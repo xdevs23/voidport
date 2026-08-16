@@ -1388,14 +1388,17 @@ The verdicts against the sections above:
   memory off the plateau under-states the peak; recorded here so
   capacity math uses the right number.
 
-Two mount-behavior findings from the same runs, recorded for the
-queue: statfs reports zero inodes (df -i shows 0/0/0 on any mount,
-so inode headroom cannot be checked through the share), and bulk
-unlink runs ~3.4x slower than bulk create (3 600 against 12 200 per
-second through the mount) — the mutation path is round-trip-bound,
-the same shape as the write-throughput number in the field section
-below. The client also logs a spurious unmount warning after every
-successful unmount; cosmetic, queued.
+Two mount-behavior findings from the same runs. The zero-inode df
+output is per node kind, not a defect (refined 2026-08-17 after the
+behavior was pinned by test): synthesized directories answer all-zero
+statfs, host-backed nodes pass the backing filesystem's counts
+through — a mount rooted on a synthesized directory therefore shows
+zero inodes at the mountpoint while a host-backed subpath reports
+real numbers. Bulk unlink runs ~3.4x slower than bulk create (3 600
+against 12 200 per second through the mount) — the mutation path is
+round-trip-bound, the same shape as the write-throughput number in
+the field section below. The client also logged a spurious unmount
+warning after every successful unmount; fixed since.
 
 ## 2026-08-16 — readahead in the field, post-integration
 
