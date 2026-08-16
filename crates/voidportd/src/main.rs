@@ -15,6 +15,7 @@
 mod cli;
 mod tui;
 
+use std::io;
 use std::process::ExitCode;
 
 use anyhow::{Context as _, Result, anyhow, bail};
@@ -44,6 +45,17 @@ async fn main() -> ExitCode {
             return ExitCode::FAILURE;
         }
     };
+    // Before anything is bound, written or taken over: every launch is stopped
+    // by this one future, and it is registered while a failure is still only a
+    // launch that does not happen. Every branch below is handed the same
+    // already-listening streams.
+    let terminated = match terminated() {
+        Ok(terminated) => terminated,
+        Err(error) => {
+            eprintln!("voidportd: {error}");
+            return ExitCode::FAILURE;
+        }
+    };
     match plan {
         Plan::Attach { socket, logging } => {
             let socket = match attach_socket(socket) {
@@ -57,7 +69,7 @@ async fn main() -> ExitCode {
                 eprintln!("voidportd: {error:#}");
                 return ExitCode::FAILURE;
             }
-            match tui::attach(socket).await {
+            match tui::attach(socket, terminated).await {
                 Ok(()) => ExitCode::SUCCESS,
                 // Every failure the interface reports is already restored-and-
                 // plain by the time it reaches here: a socket that could not be
@@ -69,12 +81,19 @@ async fn main() -> ExitCode {
                 }
             }
         }
-        Plan::Serve { config, present } => serve(config, present).await,
+        Plan::Serve { config, present } => serve(config, present, terminated).await,
     }
 }
 
 /// Starts a server and either serves it plainly or presents it.
-async fn serve(config: DaemonConfig, present: Option<Logging>) -> ExitCode {
+///
+/// `terminated` is the stop this launch already listens for: both ways of
+/// running a server are ended by the same future.
+async fn serve(
+    config: DaemonConfig,
+    present: Option<Logging>,
+    terminated: impl Future<Output = ()> + Send + 'static,
+) -> ExitCode {
     // A plain launch keeps the destination it started with — stderr, so stdout
     // carries only what the operator is meant to act on: a seeded launch prints
     // mount commands there, and a line an operator pipes into a shell must not
@@ -103,7 +122,7 @@ async fn serve(config: DaemonConfig, present: Option<Logging>) -> ExitCode {
 
     if present.is_some() {
         // The launch summary is rendered in the Overview instead of stdout.
-        return match tui::serve_and_present(daemon).await {
+        return match tui::serve_and_present(daemon, terminated).await {
             Ok(()) => ExitCode::SUCCESS,
             Err(error) => {
                 eprintln!("voidportd: {}", render(&error));
@@ -118,7 +137,7 @@ async fn serve(config: DaemonConfig, present: Option<Logging>) -> ExitCode {
         println!("{summary}");
     }
 
-    if let Err(error) = daemon.serve(terminated()).await {
+    if let Err(error) = daemon.serve(terminated).await {
         eprintln!("voidportd: {}", render(&error));
         return ExitCode::FAILURE;
     }
@@ -274,31 +293,43 @@ fn default_state_file() -> Result<PathBuf> {
     Ok(state_file)
 }
 
-/// Resolves when the process is asked to stop.
+/// Listens for the signals that ask this process to stop, and returns the
+/// future that resolves when one of them arrives.
 ///
-/// Both signals mean the same thing here: finish the mutation in flight,
-/// unlink the socket, exit.
-async fn terminated() {
+/// Both streams are registered here, not inside the future, so the future has
+/// exactly one way to resolve: a signal. Everything downstream reads a resolved
+/// future as an order to stop — [`Daemon::serve`] stops accepting on both
+/// planes, the interface stops itself — so a registration failure that resolved
+/// it instead of being raised would end a server nobody asked to stop, and log
+/// the clean shutdown it is not.
+///
+/// # Errors
+///
+/// Returns the failure to listen for either signal, which refuses the launch.
+/// The client refuses a mount the same way when its signals cannot be
+/// registered.
+fn terminated() -> io::Result<impl Future<Output = ()> + Send + 'static> {
     use tokio::signal::unix::{SignalKind, signal};
-    let mut interrupt = match signal(SignalKind::interrupt()) {
-        Ok(stream) => stream,
-        Err(error) => {
-            tracing::error!(%error, "cannot listen for SIGINT");
-            return;
-        }
-    };
-    let mut terminate = match signal(SignalKind::terminate()) {
-        Ok(stream) => stream,
-        Err(error) => {
-            tracing::error!(%error, "cannot listen for SIGTERM");
-            return;
-        }
-    };
-    let signal = tokio::select! {
-        _ = interrupt.recv() => "SIGINT",
-        _ = terminate.recv() => "SIGTERM",
-    };
-    tracing::info!(signal, "shutting down");
+
+    let mut interrupt =
+        signal(SignalKind::interrupt()).map_err(|error| cannot_listen("SIGINT", &error))?;
+    let mut terminate =
+        signal(SignalKind::terminate()).map_err(|error| cannot_listen("SIGTERM", &error))?;
+    Ok(async move {
+        // Both signals mean the same thing here: finish the mutation in
+        // flight, unlink the socket, exit.
+        let signal = tokio::select! {
+            _ = interrupt.recv() => "SIGINT",
+            _ = terminate.recv() => "SIGTERM",
+        };
+        tracing::info!(signal, "shutting down");
+    })
+}
+
+/// Names the signal a registration failure was for, keeping the kernel's own
+/// reason and its kind.
+fn cannot_listen(signal: &str, error: &io::Error) -> io::Error {
+    io::Error::new(error.kind(), format!("cannot listen for {signal}: {error}"))
 }
 
 #[cfg(test)]
@@ -311,6 +342,51 @@ mod tests {
         // build script that writes the manual page — so it cannot reach into
         // the library for this value. It can be checked against it here.
         assert_eq!(cli::DEFAULT_NAMESPACE, voidportd::seed::DEFAULT_NAMESPACE);
+    }
+
+    /// What the eager restructure guarantees: registration is over before the
+    /// future exists, so the future carries no failure path of its own and the
+    /// only thing that can resolve it is a signal. A caller may therefore treat
+    /// a resolved future as an order to stop, which is exactly what
+    /// `Daemon::serve` and the interface do.
+    ///
+    /// The kernel refusing SIGINT or SIGTERM to this process cannot be staged
+    /// here, so the failure path is proven where it is observable — in the
+    /// constructor's message, below — and this test proves the future's two
+    /// halves: it does not resolve unasked, and it does resolve on a signal.
+    #[tokio::test]
+    async fn only_a_signal_resolves_the_termination_future() {
+        use std::time::Duration;
+
+        use rustix::process::{Signal, getpid, kill_process};
+
+        let terminated = terminated().expect("SIGINT and SIGTERM can be listened for");
+        tokio::pin!(terminated);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(200), &mut terminated)
+                .await
+                .is_err(),
+            "the shutdown future resolved without a signal"
+        );
+        // Both streams are registered, so the default disposition is already
+        // replaced: this is delivered to the stream above, not to the kernel's
+        // "terminate this process".
+        kill_process(getpid(), Signal::INT).expect("a process can signal itself");
+        tokio::time::timeout(Duration::from_secs(10), terminated)
+            .await
+            .expect("SIGINT resolves the shutdown future");
+    }
+
+    #[test]
+    fn a_refused_registration_names_the_signal_and_keeps_the_reason() {
+        // What the operator reads when a launch is refused: which signal could
+        // not be listened for, and why.
+        let error = cannot_listen("SIGTERM", &io::Error::from(io::ErrorKind::PermissionDenied));
+        assert_eq!(
+            error.to_string(),
+            "cannot listen for SIGTERM: permission denied"
+        );
+        assert_eq!(error.kind(), io::ErrorKind::PermissionDenied);
     }
 
     #[test]

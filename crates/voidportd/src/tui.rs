@@ -202,9 +202,12 @@ pub fn notes(summary: &LaunchSummary) -> LaunchNotes {
 ///
 /// Returns the interface's own failure: a socket that cannot be reached (raised
 /// before the terminal is touched) or a terminal that cannot be used.
-pub async fn attach(socket: PathBuf) -> Result<(), voidport_tui::Error> {
+pub async fn attach(
+    socket: PathBuf,
+    terminated: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), voidport_tui::Error> {
     let options = Options::new(socket);
-    present(options, Presentation::Attach).await
+    present(options, Presentation::Attach, terminated).await
 }
 
 /// Serves and presents one daemon: the TUI is the foreground, and quitting it
@@ -213,7 +216,10 @@ pub async fn attach(socket: PathBuf) -> Result<(), voidport_tui::Error> {
 /// # Errors
 ///
 /// Returns the interface's failure, or the daemon's if it stopped on its own.
-pub async fn serve_and_present(daemon: Daemon) -> Result<(), voidport_tui::Error> {
+pub async fn serve_and_present(
+    daemon: Daemon,
+    terminated: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), voidport_tui::Error> {
     let socket = daemon.control_socket().to_path_buf();
     let launch = daemon.launch_summary().map(|summary| notes(&summary));
 
@@ -241,6 +247,7 @@ pub async fn serve_and_present(daemon: Daemon) -> Result<(), voidport_tui::Error
             }),
             stopped,
         }),
+        terminated,
     )
     .await
 }
@@ -252,12 +259,20 @@ pub async fn serve_and_present(daemon: Daemon) -> Result<(), voidport_tui::Error
 /// too: in raw mode Ctrl-C is a key, not a signal, so a SIGTERM (or a
 /// SIGINT from another terminal) arrives here and is handed to the interface
 /// as an ordinary stop.
-async fn present(options: Options, presentation: Presentation) -> Result<(), voidport_tui::Error> {
+///
+/// `terminated` is already listening when it gets here: the signals are
+/// registered before the launch reaches this point, so the only thing this
+/// wiring has to do is turn a signal that arrives into a stop.
+async fn present(
+    options: Options,
+    presentation: Presentation,
+    terminated: impl Future<Output = ()> + Send + 'static,
+) -> Result<(), voidport_tui::Error> {
     let handle = tokio::runtime::Handle::current();
     tokio::task::spawn_blocking(move || {
         voidport_tui::run(&options, presentation, move |stopper| {
             handle.spawn(async move {
-                crate::terminated().await;
+                terminated.await;
                 stopper.stop();
             });
         })
