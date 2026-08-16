@@ -1,0 +1,22 @@
+[package]
+name = "voidport-tui"
+description = "voidport operator TUI: a full-screen manager for a running voidportd, over its control protocol"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+voidport-control = { workspace = true, features = ["client"] }
+
+crossterm = { workspace = true }
+ratatui = { workspace = true }
+rustix = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The shared pty harness the terminal-lifecycle proofs run their child in.
+voidport-pty = { workspace = true }
+voidportd = { path = "../voidportd" }
+
+[lints]
+workspace = true

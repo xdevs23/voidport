@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# One-command gate: format, lint, and test the whole workspace inside the
+# flake dev shell. Usage: ./check [extra cargo-test args]
+#
+# The build and test phases are the machine's memory-heavy work, so every
+# invocation serializes on one machine-wide lock: concurrent tools keep
+# editing and reading in parallel, but only one compiles or tests at a
+# time (parallelize the light work, serialize the heavy phase).
+# Use the same lock around any other heavy command:
+#   flock -w 5400 "$HOME/.cache/voidport-heavy.lock" nix build path:.
+set -euo pipefail
+cd "$(dirname "$0")"
+./.githooks/pre-commit --all
+exec 9>"${VOIDPORT_HEAVY_LOCK:-$HOME/.cache/voidport-heavy.lock}"
+flock -w 5400 9 || { echo "check: gave up waiting for the heavy lock" >&2; exit 1; }
+exec nix develop path:. -c bash -c '
+  set -euo pipefail
+  cargo fmt --all --check
+  cargo clippy --workspace --all-targets -- -D warnings
+  cargo test --workspace "$@"
+' bash "$@"

@@ -1,0 +1,94 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/voidport-proto",
+    "crates/voidport-control",
+    "crates/voidportd",
+    "crates/voidport",
+    "crates/voidport-ctl",
+    "crates/voidport-tui",
+    "crates/voidport-bench",
+    "crates/voidport-torture",
+    "crates/voidport-pty",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/xdevs23/voidport"
+
+[workspace.dependencies]
+voidport-control = { path = "crates/voidport-control" }
+voidport-proto = { path = "crates/voidport-proto" }
+# Dev-only: the shared pty harness, a workspace member of its own so nothing it
+# needs (a pty, a terminal parser) becomes a dependency of the product.
+voidport-pty = { path = "crates/voidport-pty" }
+voidport-tui = { path = "crates/voidport-tui" }
+
+anyhow = "1.0"
+clap = { version = "4.6", features = ["derive"] }
+# Build-dependency only: each binary's build script renders its manual page from
+# the very clap definition the binary parses with, so `man` and `--help` cannot
+# disagree.
+clap_mangen = "0.3"
+# The terminal backend the operator TUI draws through; `ratatui` binds to this
+# very version through its `crossterm_0_29` feature, so both halves of the
+# terminal are one crate.
+crossterm = "0.29"
+fuser = "0.18"
+# Only for the `F_OFD_*` lock commands the design rules and rustix does not
+# expose; see `voidportd::host::lock`.
+libc = "0.2"
+# The decoder half of `url`, which the URL crate does not re-export; see
+# `voidport::url`.
+percent-encoding = "2.3"
+# Dev-dependency only, through `voidport-pty`: the terminal-lifecycle proofs run
+# a real process on a pty the test itself creates.
+portable-pty = "0.9"
+ratatui = { version = "0.30", features = ["crossterm_0_29"] }
+rustix = { version = "1.1", features = [
+    "event",
+    "fs",
+    # Mapping a file the test suite mounted: the `--direct-io` proofs map a
+    # file MAP_SHARED and write through the mapping, which is the one thing
+    # direct I/O may never break.
+    "mm",
+    "mount",
+    "net",
+    "process",
+    # Replacing a descriptor safely, which the terminal-lifecycle tests do to
+    # make one takeover step fail while the rest of the process is intact.
+    "stdio",
+    "thread",
+] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["full"] }
+# The asynchronous half of the vsock transport: it wraps a connected vsock
+# socket in the runtime's reactor, which is what makes an accepted connection an
+# `AsyncRead + AsyncWrite` like every other transport's. Its *listener* cannot
+# be used to bind, because binding happens before any runtime exists (see
+# `voidportd::data::listener`), so the synchronous `vsock` crate below binds and
+# this one takes the connections over once the runtime is up.
+tokio-vsock = "0.7"
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+# The synchronous half of the vsock transport, and the crate `tokio-vsock` is
+# itself built on: it binds a listener without a runtime, it dials without one,
+# and its `From<OwnedFd>` conversions are what let a socket be duplicated into
+# two independent halves with no `unsafe` and no shared lock.
+vsock = "0.5"
+# Dev-dependency only, through `voidport-pty`: the shared pty harness reads the
+# screen a process drew, and an ANSI stream is a solved format.
+vt100 = "0.16"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+[workspace.lints.rust]
+unsafe_code = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"

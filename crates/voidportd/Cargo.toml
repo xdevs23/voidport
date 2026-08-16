@@ -1,0 +1,44 @@
+[package]
+name = "voidportd"
+description = "voidport server: serves policy-composed namespaces of the host filesystem"
+version.workspace = true
+edition.workspace = true
+license = "AGPL-3.0-only"
+
+[dependencies]
+voidport-control = { workspace = true, features = ["client"] }
+voidport-proto = { workspace = true }
+voidport-tui = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+libc = { workspace = true }
+# The authority component of a printed mount URL is a percent-encoded socket
+# path; see `voidportd::launch`.
+percent-encoding = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+# The vsock data listener: `vsock` binds it before the runtime exists, and
+# `tokio-vsock` serves the connections it accepts. See `voidportd::data::vsock`.
+tokio-vsock = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+vsock = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+# The shared pty harness `--tui` is proven in, with the real binary inside it.
+voidport-pty = { workspace = true }
+
+[build-dependencies]
+# The manual page is rendered from `src/cli.rs`, which the build script
+# compiles alongside the binary.
+clap = { workspace = true }
+clap_mangen = { workspace = true }
+
+[lints]
+workspace = true

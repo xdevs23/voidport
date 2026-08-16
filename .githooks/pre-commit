@@ -1,0 +1,52 @@
+#!/usr/bin/env bash
+# Tree hygiene: refuse to commit files that do not belong to this project.
+#
+# The repository is a Rust workspace plus documentation. Concurrent tools and
+# humans read foreign source trees (kernel sources, other projects) during
+# investigation, and a stray copy left in the working directory is one
+# careless `git add -A` from entering history — which must never happen.
+# This hook is the commit-time backstop; `./check --hygiene`
+# runs the same rules over every tracked file so the gate catches anything
+# that slipped past a `--no-verify`.
+#
+# Rules, deliberately blunt:
+#   * no C/C++/object/kernel artifacts anywhere — this workspace has no
+#     legitimate use for them (the one unsafe island is plain Rust + libc);
+#   * every top-level entry must be on the allowlist below — a new
+#     legitimate top-level file is added HERE, in the same commit, which is
+#     exactly the review moment the rule wants.
+#
+# The vocabulary rules live beside this file, in `check-vocab`, and run from
+# here in whichever mode this hook was given — one word list, both entries.
+set -euo pipefail
+
+allowed_top='^(Cargo\.lock|Cargo\.toml|check|crates|docs|flake\.lock|flake\.nix|\.gitignore|LICENSES|README\.md|\.githooks)(/|$)'
+foreign_ext='\.(c|h|cpp|hpp|cc|hh|cxx|hxx|ko|o|a|so|orig|rej)$'
+
+if [ "${1:-}" = "--all" ]; then
+  files=$(git ls-files)
+else
+  files=$(git diff --cached --name-only --diff-filter=ACR)
+fi
+
+bad=0
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  if ! printf '%s\n' "$file" | grep -Eq "$allowed_top"; then
+    echo "hygiene: '$file' is outside the allowed top-level layout" >&2
+    bad=1
+  fi
+  if printf '%s\n' "$file" | grep -Eq "$foreign_ext"; then
+    echo "hygiene: '$file' looks like a foreign source or build artifact" >&2
+    bad=1
+  fi
+done <<< "$files"
+
+if [ "$bad" -ne 0 ]; then
+  echo "hygiene: refusing. External files never enter this history." >&2
+  echo "Move investigation copies to the project cache directory," >&2
+  echo "or extend the allowlist in .githooks/pre-commit deliberately." >&2
+  exit 1
+fi
+
+exec "$(dirname "$0")/check-vocab" "$@"

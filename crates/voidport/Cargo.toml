@@ -1,0 +1,46 @@
+[package]
+name = "voidport"
+description = "voidport guest client: mounts a voidport namespace via FUSE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+voidport-control = { workspace = true }
+voidport-proto = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+fuser = { workspace = true }
+percent-encoding = { workspace = true }
+rustix = { workspace = true }
+# The `subscribe` command's output rendering, and nothing else: JSON never
+# reaches the wire, which carries fixed-layout structs.
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+# The vsock transport a `voidport+vsock://` mount dials: `tokio-vsock` drives the
+# connection, and `vsock` is how its socket is duplicated into two halves that
+# share no lock. See `voidport::client::transport`.
+tokio-vsock = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+vsock = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+# The operator interface's own client layer, driven against a real mount: a
+# rule it changes must bind for the guest, and its sessions view must follow
+# the mount.
+voidport-tui = { workspace = true }
+voidportd = { path = "../voidportd" }
+
+[build-dependencies]
+# The manual page is rendered from `src/cli.rs`, which the build script
+# compiles alongside the binary.
+clap = { workspace = true }
+clap_mangen = { workspace = true }
+
+[lints]
+workspace = true

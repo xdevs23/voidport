@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Vocabulary gate: the words this project does not write.
+#
+# The list below is filler jargon — words that sound like a decision and say
+# nothing. Every one of them has a plainer replacement that carries the same
+# meaning ("instead of", "decided", "justified", "connection", "note"), so the
+# rule is a flat ban and the fix is always a rewrite, never a synonym hunt.
+#
+# Rules, deliberately blunt:
+#   * whole words, any casing; "rather than" is the one banned as a phrase; (vocab-ok: the rule states its own list)
+#   * only ADDED lines are judged — the staged diff at commit time, and every
+#     tracked line under `--all`, because this project publishes a fresh root
+#     and the whole tree therefore counts as newly written;
+#   * a line carrying `vocab-ok` is exempt. That is the escape for the one
+#     legitimate case: an identifier that already spells a banned word and
+#     cannot be renamed. It is a comment on the same line, so the exemption is
+#     visible where it applies and reviewable in the diff that adds it.
+#
+# `.githooks/pre-commit` runs this both ways: the staged diff on commit, and
+# the whole tree under `--all` (which is what `./check` runs).
+set -euo pipefail
+
+words='rather than|worth|leg|lane|doctrine|caveat|twist|ruling|ruled|seat' # vocab-ok: the list itself
+
+refuse() {
+  echo "vocab: refusing. These words are banned in tracked content." >&2
+  echo "Rewrite the line, or mark a legitimate identifier with a" >&2
+  echo "'vocab-ok' comment on the same line." >&2
+  exit 1
+}
+
+# Reads `file:line:text` and reports every line that uses a banned word.
+judge() {
+  local entry rest file line text hits bad=0
+  while IFS= read -r entry || [ -n "$entry" ]; do
+    [ -z "$entry" ] && continue
+    file=${entry%%:*}
+    rest=${entry#*:}
+    line=${rest%%:*}
+    text=${rest#*:}
+    case $text in *vocab-ok*) continue ;; esac
+    hits=$(printf '%s\n' "$text" | grep -owiE "$words" | sort -fu | paste -sd' ' -) || true
+    [ -z "$hits" ] && continue
+    echo "vocab: $file:$line: $hits" >&2
+    bad=1
+  done
+  return "$bad"
+}
+
+# Every added line of the staged change, as `file:line:text`.
+staged() {
+  local file
+  git diff --cached --name-only --diff-filter=ACMR | while IFS= read -r file; do
+    [ -z "$file" ] && continue
+    git diff --cached -U0 -- "$file" | awk -v f="$file" '
+      /^\+\+\+/ { next }
+      /^@@/ { n = $3; sub(/^\+/, "", n); sub(/,.*/, "", n); next }
+      /^\+/ { printf "%s:%d:%s\n", f, n, substr($0, 2); n++ }
+    '
+  done
+}
+
+if [ "${1:-}" = "--all" ]; then
+  # `git grep` prefilters with the same expression, so only candidate lines
+  # are judged one at a time — the whole tree costs one pass.
+  candidates=$(git grep -InwiE "$words" -- . || true)
+  printf '%s\n' "$candidates" | judge || refuse
+else
+  staged | judge || refuse
+fi

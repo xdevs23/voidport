@@ -1,0 +1,17 @@
+[package]
+name = "voidport-bench"
+description = "voidport benchmark harness: one scenario per workload class, one JSON record per run"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[lints]
+workspace = true

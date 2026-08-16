@@ -1,0 +1,331 @@
+# voidport state file — a commented example.
+#
+# This file is the server's source of truth. voidportd loads it at startup,
+# builds every namespace from it, and persists it back — in exactly this
+# shape — whenever the control plane changes something. Two consequences
+# to internalise:
+#
+#   * The server owns the file. Edits made while it runs are not watched and
+#     are overwritten by the next control-plane mutation (v1 decision).
+#   * What you write is what is kept. The `"uid"`/`"gid"` sentinels and
+#     relative host paths below stay unresolved in the file forever; they are
+#     resolved only in memory, against the invoking user and this file's
+#     directory. A configuration is therefore portable between machines and
+#     users, and a mutation never freezes it to one of them.
+#
+# Start the server with:
+#
+#   voidportd --state /path/to/state.toml
+#
+# and drive it with `voidport-ctl` — which, given no `--socket`, looks for a
+# running server on `$XDG_STATE_HOME/voidport/control.sock` and then on
+# `/run/voidport/control.sock`.
+
+[server]
+# The control-plane unix socket, interpreted exactly as configured by the
+# process. Owner-only (0600); the command line's --control-socket overrides it.
+# Anything that can talk to it can reconfigure every namespace, so keep it in
+# a private directory.
+control_socket = "/run/voidport/control.sock"
+
+# Data-plane listeners: where guests mount from. One entry per endpoint.
+# `tcp`, `unix` and `vsock` are all served. Startup is all-or-nothing: if any
+# listener here cannot be bound, the server does not start.
+#
+# This array is also what `voidport-ctl listener add` and `listener remove`
+# write: a listener bound at runtime lands here, so a restart serves it, and a
+# `tcp` entry on port 0 re-resolves to a fresh port on every start — exactly as
+# a port-0 entry written by hand always has.
+#
+# A `unix` listener follows the same bind contract as the control socket:
+# owner-only (0600), a stale socket is reclaimed, a live one is refused, a path
+# holding anything else is left alone, and the socket is unlinked on shutdown.
+#
+# A `vsock` listener is reachable from this machine's own guests and from
+# nowhere else — no network stack is involved at all. `cid` is optional and
+# defaults to the vsock wildcard, which is the bind a host wants; name one only
+# to restrict the listener to a single context id. The port is 1..=65535,
+# because that is what a mount URL's port can carry. Guests mount it as
+# `voidport+vsock://2:1024/@namespace`, 2 being the cid a guest reaches its host
+# at by the vsock convention.
+
+[[server.listeners]]
+transport = "tcp"
+addr = "0.0.0.0:9000"
+
+[[server.listeners]]
+transport = "unix"
+path = "/run/voidport/data.sock"
+
+[[server.listeners]]
+transport = "vsock"
+port = 1024
+
+# Resource caps — OPT-IN THROTTLES, and there are no defaults.
+#
+# Every cap below is unbounded unless you write it. A server with no
+# `[server.limits]` table refuses nothing of its own accord: a guest holds as
+# many nodes, handles and listing entries as the machine can carry, exactly as
+# a local process on the host would. This is what a single trusted guest wants,
+# and the sized defaults that used to live here are gone — they twice refused a
+# real source-tree walk that the host filesystem carries without complaint.
+#
+# Configure them for a MULTI-TENANT posture: with `auth.mode: none`, anything
+# that can reach a data listener can mount, so an operator serving forty
+# unknown guests wants a ceiling per guest. That is what these are for.
+#
+# `max_inflight` is not an error budget: reaching it pauses the connection's
+# read loop, which throttles the client through the transport itself
+# (unconfigured, the read loop never pauses). The other caps answer with an
+# errno — ENFILE, EMFILE, EOVERFLOW — because each names a resource a guest
+# asked for explicitly. A cap written here is enforced exactly as written; only
+# `max_inflight = 0` is refused at startup, because a connection that may have
+# no request in flight can serve nothing.
+#
+# Nothing in this table is written back to the state file unless it was
+# configured.
+[server.limits]
+max_sessions = 256          # concurrent mounts; an excess connection is
+                            # answered and closed
+max_inflight = 64           # requests in flight per session (backpressure)
+max_nodes = 1048576         # nodes per session (ENFILE)
+max_handles = 16384         # open handles per session (EMFILE)
+max_listing_entries = 1048576  # entries in one materialized listing (EOVERFLOW)
+
+# --- The descriptor arithmetic, if you do cap ---------------------------------
+# A node is one entry a guest has looked up and not yet forgotten, and every
+# host-backed one holds an O_PATH descriptor for as long as it lives: nodes and
+# open descriptors are the same number, one for one (measured, not estimated).
+# A handle — an open file or directory — costs one more.
+#
+# So `max_nodes` is a bound on the guest's *working set*, not on any one
+# directory. A build system walking a source tree looks up every entry it
+# passes, and a guest kernel forgets nothing until it is short of memory, so the
+# working set of a tree walk is the whole tree. Measured on a synthetic tree of
+# 20,201 directories and 300,000 files:
+#
+#   entries walked      nodes needed      descriptors held      server RSS
+#   320,201             320,202           ~320,215              254 MiB
+#
+# — i.e. ~1 descriptor and ~790 bytes of server memory per held node. A cap
+# smaller than a guest's working set stops that guest with ENFILE on the lookup
+# that would have exceeded it, so size it against the trees your guests walk, or
+# leave it unset and let the machine be the bound.
+#
+# What the server does regardless of this table: at startup it raises
+# RLIMIT_NOFILE to the OS maximum (`/proc/sys/fs/nr_open`, commonly 1,048,576)
+# and logs what it got. It never lowers the limit, and failing to raise it is
+# never fatal. Raising the *hard* limit needs CAP_SYS_RESOURCE, so a server
+# started under a low ceiling keeps that ceiling — raise it with `LimitNOFILE=`
+# in a systemd unit or `ulimit -n` in a shell if a guest needs more.
+#
+# Sessions share that one process-wide descriptor table. Several guests each
+# holding a source-tree-scale working set need a ceiling sized for the sum: at
+# ~320k descriptors per such guest, three fit inside a 1,048,576 limit and a
+# fourth does not. Past it, a pin fails with the host's EMFILE, not with
+# a configured cap's ENFILE — the machine's own answer to exhaustion, which is a
+# fact, not a policy. Where you configure `max_nodes` and `max_handles`
+# both, the server checks `max_nodes + max_handles + 1024` against the limit it
+# reached and warns if the caps promise more than the process can back.
+
+# ---------------------------------------------------------------------------
+# A namespace: a virtual root that starts completely empty — zero inodes, zero
+# resolvable paths — into which host paths are grafted, each with its own
+# share mode.
+# ---------------------------------------------------------------------------
+
+[[namespaces]]
+# Nonempty, at most 255 bytes, no `/`, NUL or control characters, unique
+# across the file. This is the name guests mount:
+#   voidport://10.0.2.2:9000/@project/path/to/thing
+name = "project"
+
+# How host permission bits are presented. v1: `passthrough` — host bits as-is,
+# except that a read-only graft strips the write bits from the *presented*
+# mode. Presentation is UX only; enforcement is always server-side.
+permission = "passthrough"
+
+# How clients authenticate. v1: `none`.
+auth = "none"
+
+# --- Ownership --------------------------------------------------------------
+# Three modes, each with its own required fields; a field belonging to another
+# mode is a load error, not a silently ignored key.
+#
+#   mode = "passthrough"          host ids shown as-is
+#   mode = "static", uid, gid     everything presented as one owner
+#   mode = "map", uid_map,        explicit translation, applied in reverse for
+#                 gid_map         guest-created files
+[namespaces.ownership]
+mode = "map"
+
+# What happens to a host id no table entry covers:
+#   "squash"      present the squash id below (only the unmapped component)
+#   "hide"        hide the file entirely (either component unmapped)
+#   "passthrough" present the raw host id
+unmapped = "squash"
+
+# The numeric ids `unmapped = "squash"` presents. Default 65534 (nobody);
+# never resolved through NSS. A mapped guest id must not collide with these,
+# or mapped and unmapped owners would be indistinguishable.
+squash_uid = 65534
+squash_gid = 65534
+
+# The tables must be injective in both directions: a repeated host id makes
+# presentation ambiguous, a repeated guest id makes the reverse mapping
+# ambiguous. `host` takes a number, or the sentinel "uid"/"gid" meaning the
+# invoking user's id.
+[[namespaces.ownership.uid_map]]
+host = "uid"
+guest = 0
+
+[[namespaces.ownership.gid_map]]
+host = "gid"
+guest = 0
+
+# --- Rules ------------------------------------------------------------------
+# Resolution is component-wise, and precedence is structural, not
+# list-order: a literal rule beats a pattern, a pattern beats a wildcard, a
+# wildcard beats subtree inheritance, and a deeper literal rule overrides the
+# graft it sits in.
+#
+#   path    a namespace path (`/a/b`), `/a/*` for the per-directory default,
+#           or — with `match` — the directory whose children the match covers
+#   mode    "rw" | "ro" | "hidden"
+#   match   a glob over the CHILD NAMES of `path`, making this a pattern rule.
+#           `*` matches any run of bytes, including none; a leading `*` does
+#           not cover names starting with `.`, as in a shell; every other byte
+#           is literal. A pattern rule is keyed by its path AND its match, so
+#           one directory carries several — as long as no name is covered by
+#           two of them, which is refused when the rule is added. It is
+#           mode-only: never combined with `target`.
+#   target  the host path, absolute or relative to THIS FILE's directory.
+#           Required on a graft root; omitted deeper (derived from the
+#           enclosing graft) unless you are re-targeting.
+#
+# A path component containing `*` is an ordinary literal name — the entry
+# really called `b*` — and always has been. The match is a field of its own.
+#
+# Every target below is relative, which is what the portability note at the top
+# of this file is about: the file names no machine's layout, so it loads
+# wherever the trees beside it exist. An absolute target (`/srv/project`) is
+# equally valid and is what a deployed configuration usually says.
+#
+# A graft target must exist when the namespace is built — startup and every
+# accepted mutation pin it with `O_PATH` — so a target naming nothing refuses
+# startup instead of surfacing as an empty directory later.
+#
+# The example below is the design document's worked example: the project is
+# grafted read-write, its children default to hidden, and the entries that
+# should be visible are named individually.
+
+[[namespaces.rules]]
+path = "/project"
+mode = "rw"
+target = "project"
+
+# The per-directory default: anything not named below does not exist.
+[[namespaces.rules]]
+path = "/project/*"
+mode = "hidden"
+
+[[namespaces.rules]]
+path = "/project/foo"
+mode = "rw"
+
+# Read-only: writes fail server-side and the presented bits lose `w`.
+[[namespaces.rules]]
+path = "/project/bar"
+mode = "ro"
+
+[[namespaces.rules]]
+path = "/project/file.txt"
+mode = "rw"
+
+# A deeper rule may re-target: this name resolves to a different host tree.
+[[namespaces.rules]]
+path = "/project/vendor"
+mode = "ro"
+target = "vendor-snapshot"
+
+# A pattern rule: every child of /project whose name starts with `family-` is
+# shared read-write, however many there are and whenever they appear. This is
+# the composition to reach for when a *changing family* of sibling directories
+# has to be shared: graft the parent, default its children to hidden, un-hide
+# the family by match. A guest `mkdir family-new` then creates the real host
+# directory, which outlives the guest.
+[[namespaces.rules]]
+path = "/project"
+mode = "rw"
+match = "family-*"
+
+# --- Extended attributes ----------------------------------------------------
+# Which attribute NAMES a guest of this namespace may read and write. Per
+# namespace, like everything else here; there is no server-wide setting.
+#
+# With no rules at all:
+#
+#   * every attribute reads — the mount behaves like a local filesystem, so a
+#     guest can read a `security.*` label the same way it can on ext4;
+#   * `user.*` writes land, and every other namespace's write is refused.
+#
+# Whatever the rules say, everything is bounded by what the server's own host
+# user can do: `security.*` and `trusted.*` need CAP_SYS_ADMIN in the initial
+# namespace, so an unprivileged server passes the kernel's own EPERM back and
+# an allow rule buys visibility, not privilege. And a write to
+# `system.posix_acl_access` or `system.posix_acl_default` is ALWAYS refused: a
+# valid ACL blob silently rewrites the file's permission bits, which is a change
+# the share modes and presented bits would never see.
+#
+#   match   a glob over attribute names — `*` covers any run of bytes including
+#           none, every other byte is literal, `/` included, and a bare `*` is
+#           a legal catch-all. At most 255 bytes.
+#   read    "allow" | "deny", for getxattr and listxattr. A denied name is
+#           ABSENT from a listing and answers ENODATA on a get: a denial does
+#           not advertise what it denies.
+#   write   "allow" | "deny", for setxattr and removexattr. A denied write
+#           answers EPERM with the host untouched.
+#
+# Among the rules covering a name the longest literal prefix wins, per verdict:
+# `user.build.*` beats `user.*`. Where two covering rules tie, deny wins. A
+# verdict a rule leaves out falls through to the next-most-specific rule that
+# states one, and then to the defaults — which is what makes the pair below
+# layer. A rule is keyed by its match, so a second rule with the same match is
+# refused; change one by removing it and adding it back. A rule must state at
+# least one of the two verdicts: one that states neither decides nothing while
+# holding its match against a rule that would, and is refused at load and at
+# `xattr add` alike.
+#
+# On a read-only share the share mode still comes first: a setxattr there
+# answers EROFS before any of this is consulted.
+
+[[namespaces.xattr]]
+match = "user.*"
+write = "deny"
+
+# ... except this one name, which the longer literal prefix wins for. Reads are
+# unstated on both rules, so they fall through to the default: allowed.
+[[namespaces.xattr]]
+match = "user.build.id"
+write = "allow"
+
+# ---------------------------------------------------------------------------
+# A second namespace, showing the other two ownership modes' shapes. This one
+# grafts a single file and nothing else: everything not grafted does not
+# exist.
+# ---------------------------------------------------------------------------
+
+[[namespaces]]
+name = "logs"
+permission = "passthrough"
+auth = "none"
+
+[namespaces.ownership]
+mode = "static"
+uid = 0
+gid = 0
+
+[[namespaces.rules]]
+path = "/var/log/app.log"
+mode = "ro"
+target = "logs/app.log"

@@ -1,0 +1,35 @@
+[package]
+name = "voidport-torture"
+description = "voidport torture harness: every operation class at once, for hours, with the invariants asserted throughout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The mount itself: the harness drives real FUSE mounts of a real server, and
+# mounting is what this crate does.
+voidport = { path = "../voidport" }
+# The node and handle counts a leak would show up in are the control plane's
+# session view.
+voidport-control = { workspace = true }
+# The lock-storm class speaks the data plane directly; see `wire`.
+voidport-proto = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The lock-storm class dials every transport a mount URL can name, vsock
+# included, and it speaks the wire synchronously; see `wire`.
+vsock = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+# The smoke variant runs a real server, started exactly as its binary starts
+# it, from the runner the other suites share.
+voidportd = { path = "../voidportd" }
+
+[lints]
+workspace = true

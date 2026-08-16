@@ -1,0 +1,36 @@
+[package]
+name = "voidport-ctl"
+description = "voidport operator CLI: manages namespaces and rules on a running voidportd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+voidport-control = { workspace = true, features = ["client"] }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+voidport-proto = { workspace = true }
+# One suite runs both operator surfaces at once, to prove that a change made
+# through this CLI reaches a watching interface within one tick.
+voidport-tui = { workspace = true }
+voidportd = { path = "../voidportd" }
+tokio = { workspace = true }
+zerocopy = { workspace = true }
+
+[build-dependencies]
+# The manual page is rendered from `src/cli.rs`, which the build script
+# compiles alongside the binary — with the dependencies that module has.
+anyhow = { workspace = true }
+clap = { workspace = true }
+clap_mangen = { workspace = true }
+voidport-control = { workspace = true }
+
+[lints]
+workspace = true

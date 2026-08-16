@@ -1,0 +1,5 @@
+/target
+/.cache/
+# `nix build` leaves this symlink into the store at the root of whatever it was
+# run in, and running it is one of the two gates.
+/result

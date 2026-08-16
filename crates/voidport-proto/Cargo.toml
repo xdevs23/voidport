@@ -1,0 +1,12 @@
+[package]
+name = "voidport-proto"
+description = "voidport wire protocol: opcodes, frame layout, and fixed-layout message types"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+
+[dependencies]
+zerocopy = { workspace = true }
+
+[lints]
+workspace = true
