@@ -872,6 +872,14 @@ which fails on the decided shape and passes on this one.
 
 ### The descriptor-per-node lifecycle — criterion 6
 
+(Refined 2026-08-17: this section measured the PRE-budget lifecycle,
+where a node held its pin for life — one descriptor per node. The
+descriptor budget has since landed: descriptors are evictable cache
+slots reopened from full-path recipes, and the current-stack
+re-measure above observed 0.33 per node at an 801k-name peak. The
+numbers below stand as the record of what was measured before that
+decision.)
+
 The question the field-use disposition left open: whether a node should keep
 its `O_PATH` pin for its lifetime, or whether descriptors should be evicted
 and reopened on demand. Measured before deciding, on a synthetic source tree
@@ -1338,6 +1346,56 @@ memory stays flat per the sections above); the default cached mode
 for small projects whose hot files are re-read constantly, where
 the cache repays its bounded cost with native-speed re-reads.
 
+
+## 2026-08-17 — per-entry cost re-measured on the current stack
+
+The entry-cost and reclaim numbers above predate the descriptor
+budget, the full-path reopen recipes, and the memory-reclaim landing.
+Re-measured end to end: 801 042 names (40 x 25 x 800 empty files plus
+1 040 directories, the established tree shape), one fresh server per
+run, six runs across three mount arms, real VmRSS from the server's
+proc status at idle, post-walk plateau, drain, and settle.
+
+| arm, two runs each | peak KiB/name | return % after drain | post-drain KiB/name |
+|---|---|---|---|
+| default (page-cached) | 1.0875 / 1.0872 | 77.3 / 73.2 | 0.25 / 0.29 |
+| direct-io, readahead 256 MiB | 1.0874 / 1.0876 | 76.6 / 75.5 | 0.25 / 0.27 |
+| direct-io, readahead 0 | 1.0874 / 1.0873 | 65.7 / 72.3 | 0.37 / 0.30 |
+
+The verdicts against the sections above:
+
+- **Peak per-entry cost improved ~39%**: 1.087 KiB/name against the
+  1.79-1.83 the earlier pass measured (the ~1.4 GiB / 800 809-name
+  figure derives to 1.83). Spread across all six runs is
+  0.0004 KiB/name. The landed work is the difference; nothing else
+  changed the entry path.
+- **Descriptors: 0.33 per node at peak** (262 161 against 801 042
+  nodes — the budget cap plus infrastructure), no longer the 1.00
+  per node the pre-budget lifecycle measured. After a drain: 16.
+- **Reclaim return holds**: default-mount runs at 77.3% and 73.2%
+  against the documented 76-82% band — one inside, one three points
+  below; residue is not a fixed high-water mark (197-299 MiB across
+  identical runs), as the reclaim section already states.
+- **Readahead adds nothing to server memory**: peak per-name
+  identical to four decimals with the engine at 256 MiB and at 0.
+  The pool is a ceiling, not an allocation, and it lives in the
+  client. Bounded claim: an empty-file walk issues no reads, so
+  this proves the engine's idle cost is zero, not the cost of a
+  full pool.
+- **The true RSS high-water mark is during the drain, not the
+  walk**: the FORGET flood transiently adds ~18% over the post-walk
+  plateau (1.27-1.32 KiB/name at that moment) in every run. Sizing
+  memory off the plateau under-states the peak; recorded here so
+  capacity math uses the right number.
+
+Two mount-behavior findings from the same runs, recorded for the
+queue: statfs reports zero inodes (df -i shows 0/0/0 on any mount,
+so inode headroom cannot be checked through the share), and bulk
+unlink runs ~3.4x slower than bulk create (3 600 against 12 200 per
+second through the mount) — the mutation path is round-trip-bound,
+the same shape as the write-throughput number in the field section
+below. The client also logs a spurious unmount warning after every
+successful unmount; cosmetic, queued.
 
 ## 2026-08-16 — readahead in the field, post-integration
 

@@ -93,9 +93,11 @@ max_handles = 16384         # open handles per session (EMFILE)
 max_listing_entries = 1048576  # entries in one materialized listing (EOVERFLOW)
 
 # --- The descriptor arithmetic, if you do cap ---------------------------------
-# A node is one entry a guest has looked up and not yet forgotten, and every
-# host-backed one holds an O_PATH descriptor for as long as it lives: nodes and
-# open descriptors are the same number, one for one (measured, not estimated).
+# A node is one entry a guest has looked up and not yet forgotten. Host-backed
+# nodes hold O_PATH descriptors through a server-global evictable budget
+# (default 262144): under the budget, roughly one per recently used node; at
+# scale the budget is the ceiling and cold descriptors are reopened on demand
+# from their recorded paths (an 801k-node walk measured 0.33 per node).
 # A handle — an open file or directory — costs one more.
 #
 # So `max_nodes` is a bound on the guest's *working set*, not on any one
