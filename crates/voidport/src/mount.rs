@@ -31,6 +31,20 @@
 //! mountpoint: an `EBUSY` leaves a mount that is live, usable, and handed back
 //! its probe ([`Client::resume_recovery`]) exactly as it was found.
 //!
+//! ## fuser unmounts a second time, and it cannot be talked out of it
+//!
+//! The kernel unmount above is this client's own ([`unmount`]), because v1's is
+//! a plain unmount: `EBUSY` surfaces and there is no lazy or forced mode. fuser
+//! 0.18 holds a mount handle of its own inside the session and unmounts from it
+//! once more when that handle drops as the session ends. The handle is private
+//! to the session and the only way to release it is to unmount *through* it,
+//! which takes fuser's path — and that path answers a kernel `EPERM` by
+//! detaching lazily and reporting success, which is exactly what the contract
+//! forbids. So the second unmount stays; it lands on a mountpoint that is
+//! already gone, whoever took it down, and fails there. Keeping that failure
+//! out of a process's diagnostics is the binary's business, and it is done only
+//! while the mountpoint is provably gone.
+//!
 //! ## Auto-unmount is opportunistic, not guaranteed
 //!
 //! A `SIGKILL` is the one exit the client cannot run a teardown for, and FUSE's

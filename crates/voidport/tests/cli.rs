@@ -120,11 +120,20 @@ fn the_binary_mounts_and_unmounts() {
 
     // The foreground mount ends when the mountpoint does, and reports success.
     let output = mounted.finish();
+    let said = String::from_utf8_lossy(&output.stderr);
     assert!(
         output.status.success(),
-        "the mount process exited with {}: {}",
+        "the mount process exited with {}: {said}",
         output.status,
-        String::from_utf8_lossy(&output.stderr)
+    );
+    // And it says nothing alarming on the way out. fuser unmounts a second time
+    // from its own session handle as the session ends, on a mountpoint this
+    // unmount has already taken down, so that attempt can only fail — a warning
+    // there is an unmount that worked, reported as one that did not, in every
+    // client log there is.
+    assert!(
+        !said.contains("WARN"),
+        "an unmount that succeeded warned:\n{said}"
     );
 }
 

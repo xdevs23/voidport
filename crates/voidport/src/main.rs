@@ -6,9 +6,11 @@
 //! mounted.
 
 mod cli;
+mod diagnostics;
 mod events;
 
 use std::io::Write as _;
+use std::path::Path;
 use std::process::ExitCode;
 use std::time::Duration;
 
@@ -21,42 +23,32 @@ use voidport::url::MountUrl;
 
 use crate::cli::{Cli, Command};
 
-/// What `RUST_LOG` asks for, or `info`.
-///
-/// An **empty** `RUST_LOG` is treated as an absent one, which
-/// `EnvFilter::try_from_default_env` does not do: an empty value parses into a
-/// filter with no directives, and that enables nothing at all — a mount whose
-/// diagnostics vanish because something in the environment exported `RUST_LOG=`
-/// is silent exactly when it is being debugged. A value that is set but
-/// unparseable falls back the same way instead of refusing to mount over a log
-/// filter.
-fn filter() -> tracing_subscriber::EnvFilter {
-    let default = || tracing_subscriber::EnvFilter::new("info");
-    match std::env::var(tracing_subscriber::EnvFilter::DEFAULT_ENV) {
-        Ok(directives) if !directives.trim().is_empty() => {
-            tracing_subscriber::EnvFilter::try_new(directives).unwrap_or_else(|_| default())
-        }
-        _ => default(),
-    }
-}
-
 fn main() -> ExitCode {
-    // **stderr**, not the default stdout. `voidport subscribe` writes one JSON
-    // object per line on stdout and a consumer parses every one of them; a log
-    // line landing in that stream would be a parse failure in someone's shell
-    // pipeline. Diagnostics belong on stderr for every subcommand, and the one
-    // that makes it load-bearing is enough reason to state it once here.
-    tracing_subscriber::fmt()
-        .with_env_filter(filter())
-        .with_writer(std::io::stderr)
-        .init();
+    // Parsed before the diagnostics are installed, because where they go is one
+    // thing and what they may not swallow is another: the mount's own teardown
+    // is what tells fuser's spurious unmount warning from a real one, and the
+    // command line is where the mountpoint comes from. A command line the
+    // parser refuses never reaches a log; clap reports it itself.
+    let arguments = Cli::parse();
+    diagnostics::install(mountpoint(&arguments.command));
 
-    match run(Cli::parse()) {
+    match run(arguments) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("voidport: {error:#}");
             ExitCode::FAILURE
         }
+    }
+}
+
+/// The mountpoint this invocation mounts on, where it mounts one.
+///
+/// Only a mount runs a FUSE session, and only a FUSE session has an unmount of
+/// fuser's own behind it; the other two commands hand over nothing.
+fn mountpoint(command: &Command) -> Option<&Path> {
+    match command {
+        Command::Mount { mountpoint, .. } => Some(mountpoint),
+        Command::Umount { .. } | Command::Subscribe { .. } => None,
     }
 }
 

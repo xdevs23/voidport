@@ -191,6 +191,16 @@ fn a_signalled_mount_unmounts_itself() {
             Mountpoint::Unmounted,
             "{label}: a signalled mount must unmount itself"
         );
+        // And it says nothing alarming on the way out. fuser unmounts a second
+        // time from its own session handle as the session ends, on a mountpoint
+        // this teardown has already taken down, so that attempt can only fail —
+        // a warning there is an unmount that worked, reported as one that did
+        // not, in every client log there is.
+        let said = guest.said();
+        assert!(
+            !said.contains("WARN"),
+            "{label}: a teardown that unmounted cleanly warned:\n{said}"
+        );
     }
 }
 
