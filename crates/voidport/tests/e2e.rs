@@ -510,6 +510,52 @@ fn posix_continuity_survives_the_proxy() {
     );
 }
 
+/// What `df` reports for a mount, which the design decided per node kind and
+/// nothing end to end had ever pinned.
+///
+/// A host-backed mount root reports its backing filesystem — the same numbers a
+/// `statvfs` of the grafted directory gives, because the server answers with an
+/// `fstatfs` on the very descriptor it pinned. A mount that lands on a
+/// synthesized directory has no filesystem to report and answers zeroes: such a
+/// root holds nothing and nothing can be created in it, so a zero-sized
+/// filesystem is the honest answer and not a placeholder. Both readings are
+/// characterization: a future change to either is a decision somebody has to
+/// make deliberately.
+#[test]
+fn statfs_reports_the_backing_filesystem_and_zeroes_a_synthesized_root() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = Fixture::start("statfs");
+
+    let host_backed = fixture.mount("statfs-tree", "plain", "/tree");
+    let through = rustix::fs::statvfs(host_backed.root()).expect("the mount answers statfs");
+    let directly = rustix::fs::statvfs(fixture.host("tree")).expect("the host answers statfs");
+    assert_eq!(
+        (through.f_blocks, through.f_bsize, through.f_namemax),
+        (directly.f_blocks, directly.f_bsize, directly.f_namemax),
+        "a host-backed root reports the filesystem behind the graft"
+    );
+    assert!(through.f_blocks > 0, "a real filesystem has blocks");
+
+    // The namespace root of the same namespace is synthesized: the grafts are
+    // its children and it has no backing of its own.
+    let synthesized = fixture.mount("statfs-root", "plain", "");
+    let empty = rustix::fs::statvfs(synthesized.root()).expect("the mount answers statfs");
+    assert_eq!(
+        (
+            empty.f_blocks,
+            empty.f_bfree,
+            empty.f_bavail,
+            empty.f_files,
+            empty.f_ffree,
+        ),
+        (0, 0, 0, 0, 0),
+        "a synthesized root reports a filesystem that holds nothing"
+    );
+    assert_eq!(empty.f_namemax, 0);
+}
+
 // ---------------------------------------------------------------------------
 // Criterion 8 — ownership mapping, end to end
 // ---------------------------------------------------------------------------

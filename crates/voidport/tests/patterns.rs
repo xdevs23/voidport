@@ -10,6 +10,7 @@
 mod support;
 
 use std::fs;
+use std::os::fd::AsFd as _;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::time::Duration;
@@ -293,6 +294,56 @@ fn a_match_reaches_a_dotfile_only_when_it_begins_with_a_dot() {
     let hidden = fs::metadata(guest.path(".b-a")).expect_err("hidden by `.b-*`");
     assert_eq!(errno(&hidden), Errno::NOENT.raw_os_error(), "{hidden}");
     assert!(!names(guest.root()).contains(&".b-a".to_owned()));
+}
+
+/// Policy binds at lookup, and a pattern is policy like every other rule.
+///
+/// The pattern criteria prove a match appearing and admitting; this is the
+/// other direction, and it is the one an operator reaches for when a family
+/// must stop being shared. Taking the match away drops its members back onto
+/// the bare `*` that hides them — at the next lookup, TTL-bounded, with no
+/// remount — while a handle opened before the removal keeps working, because a
+/// node's mode binds at the lookup that admitted it and open handles are
+/// grandfathered.
+#[test]
+fn removing_a_pattern_hides_its_family_at_the_next_lookup_and_spares_an_open_handle() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = start("pattern-removal");
+    let guest = fixture.mount("family", "family", "/family");
+
+    // Opened while the match still admits the name.
+    let held = fs::File::open(guest.path("project-b/note.txt")).expect("openable");
+
+    let response = fixture.control(&Request::RuleRemove {
+        namespace: family(),
+        path: "/family".to_owned(),
+        r#match: Some("project-*".to_owned()),
+    });
+    assert!(matches!(response, Response::Ok { .. }), "{response:?}");
+
+    // Nothing claims the family now, so the bare `*` decides it — and the one
+    // member a literal rule names outlives the match that used to cover it.
+    // The listing and the cached entry are bounded separately — a name already
+    // resolved keeps its dentry for the entry timeout — so both are waited for.
+    assert!(
+        eventually(PATIENCE, || names(guest.root())
+            == ["project-pinned".to_owned()]
+            && fs::metadata(guest.path("project-b")).is_err()),
+        "the family never went away: {:?}",
+        names(guest.root())
+    );
+    let hidden = fs::metadata(guest.path("project-b")).expect_err("hidden by the bare `*`");
+    assert_eq!(errno(&hidden), Errno::NOENT.raw_os_error(), "{hidden}");
+
+    // The handle from before is untouched, and a fresh look at the same path is
+    // refused — which is exactly the split the design draws.
+    let mut buffer = [0u8; 13];
+    let read = rustix::io::pread(held.as_fd(), &mut buffer, 0).expect("still readable");
+    assert_eq!((read, &buffer), (13, b"family member"));
+    let refused = fs::File::open(guest.path("project-b/note.txt")).expect_err("hidden now");
+    assert_eq!(errno(&refused), Errno::NOENT.raw_os_error(), "{refused}");
 }
 
 /// Criterion 8: a pattern-admitted child composes with ownership and

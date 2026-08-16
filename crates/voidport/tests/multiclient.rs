@@ -519,3 +519,68 @@ fn a_rename_over_an_open_file_leaves_its_holder_on_the_old_inode() {
         "the source name survived the rename"
     );
 }
+
+/// An unlink from one mount leaves the other mount's open handle working.
+///
+/// Unlink-while-open is one of the daily-driver semantics the design promises,
+/// and the corner that only two mounts can reach is this one: the name goes
+/// away through a session that knows nothing about the holder's handle. The
+/// holder must behave exactly as a local process whose file was unlinked under
+/// it — reads and writes keep landing on the inode it opened — while both
+/// mounts and the host agree the name is gone.
+#[test]
+fn an_unlink_from_one_mount_leaves_the_other_mounts_open_handle_working() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = Fixture::start("unlink-open");
+    let holder = fixture.mount("unlink-a", "plain", "/tree");
+    let remover = fixture.mount("unlink-b", "plain", "/tree");
+
+    fs::write(fixture.host("tree/doomed"), b"alive").expect("writable");
+    let open = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(holder.path("doomed"))
+        .expect("openable");
+
+    fs::remove_file(remover.path("doomed")).expect("removable");
+    assert!(
+        !fixture.host("tree/doomed").exists(),
+        "the unlink is passed through to the host, not deferred"
+    );
+
+    // The handle still names the inode: it reads what was stored and takes a
+    // write, with no name anywhere referring to it.
+    let mut buffer = [0u8; 5];
+    let read = rustix::io::pread(open.as_fd(), &mut buffer, 0).expect("still readable");
+    assert_eq!((read, &buffer), (5, b"alive"));
+    let written = rustix::io::pwrite(open.as_fd(), b"-more", 5).expect("still writable");
+    assert_eq!(written, 5);
+    let mut whole = [0u8; 10];
+    let mut read = 0;
+    while read < whole.len() {
+        let count =
+            rustix::io::pread(open.as_fd(), &mut whole[read..], read as u64).expect("readable");
+        assert_ne!(count, 0, "the held descriptor hit end of file early");
+        read += count;
+    }
+    assert_eq!(&whole, b"alive-more");
+
+    // The remover sees the name gone at once, and the holder once its entry
+    // cache expires — the same bound every other policy and host change has.
+    let gone = fs::metadata(remover.path("doomed")).expect_err("the name is gone");
+    assert_eq!(
+        errno(&gone),
+        rustix::io::Errno::NOENT.raw_os_error(),
+        "{gone}"
+    );
+    assert!(
+        eventually(PATIENCE, || fs::metadata(holder.path("doomed")).is_err()),
+        "the holder never stopped resolving a name that no longer exists"
+    );
+    // And nothing the holder wrote came back: closing the last handle is what
+    // frees the inode, exactly as it does locally.
+    drop(open);
+    assert!(!fixture.host("tree/doomed").exists());
+}

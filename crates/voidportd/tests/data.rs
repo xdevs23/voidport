@@ -497,6 +497,144 @@ fn a_create_lands_with_reverse_mapped_ownership_and_presents_forward() {
     assert!(!fixture.join("project/invisible").exists());
 }
 
+/// The ownership contract binds every kind a guest can make, not only the
+/// regular-file create above — and a guest id the table cannot map back lands
+/// as the server identity, never as the raw id.
+///
+/// A directory and a special file are chowned after the syscall that made them,
+/// which is code the regular-file create never runs. Two namespaces are needed
+/// to say anything true here, because the two directions differ:
+///
+/// * `plain` is passthrough, so the reverse of guest 4242 is host 4242 — which
+///   a server without `CAP_CHOWN` cannot apply. What holds in **both** postures
+///   is the sentence the contract rests on: the guest's view stays consistent
+///   because presentation forward-maps whatever the host actually recorded.
+/// * `project` maps one id and 4242 is in neither table, so the create falls to
+///   the server identity — and presents as guest 0, which is what that identity
+///   maps forward to.
+///
+/// The symlink arm of the same path is one test further down, ignored, because
+/// it does not hold.
+#[test]
+fn every_created_kind_carries_the_ownership_contract_into_the_host() {
+    let fixture = Fixture::start("create-ownership-kinds");
+    let server = (
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+    );
+    let privileged = rustix::process::getuid().is_root();
+
+    // Passthrough, from a caller that is nobody in particular.
+    let mut plain = fixture.server.mount("plain", "/tree");
+    plain.as_user(4242, 4242);
+    for (kind, name, entry) in made_by(&mut plain, ROOT, "plain") {
+        let host = fs::symlink_metadata(fixture.tree(&name)).expect("the host entry exists");
+        let expected = if privileged { (4242, 4242) } else { server };
+        assert_eq!(
+            (host.uid(), host.gid()),
+            expected,
+            "a {kind} lands with the reverse-mapped ids the server can apply"
+        );
+        assert_eq!(
+            (entry.attr.uid.get(), entry.attr.gid.get()),
+            (host.uid(), host.gid()),
+            "passthrough presents exactly what the host recorded for the {kind}"
+        );
+    }
+
+    // Mapped, from a caller the reverse table does not know.
+    let mut project = fixture.server.mount("project", "/project");
+    project.as_user(4242, 4242);
+    let foo = project.lookup(ROOT, "foo").expect("resolves");
+    for (kind, name, entry) in made_by(&mut project, foo.node_id, "mapped") {
+        let host = fs::symlink_metadata(fixture.join(&format!("project/foo/{name}")))
+            .expect("the host entry exists");
+        assert_eq!(
+            (host.uid(), host.gid()),
+            server,
+            "an unmapped creator's {kind} falls to the server identity, not to 4242"
+        );
+        assert_eq!(
+            (entry.attr.uid.get(), entry.attr.gid.get()),
+            (0, 0),
+            "and presents as the guest id the server identity maps to"
+        );
+    }
+}
+
+/// Makes one of each kind whose ownership the shared adoption path applies.
+///
+/// The regular-file `create` has its own test above.
+fn made_by(
+    client: &mut support::wire::WireClient,
+    parent: u64,
+    label: &str,
+) -> Vec<(&'static str, String, support::wire::Entry)> {
+    let fifo = format!("pipe-{label}");
+    let directory = format!("dir-{label}");
+    vec![
+        (
+            "fifo",
+            fifo.clone(),
+            client.mknod(parent, &fifo, 0o010_600).expect("creatable"),
+        ),
+        (
+            "directory",
+            directory.clone(),
+            client.mkdir(parent, &directory, 0o700).expect("creatable"),
+        ),
+    ]
+}
+
+/// The symlink arm of create ownership, which does not hold.
+///
+/// **Observed on this tree:** a symlink a guest creates keeps the *server's*
+/// own uid and gid instead of the caller's reverse-mapped ones. Every other
+/// created kind takes them. Under passthrough ownership a guest therefore
+/// creates a symlink and sees it owned by somebody else, which is not what the
+/// same sequence does locally.
+///
+/// The adoption path chowns a new entry through `/proc/self/fd/N`, and for the
+/// symlink it passes `AT_SYMLINK_NOFOLLOW` so the link and not its target is
+/// re-owned. Measured directly with a standalone C probe on this kernel:
+/// `fchownat("/proc/self/fd/N", …, AT_SYMLINK_NOFOLLOW)` **returns 0 and
+/// changes nothing** — with that flag the final component is the procfs magic
+/// link itself, so the call re-owns that and reports success. The server's own
+/// failure logging therefore never fires either, because there is no failure to
+/// log. The two obvious alternatives were measured on the same probe and both
+/// answer `EPERM` on an `O_PATH` descriptor: `fchownat(fd, "", AT_EMPTY_PATH |
+/// AT_SYMLINK_NOFOLLOW)` and following the magic link without the flag. So this
+/// is not a one-line correction, which is why the test is ignored and the
+/// behavior is reported instead of patched.
+#[test]
+#[ignore = "a guest-created symlink keeps the server's ownership; see the doc comment"]
+fn a_created_symlink_carries_the_ownership_contract_too() {
+    let fixture = Fixture::start("create-ownership-symlink");
+    let server = (
+        rustix::process::getuid().as_raw(),
+        rustix::process::getgid().as_raw(),
+    );
+    let privileged = rustix::process::getuid().is_root();
+
+    let mut plain = fixture.server.mount("plain", "/tree");
+    plain.as_user(4242, 4242);
+    let entry = plain
+        .symlink(ROOT, "link-plain", "elsewhere")
+        .expect("creatable");
+    // `symlink_metadata`, so the link is judged and not whatever it names.
+    let host = fs::symlink_metadata(fixture.tree("link-plain")).expect("the host entry exists");
+    assert_eq!(
+        (host.uid(), host.gid()),
+        if privileged { (4242, 4242) } else { server },
+        "a symlink lands with the reverse-mapped ids the server can apply"
+    );
+    assert_eq!(
+        (entry.attr.uid.get(), entry.attr.gid.get()),
+        (host.uid(), host.gid()),
+        "passthrough presents exactly what the host recorded"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Criterion 4 — symlinks and containment
 // ---------------------------------------------------------------------------

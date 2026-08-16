@@ -319,6 +319,62 @@ fn removing_a_listener_stops_new_connections_and_leaves_its_sessions_serving() {
     );
 }
 
+/// Removal on the transport that leaves nothing behind to look at, and what it
+/// gives back.
+///
+/// The unix case above can read the answer off the filesystem — the path is
+/// unlinked — but a tcp listener's only evidence is the socket itself, so the
+/// refused connection is what says it was closed and not merely forgotten. The
+/// second half is the churn an operator actually performs: a listener is
+/// identified by the source form it was added with, so removing one must give
+/// that spelling back. Otherwise `:0` could be added exactly once per server
+/// lifetime, and the state file would grow an entry nobody could remove.
+#[test]
+fn a_removed_tcp_listener_stops_accepting_and_gives_its_source_form_back() {
+    // A unix listener at startup, so the tcp entry under test is one this test
+    // added and can add again.
+    let case = Case::start("listener-remove-tcp", |directory| {
+        format!(
+            "[[server.listeners]]\ntransport = \"unix\"\npath = \"{}\"\n",
+            directory.join("startup.sock").display()
+        )
+    });
+    let mut client = case.control();
+    let endpoint = add(&mut client, tcp_listener());
+    let address: std::net::SocketAddr = endpoint.parse().expect("a bound address");
+
+    // Mounted through it, so the removal has a session to leave alone.
+    let mut mounted = WireClient::tcp(address).expect("the listener accepts");
+    mounted.hello("plain", "/tree").expect("the mount resolves");
+
+    client.expect_ok(&Request::ListenerRemove {
+        endpoint: endpoint.clone(),
+    });
+
+    assert!(
+        WireClient::tcp(address).is_err(),
+        "a removed tcp listener accepts nothing, and the operation answered only once it did not"
+    );
+    mounted
+        .lookup(ROOT, "data.bin")
+        .expect("an already-accepted session is untouched by removal");
+
+    // The source form is free again: while the listener was held, adding
+    // `127.0.0.1:0` a second time was a duplicate.
+    let again = add(&mut client, tcp_listener());
+    mounts(WireClient::tcp(again.parse().expect("a bound address")).expect("the new one accepts"));
+    assert_eq!(
+        case.persisted(),
+        vec![
+            Listener::Unix {
+                path: case.directory.join("startup.sock")
+            },
+            tcp_listener(),
+        ],
+        "the removed entry left the file, so the re-add did not double it"
+    );
+}
+
 #[test]
 fn removing_the_last_listener_leaves_a_control_socket_only_server() {
     let mut case = Case::tcp("listener-remove-last");

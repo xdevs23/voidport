@@ -469,6 +469,48 @@ fn a_subpath_mount_hears_only_its_own_subtree() {
     );
 }
 
+/// Criterion 4's silence half: an ancestor default that the mount root's own
+/// rule overrides changes nothing the session can see, so nothing is sent.
+///
+/// The stream's diff is computed on the **session-scoped entry set**, not on
+/// the rule table, and this is the case where the two disagree: the wildcard
+/// re-modes every name in the directory except the one a literal rule claims,
+/// which is this session's root. An implementation that fanned rule-table
+/// changes out instead of diffing entries would send a spurious `changed` here
+/// — and the guest would unmount and remount a share whose mode never moved.
+#[test]
+fn an_ancestor_default_the_mount_roots_own_rule_overrides_is_silent() {
+    let fixture = Fixture::start("subscribe-override");
+    // A mode-override island on what will be the mount root: a literal rule
+    // inside the `/tree` graft, which resolution gives the last word.
+    add_rule(&fixture, "plain", Rule::new("/tree/sub", ShareMode::Rw));
+
+    let mut client = fixture.server.mount("plain", "/tree/sub");
+    client.subscribe().expect("subscribed");
+    assert_eq!(
+        client.share_snapshot(),
+        vec![ShareLine::new("/", "rw", "directory")],
+        "the session's own rule is what resolves its mount root"
+    );
+
+    // One publish, and it decides every child of `/tree` except this one.
+    add_rule(&fixture, "plain", Rule::new("/tree/*", ShareMode::Ro));
+    assert_eq!(
+        client.try_share_event(SILENCE),
+        None,
+        "a default the mount root's own rule overrides is not a change to it"
+    );
+
+    // The silence was the diff, not a dead stream: take the overriding rule
+    // away and the same wildcard decides the root, which the session does hear.
+    remove_rule(&fixture, "plain", "/tree/sub");
+    assert_eq!(
+        client.share_event(),
+        ShareNotification::Changed(ShareLine::new("/", "ro", "directory")),
+        "with nothing overriding it, the default is what `/` resolves to"
+    );
+}
+
 /// Criterion 10, the lifecycle half: deleting the namespace ends the stream
 /// with `ended` while the tombstoned session keeps serving, and a `Subscribe`
 /// against the tombstoned session is refused.
