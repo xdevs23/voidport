@@ -200,49 +200,18 @@ async fn converse<S: DataStream>(stream: S, plane: Arc<DataPlane>, peer: Peer) -
     let Some(hello) = read_frame(&mut reader, MAX_HELLO_FRAME_LEN).await? else {
         return Ok(());
     };
-    let (session, _registration) = match handshake(&plane, &peer, &hello) {
+    let outcome = handshake(&plane, &peer, &hello);
+    if let Some(reply) = encode_handshake_reply(&outcome)? {
+        writer.write_all(&reply).await?;
+        writer.flush().await?;
+    }
+    let (session, _registration) = match outcome {
         Ok(Accepted {
-            request_id,
             session,
             registration,
-        }) => {
-            let mut buffer = [0u8; 64];
-            let reply = FrameWriter::response(
-                &mut buffer,
-                MAX_HELLO_FRAME_LEN,
-                request_id,
-                &HelloReply {
-                    root_node_id: U64::new(ROOT_NODE_ID),
-                    protocol_version: U32::new(PROTOCOL_VERSION),
-                    flags: U32::ZERO,
-                    max_frame_len: U32::new(MAX_FRAME_LEN),
-                    reserved: U32::ZERO,
-                },
-            )
-            .and_then(FrameWriter::finish)
-            .map_err(framing)?;
-            writer.write_all(reply).await?;
-            writer.flush().await?;
-            (session, registration)
-        }
-        Err(refusal) => {
-            // A refused handshake is answered before the connection closes, so
-            // the client learns why its mount failed.
-            if let Some(request_id) = refusal.request_id {
-                let mut buffer = [0u8; FRAME_HEADER_LEN + 4];
-                if let Ok(reply) = FrameWriter::error_response(
-                    &mut buffer,
-                    MAX_HELLO_FRAME_LEN,
-                    request_id,
-                    Opcode::Hello,
-                    -refusal.errno.raw_os_error(),
-                ) {
-                    writer.write_all(reply).await?;
-                    writer.flush().await?;
-                }
-            }
-            return Ok(());
-        }
+            ..
+        }) => (session, registration),
+        Err(_) => return Ok(()),
     };
 
     // The configured cap, used exactly as configured: zero is refused when the
@@ -691,6 +660,57 @@ fn handshake(plane: &DataPlane, peer: &Peer, bytes: &[u8]) -> Result<Accepted, R
         session,
         registration,
     })
+}
+
+/// Encodes the frame that answers a `Hello`, if there is one to send.
+///
+/// Accepted, it carries the parameters the rest of the session runs under —
+/// including [`MAX_FRAME_LEN`], the bound both directions are held to from
+/// here on. Refused, it carries the errno, because the client is owed the
+/// reason its mount failed.
+///
+/// Two refusals answer nothing: one whose frame was too malformed to name a
+/// request id, and one that cannot be encoded — the connection is closing
+/// either way, and a second failure adds nothing. An accepted handshake that
+/// cannot be encoded is a framing error, and it poisons the stream.
+///
+/// The frame is bounded by [`MAX_HELLO_FRAME_LEN`] in both cases: it is written
+/// before anything is negotiated, under the pre-handshake bound.
+fn encode_handshake_reply(outcome: &Result<Accepted, Refused>) -> io::Result<Option<Vec<u8>>> {
+    match outcome {
+        Ok(accepted) => {
+            let mut buffer = [0u8; 64];
+            let reply = FrameWriter::response(
+                &mut buffer,
+                MAX_HELLO_FRAME_LEN,
+                accepted.request_id,
+                &HelloReply {
+                    root_node_id: U64::new(ROOT_NODE_ID),
+                    protocol_version: U32::new(PROTOCOL_VERSION),
+                    flags: U32::ZERO,
+                    max_frame_len: U32::new(MAX_FRAME_LEN),
+                    reserved: U32::ZERO,
+                },
+            )
+            .and_then(FrameWriter::finish)
+            .map_err(framing)?;
+            Ok(Some(reply.to_vec()))
+        }
+        Err(refusal) => {
+            let Some(request_id) = refusal.request_id else {
+                return Ok(None);
+            };
+            let mut buffer = [0u8; FRAME_HEADER_LEN + 4];
+            let reply = FrameWriter::error_response(
+                &mut buffer,
+                MAX_HELLO_FRAME_LEN,
+                request_id,
+                Opcode::Hello,
+                -refusal.errno.raw_os_error(),
+            );
+            Ok(reply.ok().map(|reply| reply.to_vec()))
+        }
+    }
 }
 
 /// Parses a mount subpath.
