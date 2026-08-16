@@ -1339,6 +1339,45 @@ for small projects whose hot files are re-read constantly, where
 the cache repays its bounded cost with native-speed re-reads.
 
 
+## 2026-08-16 — readahead in the field, post-integration
+
+Measured on the same separate deployment as the direct-io section
+above, after its migration to a build carrying the readahead engine.
+Reproduced numbers; conditions stated as reported.
+
+- **Sequential reads 1.66x**: 609/668 MB/s with `--readahead 0`
+  against 1043/1096 MB/s at the 256 MiB default — same binary, same
+  transport, same 512 MiB file, two mounts of the same namespace.
+  Engine-off is effectively the pre-readahead behaviour, so this A/B
+  is a controlled before/after; both halves ran minutes apart under
+  identical load. Because readahead applies under `--direct-io`,
+  that deployment's default for every share, every mount gets it
+  without a flag.
+- **Metadata unchanged**: cold `grep -r` 928-949 ms against
+  867-924 ms before, warm walk+stat 65-73 ms against 70-71 ms.
+  Within noise, and the halves are not load-matched (the host ran
+  one other VM then, four plus a large build now). Readahead does
+  not touch the per-file round-trip path, so unchanged is the
+  expected result.
+- **Distance from native**: the share reads at 1.04-1.25 GB/s
+  against 5.3-5.5 GB/s from the local overlay — about 20%. The
+  local reference is itself host-page-cache-backed through
+  virtio-blk, so its figure is memory speed, not disk.
+- **Writes through the share: 172 MB/s.** The weakest number in the
+  report. The write path pipelines nothing — every write is a full
+  round trip — making it the mirror image of what readahead fixed
+  on reads. **OPEN**: whether and how to improve it is undecided;
+  any buffering trades durability semantics and needs a decision
+  before a contract.
+- **Interactive latency under a never-pausing bulk reader**:
+  49-60 ms idle to 72-85 ms loaded, ~1.5x, degrading gracefully
+  without stalls. This is the harshest case the two-class reply
+  writer faces.
+
+Every absolute figure above was taken on a host running four VMs and
+a large build concurrently — a busy-host floor. The 1.66x A/B is the
+trustworthy comparison; both halves shared conditions.
+
 ## 2026-08-16 — readahead: what pipelining a direct mount buys, and where the wire stops it
 
 The readahead increment's criterion 1 and criterion 3 measurements, and the
