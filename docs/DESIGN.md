@@ -3305,18 +3305,32 @@ only ever lost conservatively, never resurrected onto an unrelated
 file.
 
 The store is owned by the **registry, per namespace name** — one
-instance across every republish, so a tombstoned session and its
-successor share the same authority and no two tables ever race one
-sidecar. The namespace snapshot stays immutable; reads are an
+instance across every republish. A session captures its store
+handle at handshake, beside its namespace resolution, so a deleted
+namespace does not take the store from a session still serving;
+removal deletes the sidecar with the namespace — recorded truth is
+namespace configuration and dies with it — and retires the store,
+which accepts no further writes; a re-created name starts a fresh,
+empty store. The sidecar is read **once per name**, when the store
+is created — server startup for a name the state file holds, or
+the namespace-create that introduces one — never at namespace
+build, which runs on every control mutation. No two tables ever
+race one sidecar. The namespace snapshot stays immutable; reads are an
 atomic pointer load of a copy-on-write map — free on every path
 including the pinless listing walk, no lock on the request path —
 and the rare writers rebuild and swap under the store's own small
-mutex. Mutation updates the store immediately and persists the
-sidecar **debounced** under the rename-over discipline, with the
-cadence at its constant, a flush on graceful shutdown and on
-namespace removal, the temporaries under the orphan sweep's
-prefix, and the state file's own refusal posture on a sidecar that
-does not parse. The crash contract is a local filesystem's for
+mutex — and a strip that finds nothing to clear writes nothing: no
+rebuild, no swap, no debounce reschedule, so a chunked write's
+repeated marks cost one update at most. Mutation updates the store
+immediately and persists the sidecar **debounced** under the
+rename-over discipline, with the cadence at its constant; the
+daemon flushes every store after both planes stop and before the
+instance lock drops; the temporaries ride the orphan sweep's
+prefix; the sidecar is the state file's own serde-backed TOML with
+the state file's refusal posture when it does not parse; and its
+file name is a bounded, injective derivation of the namespace name
+under the state file's prefix, since the name grammar is wider
+than a filename's. The crash contract is a local filesystem's for
 recent metadata, plus the flushes a local filesystem also gives:
 the unflushed tail may be lost, the file is always a whole
 document, nothing is ever half-written. A rename through the
@@ -3448,9 +3462,15 @@ split-role store.
   persisted like every mutation, live at the next operation.
   Disabled, presentation masks privileged bits — recorded and
   host-real alike — and a chmod attempting to set them refuses
-  (EPERM). The client mount option does the same for one mount,
-  the nosuid stance. Artifacts: the state example, the README
-  semantics section, and the man pages carry both switches.
+  (EPERM). The client mount option does the same for one mount —
+  stronger than the classic nosuid, which honors nothing but still
+  shows the bits; this masks them. **Under any masked
+  presentation — the disabled switch or the mount option — a
+  delivered mode neither records nor deletes**: the guest was
+  shown a mode without the bits, so a read-modify-write chmod from
+  it must not destroy recorded truth other mounts still present.
+  Artifacts: the state example, the README semantics section, and
+  the man pages carry both switches.
 - **Enforcement is the guest kernel's**, in its own trust domain:
   the server presents bits, the guest decides what exec does with
   them — the posture THREAT-MODEL states for every presented
@@ -3481,9 +3501,12 @@ split-role store.
    capability negotiation on the deployment kernel, and that
    negotiating nothing left the kernel's own cached-mount and
    truncate stripping untouched.
-4. The disabled namespace masks and refuses per the contract, the
-   change binding at the next operation without remount; the mount
-   option does the same client-side.
+4. The disabled namespace masks and refuses per the contract,
+   binding at the next operation that reaches the server, with the
+   guest's attribute caching bounding the visible lag by the
+   mount's attr TTL; the mount option does the same client-side;
+   and a delivered mode under masked presentation neither records
+   nor deletes, pinned by the read-modify-write test.
 5. The wire flag is covered: golden vectors carry it on
    `write_flags`, an elder server ignores it (interop test), the
    version stays 1 under the amended stability rule with the
@@ -3491,17 +3514,22 @@ split-role store.
    skew posture is documented.
 6. The cost is an atomic-load lookup: a syscall census shows zero
    added host work on any attribute path including the pinless
-   listing walk, and no lock joins the request path (the store
-   read is a pointer load, pinned in review). The sidecar's
-   debounce cadence is stated at its constant; graceful shutdown
-   and namespace removal flush; the kill test pins the crash
-   window (the unflushed tail lost, the file always a whole
-   document, flushed rows revalidate and survive); the temporaries
-   ride the orphan sweep; a stripped or chmod-cleared record is
-   DELETED, pinned by the chmod-644-clears test; a rename through
-   the server updates the locator and a host-side rename drops at
-   the next revalidation, both pinned by test; an assignment
-   through one link strips through every link, pinned by test.
+   listing walk, and no lock joins the request path beyond the
+   published-snapshot read the operation already takes, the store
+   handle resolved once per operation, never per listing entry.
+   The sidecar's debounce cadence is stated at its constant; the
+   daemon's teardown flush and the removal deletion are pinned by
+   test; the kill test pins the crash window (the unflushed tail
+   lost, the file always a whole document, flushed rows revalidate
+   and survive); the temporaries ride the orphan sweep; a record
+   is deleted when its last bit clears, whichever rule cleared it
+   — pinned by the chmod-644 test — while a strip that clears
+   setuid off a setgid-without-group-execute record updates it,
+   pinned too; a no-op strip writes nothing; a rename through the
+   server updates the locator and a host-side rename drops at the
+   next revalidation, both pinned by test, the subtree and
+   exchange rename forms included; an assignment through one link
+   presents and strips through every link, pinned by test.
 7. Both gates pass with the new suites executing; THREAT-MODEL
    carries the enforcement posture including the nosuid-host-mount
    line.
