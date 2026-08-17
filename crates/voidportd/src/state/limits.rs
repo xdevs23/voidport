@@ -50,7 +50,8 @@ pub struct Limits {
     pub max_sessions: Option<usize>,
     /// How many requests one session may have in flight. Reaching it pauses
     /// that connection's read loop — backpressure, not an error. `None`: the
-    /// read loop never pauses, since there is no number to reach.
+    /// data plane's own run-ahead bound applies, which pauses the same way and
+    /// refuses nothing either ([`crate::data::caps`]).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_inflight: Option<usize>,
     /// How many nodes one session's node table may hold. The lookup that would

@@ -38,22 +38,25 @@
 //! one regardless, so a client that keeps small replies coming cannot stop its
 //! own data.
 //!
-//! Backpressure is the interesting part, **where an operator configured it**. A
-//! session may have
+//! Backpressure is the interesting part, and **every connection runs under
+//! it**. A session may have
 //! [`Limits::max_inflight`](crate::data::caps::Limits::max_inflight) requests
 //! being served; the reader takes a permit *before* it reads the next frame, so
-//! at the cap it simply stops reading. The socket buffer fills, the client's
+//! at the bound it simply stops reading. The socket buffer fills, the client's
 //! own kernel throttles it, and nothing is answered with an error for being
 //! busy. That one mechanism also bounds the blocking pool and the reply queue,
 //! since neither can outgrow the number of requests in flight.
 //!
-//! With the cap unconfigured — the default — there is no number to reach, so
-//! no permit is taken and the read loop never pauses: a request is dispatched
-//! as fast as it arrives, and what bounds the work is the runtime and the
-//! blocking pool. The reply queue then takes a depth of its own
-//! ([`REPLY_QUEUE_DEPTH`]), which is a handoff to the writer and not a cap: a
-//! full queue makes a finished request wait for the writer's syscall, it never
-//! refuses anything.
+//! With the cap unconfigured — the default — the number is the server's own,
+//! [`RUN_AHEAD_REQUESTS`], and everything else is identical: the same permit
+//! per request, the same pause instead of an error, the same reply queue sized
+//! by the same number. A read loop with no bound dispatches as fast as frames
+//! arrive, so a client that floods cheap requests has them all being served at
+//! once (measured 2026-08-17: a `forget` flood after a 200 000-name walk drove
+//! the blocking pool to its thread ceiling and the resident set a third above
+//! its plateau, where the bound holds the same transient inside the noise).
+//! What no bound here ever does is refuse: a full reply queue only makes a
+//! finished request wait for the writer's syscall.
 //!
 //! A framing error anywhere — in the handshake, in a request, in a reply the
 //! writer could not deliver — poisons the stream, and the connection closes.
@@ -89,6 +92,7 @@ use voidport_proto::opcode::Opcode;
 use voidport_proto::ops::handshake::{HelloReply, HelloRequest};
 use zerocopy::byteorder::little_endian::{U32, U64};
 
+use super::caps::Limits;
 use super::ops::{self, Served};
 use super::server::DataPlane;
 use super::session::{Peer, Session};
@@ -150,17 +154,25 @@ pub const MAX_FRAME_LEN: u32 = 1024 * 1024;
 /// stays this buffer, not the frame bound.
 const READ_BUFFER_BYTES: usize = 64 * 1024;
 
-/// How many finished replies a connection with no in-flight cap queues for its
-/// writer.
+/// How far a client may run ahead of the server on a connection the operator
+/// capped at nothing: the in-flight bound the data plane holds itself to, in
+/// requests.
 ///
-/// A cap sizes this queue when there is one: no more replies can exist than
-/// requests in flight. With no cap there is no such number, and a queue is
-/// still needed because `mpsc` is bounded — so this is the depth chosen for
-/// that case. It bounds nothing a guest can ask for: a full queue moves the
-/// finished reply to a task that waits for the writer to drain one, which is
-/// the same wait the writer's socket would impose one step later — and never
-/// a parked pool thread, which the dispatch comment explains.
-const REPLY_QUEUE_DEPTH: usize = 1024;
+/// It is not a cap in the operator's sense. It refuses nothing and it is not
+/// configurable — it is the permit the configured cap takes, at a number the
+/// server chose, so reaching it pauses the read loop and the socket buffer
+/// absorbs the rest. It exists because an unbounded read loop was measured and
+/// costly: a `forget` flood behind a 200 000-name walk ran the blocking pool to
+/// its 512-thread ceiling and the resident set to 35% above its plateau, where
+/// this bound gives 1.9% and 245 threads, settles 12.7 MiB lower, and leaves
+/// the walk and 16-client throughput at parity.
+///
+/// **The value is measured, not a round number to raise.** At 1024 the same
+/// flood still cost 5.3% and the full 512 threads, and 16 concurrent clients
+/// over one mount lost 19% of their aggregate throughput against no bound at
+/// all — worse, on the ceiling that matters most, than either neighbour. Do not
+/// round it up.
+const RUN_AHEAD_REQUESTS: usize = 64;
 
 /// The payload size at which a reply is scheduled as **bulk**.
 ///
@@ -218,15 +230,13 @@ async fn converse<S: DataStream>(stream: S, plane: Arc<DataPlane>, peer: Peer) -
         Err(_) => return Ok(()),
     };
 
-    // The configured cap, used exactly as configured: zero is refused when the
-    // state file is loaded, so nothing here has to raise a number the operator
-    // wrote and then enforce a different one. Unconfigured, there are no
-    // permits at all — the mechanism is absent, not set to a large
-    // number, so nothing about it can bite a session nobody capped.
-    let inflight = session.limits().max_inflight;
-    let (outgoing, incoming) = queues(inflight.unwrap_or(REPLY_QUEUE_DEPTH));
+    // One number governs the whole connection, and there is only ever one
+    // posture below it: the permits and the reply queue are both sized by it,
+    // capped or not.
+    let inflight = inflight_bound(session.limits());
+    let (outgoing, incoming) = queues(inflight);
     let (stop, stopped) = watch::channel(false);
-    let permits = inflight.map(|inflight| Arc::new(Semaphore::new(inflight)));
+    let permits = Arc::new(Semaphore::new(inflight));
     let outstanding = Arc::new(Mutex::new(HashSet::new()));
 
     let writing = tokio::spawn(write_replies(
@@ -241,7 +251,7 @@ async fn converse<S: DataStream>(stream: S, plane: Arc<DataPlane>, peer: Peer) -
         &mut reader,
         &session,
         &outgoing,
-        permits.as_ref(),
+        &permits,
         &outstanding,
         stopped,
     )
@@ -271,7 +281,7 @@ async fn read_requests<R>(
     reader: &mut R,
     session: &Arc<Session>,
     outgoing: &Outbox,
-    permits: Option<&Arc<Semaphore>>,
+    permits: &Arc<Semaphore>,
     outstanding: &Arc<Mutex<HashSet<u64>>>,
     mut stopped: watch::Receiver<bool>,
 ) -> io::Result<()>
@@ -279,9 +289,8 @@ where
     R: AsyncRead + Unpin,
 {
     loop {
-        // Taken before the read: at the cap the connection simply stops
-        // reading, which is the backpressure the design asks for. With no cap
-        // there is nothing to take and the loop never pauses here.
+        // Taken before the read: at the bound the connection simply stops
+        // reading, which is the backpressure the design asks for.
         let Some(permit) = acquire(permits, &mut stopped).await else {
             return Ok(());
         };
@@ -401,38 +410,39 @@ fn serve_request(session: &Session, bytes: &[u8]) -> Result<Served, FramingError
     })
 }
 
-/// What a request holds while it is in flight: a permit where the session is
-/// capped, and nothing where it is not.
-type Permit = Option<OwnedSemaphorePermit>;
+/// How many requests one connection may have in flight.
+///
+/// A configured cap is used exactly as configured: zero is refused when the
+/// state file is loaded, so nothing here has to raise a number the operator
+/// wrote and then enforce a different one. Absent, the number is
+/// [`RUN_AHEAD_REQUESTS`] — the data plane's own bound, which is not a cap and
+/// refuses nothing, so the only thing an operator's setting changes is the
+/// number.
+fn inflight_bound(limits: Limits) -> usize {
+    limits.max_inflight.unwrap_or(RUN_AHEAD_REQUESTS)
+}
 
 /// Waits for an in-flight permit, giving up if the connection is stopping.
-///
-/// A session with no configured cap has no semaphore, so this returns at once
-/// with nothing to hold: the read loop is never paused by a mechanism the
-/// operator did not ask for.
 ///
 /// The wait has to watch the shutdown signal, because the requests holding the
 /// permits are not guaranteed to finish on their own: a host syscall already on
 /// the blocking pool cannot be cancelled, and a request parked on a lock is
 /// only cancelled *by this very signal*, which it cannot deliver to itself.
-/// A bare `acquire_owned` would therefore park a connection sitting at the cap
-/// for as long as those requests last, deaf to the writer stopping the stream
-/// on a framing error or a failed write. The read loop would never return,
-/// [`converse`] would never reach `Session::teardown`, and the session's
-/// handles, nodes, pinned descriptors and session-cap slot would outlive the
-/// connection — against the required "connection drop or any framing error tears
-/// down the session: all handles and nodes close".
+/// A bare `acquire_owned` would therefore park a connection sitting at the
+/// bound for as long as those requests last, deaf to the writer stopping the
+/// stream on a framing error or a failed write. The read loop would never
+/// return, [`converse`] would never reach `Session::teardown`, and the
+/// session's handles, nodes, pinned descriptors and session-cap slot would
+/// outlive the connection — against the required "connection drop or any
+/// framing error tears down the session: all handles and nodes close".
 async fn acquire(
-    permits: Option<&Arc<Semaphore>>,
+    permits: &Arc<Semaphore>,
     stopped: &mut watch::Receiver<bool>,
-) -> Option<Permit> {
-    let Some(permits) = permits else {
-        return Some(None);
-    };
+) -> Option<OwnedSemaphorePermit> {
     tokio::select! {
         biased;
         _ = stopped.wait_for(|stopped| *stopped) => None,
-        permit = Arc::clone(permits).acquire_owned() => permit.ok().map(Some),
+        permit = Arc::clone(permits).acquire_owned() => permit.ok(),
     }
 }
 
@@ -1008,7 +1018,7 @@ mod tests {
         assert!(outstanding.lock().expect("unpoisoned").is_empty());
     }
 
-    /// A connection at the in-flight cap whose requests never complete — a
+    /// A connection at the in-flight bound whose requests never complete — a
     /// blocking lock held by another session is enough — must still notice the
     /// writer stopping the stream, or its session is never torn down.
     #[tokio::test]
@@ -1017,48 +1027,76 @@ mod tests {
         let held = Arc::clone(&permits)
             .acquire_owned()
             .await
-            .expect("the cap is open");
+            .expect("the bound is open");
         let (stop, mut stopped) = watch::channel(false);
 
-        // At the cap the reader waits, which is the backpressure.
+        // At the bound the reader waits, which is the backpressure.
         assert!(
             tokio::time::timeout(
                 std::time::Duration::from_millis(50),
-                acquire(Some(&permits), &mut stopped),
+                acquire(&permits, &mut stopped),
             )
             .await
             .is_err(),
-            "an occupied cap pauses the read loop"
+            "an occupied bound pauses the read loop"
         );
 
         // The writer poisons the stream while the request holding the permit is
         // still on the host: the wait has to end anyway.
         stop.send(true).expect("the reader still waits");
         assert!(
-            acquire(Some(&permits), &mut stopped).await.is_none(),
+            acquire(&permits, &mut stopped).await.is_none(),
             "a stopping connection stops waiting for a permit"
         );
         drop(held);
     }
 
-    /// The default posture: with no cap there is no semaphore, so the read loop
-    /// is never paused — and it still stops when the connection does.
-    #[tokio::test]
-    async fn an_uncapped_connection_never_waits_for_a_permit() {
-        let (stop, mut stopped) = watch::channel(false);
-        for _ in 0..1000 {
-            assert!(
-                acquire(None, &mut stopped)
-                    .await
-                    .expect("an uncapped read loop is never paused")
-                    .is_none(),
-                "and it holds nothing while the request is served"
+    /// The number one connection runs under: the operator's where they wrote
+    /// one, and the run-ahead bound where they wrote none. A configured cap is
+    /// never quietly replaced by the internal number, in either direction.
+    #[test]
+    fn an_absent_cap_takes_the_run_ahead_bound_and_a_configured_one_is_used_as_written() {
+        assert_eq!(inflight_bound(Limits::default()), RUN_AHEAD_REQUESTS);
+        for configured in [1, 8, RUN_AHEAD_REQUESTS, 1024, 65_536] {
+            assert_eq!(
+                inflight_bound(Limits {
+                    max_inflight: Some(configured),
+                    ..Limits::default()
+                }),
+                configured,
+                "a configured cap keeps exactly its value"
             );
         }
-        stop.send(true).expect("the reader is still there");
+    }
+
+    /// The default posture, which is a bound and not the absence of one: the
+    /// read loop pauses with [`RUN_AHEAD_REQUESTS`] requests in flight, and one
+    /// of them completing lets the next frame in.
+    #[tokio::test]
+    async fn an_unconfigured_connection_pauses_at_the_run_ahead_bound() {
+        let permits = Arc::new(Semaphore::new(inflight_bound(Limits::default())));
+        let (_stop, mut stopped) = watch::channel(false);
+        let mut held = Vec::new();
+        for _ in 0..RUN_AHEAD_REQUESTS {
+            held.push(
+                acquire(&permits, &mut stopped)
+                    .await
+                    .expect("the bound is open"),
+            );
+        }
         assert!(
-            acquire(None, &mut stopped).await.is_some(),
-            "a stopping connection is noticed by the read loop's own select, not here"
+            tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                acquire(&permits, &mut stopped),
+            )
+            .await
+            .is_err(),
+            "a client may not run more than {RUN_AHEAD_REQUESTS} requests ahead"
+        );
+        drop(held.pop());
+        assert!(
+            acquire(&permits, &mut stopped).await.is_some(),
+            "and a request completing lets the read loop take the next frame"
         );
     }
 

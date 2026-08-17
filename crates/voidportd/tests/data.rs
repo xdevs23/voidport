@@ -1107,67 +1107,108 @@ fn overlapping_requests_complete_out_of_order() {
 /// — each of which also needs a pool thread for its host syscalls — queues
 /// behind it too; the bystander's lookup below never returns.
 ///
+/// The storm is spread over connections, because a parked wait is a request in
+/// flight and a connection's in-flight bound is what says how many of those it
+/// may have at once. That is the honest shape of the property anyway: the
+/// blocking pool is a resource of the whole process, so what must never park a
+/// thread is a wait, whichever connection asked for it.
+///
 /// Three things are asserted, in the order they matter:
 ///
 /// 1. a session with nothing to do with the contended file is served promptly
 ///    while the storm is parked (the pool is free);
-/// 2. releasing the lock wakes a waiter promptly (the backoff cap is a
+/// 2. releasing a lock wakes its waiter promptly (the backoff cap is a
 ///    latency, not a stall);
-/// 3. dropping the connection releases every parked waiter's descriptor (the
+/// 3. dropping the connections releases every parked waiter's descriptor (the
 ///    wait really is cancelled, and cancellation cleans up).
 #[test]
 fn hundreds_of_stacked_lock_waiters_leave_the_blocking_pool_free() {
     /// More waiters than tokio's blocking pool has threads.
     const WAITERS: u64 = 700;
+    /// How many of them one connection parks, comfortably inside the in-flight
+    /// bound a connection nobody capped runs under.
+    const PER_CONNECTION: u64 = 50;
+    /// The connections the storm is spread over.
+    const CONNECTIONS: u64 = WAITERS / PER_CONNECTION;
 
     let fixture = Fixture::start("lock-storm");
     let mut holder = fixture.server.mount("plain", "/tree");
-    let mut storm = fixture.server.mount("plain", "/tree");
+    let mut witness = fixture.server.mount("plain", "/tree");
     let mut bystander = fixture.server.mount("plain", "/tree");
     let path = fixture.tree("data.bin");
 
-    // One owner holds the whole file, so every waiter below conflicts.
+    // One owner holds two disjoint ranges: the storm's, which every waiter in
+    // the fleet below conflicts with, and the witness's, which exactly one
+    // waiter conflicts with. Releasing the second is what makes "a release
+    // wakes a waiter" an answer the test can read off a known connection while
+    // the whole storm is still parked on the first.
     let held = holder.lookup(ROOT, "data.bin").expect("resolves");
     let held_handle = holder.open(held.node_id, O_RDWR).expect("opens");
     holder
-        .setlk(held_handle, lock(1, lock_type::WRITE, 0, u64::MAX), false)
+        .setlk(held_handle, lock(1, lock_type::WRITE, 0, 0), false)
+        .expect("the range is free");
+    holder
+        .setlk(held_handle, lock(1, lock_type::WRITE, 100, 200), false)
         .expect("the range is free");
 
     // The bystander mounts and works before the storm, so what is measured
     // afterwards is the storm and not a first-time resolution.
     bystander.lookup(ROOT, "data.bin").expect("resolves");
 
-    let file = storm.lookup(ROOT, "data.bin").expect("resolves");
-    let handle = storm.open(file.node_id, O_RDWR).expect("opens");
+    let witnessed = witness.lookup(ROOT, "data.bin").expect("resolves");
+    let witness_handle = witness.open(witnessed.node_id, O_RDWR).expect("opens");
+    let mut fleet = Vec::with_capacity(CONNECTIONS as usize);
+    let mut handles = Vec::with_capacity(CONNECTIONS as usize);
+    for _ in 0..CONNECTIONS {
+        let mut storm = fixture.server.mount("plain", "/tree");
+        let file = storm.lookup(ROOT, "data.bin").expect("resolves");
+        handles.push(storm.open(file.node_id, O_RDWR).expect("opens"));
+        fleet.push(storm);
+    }
     let baseline = open_descriptors(&path);
 
-    // One connection, one handle, hundreds of wire lock owners: each gets its
-    // own open file description, and each parks on the holder's lock.
-    let mut requests = Vec::with_capacity(WAITERS as usize);
-    for owner in 0..WAITERS {
-        requests.push(storm.send(
-            0,
-            &voidport_proto::ops::file::SetlkRequest {
-                handle: U64::new(handle),
-                lock: lock(100 + owner, lock_type::WRITE, 0, u64::MAX),
-                flags: U32::new(1),
-                reserved: U32::ZERO,
-            },
-            &[],
-        ));
+    // Hundreds of wire lock owners over those connections: each gets its own
+    // open file description, and each parks on the holder's lock.
+    for (index, (storm, handle)) in fleet.iter_mut().zip(&handles).enumerate() {
+        for owner in 0..PER_CONNECTION {
+            storm.send(
+                0,
+                &voidport_proto::ops::file::SetlkRequest {
+                    handle: U64::new(*handle),
+                    lock: lock(
+                        100 + index as u64 * PER_CONNECTION + owner,
+                        lock_type::WRITE,
+                        0,
+                        0,
+                    ),
+                    flags: U32::new(1),
+                    reserved: U32::ZERO,
+                },
+                &[],
+            );
+        }
     }
+    let witness_request = witness.send(
+        0,
+        &voidport_proto::ops::file::SetlkRequest {
+            handle: U64::new(witness_handle),
+            lock: lock(1, lock_type::WRITE, 100, 200),
+            flags: U32::new(1),
+            reserved: U32::ZERO,
+        },
+        &[],
+    );
+    let parked = WAITERS as usize + 1;
 
     // A parked waiter holds exactly one description of the file, so the
     // descriptor count is how the test sees the whole storm arrive.
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
-    while open_descriptors(&path) < baseline + WAITERS as usize
-        && std::time::Instant::now() < deadline
-    {
+    while open_descriptors(&path) < baseline + parked && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
     }
     assert!(
-        open_descriptors(&path) >= baseline + WAITERS as usize,
-        "only {} of {WAITERS} waiters parked",
+        open_descriptors(&path) >= baseline + parked,
+        "only {} of {parked} waiters parked",
         open_descriptors(&path) - baseline
     );
 
@@ -1182,27 +1223,30 @@ fn hundreds_of_stacked_lock_waiters_leave_the_blocking_pool_free() {
         "an unrelated request waited {served:?} behind {WAITERS} parked lock waiters"
     );
 
-    // 2. The release wakes one of them, and quickly: the retry cap is the
-    //    worst case, and this bound is many times it.
+    // 2. The release wakes the waiter on that range, and quickly: the retry cap
+    //    is the worst case, and this bound is many times it. The rest of the
+    //    storm stays parked meanwhile, which is what makes this the latency
+    //    under load and not on an idle server.
     let released = std::time::Instant::now();
     holder
-        .setlk(held_handle, lock(1, lock_type::UNLOCK, 0, u64::MAX), false)
+        .setlk(held_handle, lock(1, lock_type::UNLOCK, 100, 200), false)
         .expect("releases");
-    let (answered, status) = storm.receive_status::<voidport_proto::ops::file::SetlkResponse>();
+    let (answered, status) = witness.receive_status::<voidport_proto::ops::file::SetlkResponse>();
     let woken = released.elapsed();
     assert_eq!(status, 0, "the woken waiter took the lock");
-    assert!(
-        requests.contains(&answered),
-        "an answer that belongs to no waiter: {answered}"
+    assert_eq!(
+        answered, witness_request,
+        "the answer belongs to its waiter"
     );
     assert!(
         woken < Duration::from_millis(500),
         "a released lock took {woken:?} to wake a waiter"
     );
 
-    // 3. The connection dies with hundreds of waiters still parked, and every
-    //    description they were waiting to lock through goes with it.
-    drop(storm);
+    // 3. The connections die with hundreds of waiters still parked, and every
+    //    description they were waiting to lock through goes with them.
+    drop(witness);
+    drop(fleet);
     let deadline = std::time::Instant::now() + Duration::from_secs(30);
     while open_descriptors(&path) > baseline && std::time::Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(20));
