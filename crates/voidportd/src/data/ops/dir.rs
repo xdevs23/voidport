@@ -458,7 +458,7 @@ fn caller<M: voidport_proto::message::RequestBody>(request: &Request<'_, M>) -> 
 }
 
 /// The permission bits a create requests, with the caller's umask applied.
-fn permissions(mode: u32, umask: u32) -> Mode {
+pub(super) fn permissions(mode: u32, umask: u32) -> Mode {
     Mode::from_bits_truncate(mode & !umask & 0o7777)
 }
 

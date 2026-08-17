@@ -112,7 +112,7 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
     let body = request.body();
 
     let flags = open_flags(body.flags.get());
-    let mode = Mode::from_bits_truncate(body.mode.get() & !body.umask.get() & 0o7777);
+    let mode = super::dir::permissions(body.mode.get(), body.umask.get());
     let exclusive = OFlags::from_bits_truncate(body.flags.get()).contains(OFlags::EXCL);
     let open = |flags, mode| create_child(site.directory.as_fd(), &site.name, flags, mode);
     // Whether this call *created* the entry decides two things — whose the
