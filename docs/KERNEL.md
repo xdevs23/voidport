@@ -5,9 +5,13 @@ written 2026-08-17 at the close of v1; rewritten the same day after
 its probing spec review, which measured two claims false, disproved
 one enumeration with a live probe, and rebuilt the compile probes
 against the newest kernel — every correction is folded in below,
-and the review's probes are part of this document's evidence. This
-document decides the design and implements nothing: implementation
-begins when it is opened, separately.
+and the review's probes are part of this document's evidence.
+Amended the same day after the follow-up review, which verified the
+closures and found four residual contradictions — the coherence
+carry-over, the write-path wording, the unnamed kernel attribute,
+and the shared core's license — all folded in below. This document
+decides the design and implements nothing: implementation begins
+when it is opened, separately.
 
 Standing context: the userspace FUSE client remains the client for
 userspace mounts, permanently. The kernel client exists for the
@@ -24,7 +28,7 @@ experiment, it names the experiment instead of guessing, and each
 implementation phase gates on the experiments before it.
 
 Evidence classes used throughout: **measured** (a probe ran and its
-number is stated), **compile-proven** (it builds and links; it has
+result is stated), **compile-proven** (it builds and links; it has
 never executed), **proven by source** (read in the named kernel
 version), **decided** (a recorded project decision), **open** (the
 settling experiment is named). The review that shaped this rewrite
@@ -60,7 +64,11 @@ io_uring evaluation stays retired by the recorded decision.
    userspace client into a shared no_std core crate**, not written
    twice: one authority for the resilience contract, consumed by
    both clients, tested by the existing suites through the
-   userspace client and by ring-1 tests directly. The extraction is
+   userspace client and by ring-1 tests directly. The core speaks
+   through a frame transport handed to it as data — vsock now, the
+   v2 window's control queue later — so the decided v2 shape's
+   control half has its seam here, beside the data-provider
+   boundary named in the caching section. The extraction is
    its own implementation phase with its own review, because it
    refactors shipped v1 code. Kernel-space constraints the core
    must meet, decided here: replay retention and the request table
@@ -74,11 +82,11 @@ io_uring evaluation stays retired by the recorded decision.
    offers is used from it: allocation, synchronization, workqueues,
    module plumbing — and, decisively, the kernel's **generated
    bindings crate**, through which the filesystem registration
-   types are reachable from Rust without hand-written C
-   (**compile-proven by the review**: the registration structures
-   resolve through the bindings, and every registration and
+   types are reachable from Rust without hand-written C (the
+   registration structures resolve through the bindings,
+   **compile-proven by the review**; every registration and
    super-block symbol the client needs is a plain export in both
-   probed kernels). What the bindings cannot express — static
+   probed kernels, **proven by source**). What the bindings cannot express — static
    inline helpers and macros, which the generator cannot call — is
    the true C surface, enumerated below. This layer owns the one
    auditable unsafe boundary.
@@ -165,8 +173,11 @@ guest and host — and says so instead of pretending otherwise.
 
 **The v2 seam is exactly here, and it is why the trade is
 acceptable.** The data path sits behind one provider boundary in
-the kernel-Rust layer: the interim provider fills and writes back
-pages over the wire; the v2 provider maps the shared-memory window
+the kernel-Rust layer: the interim provider fills pages from the
+wire and writes through them to the wire — writethrough, no
+writeback cache, per the decided coherence contract, with fsync
+and flush passing through as in v1; the v2 provider maps the
+shared-memory window
 so the same page cache pages ARE host memory — the DAX shape, which
 removes the duplication the interim accepts. Nothing above the
 boundary changes when the provider does. That boundary is the
@@ -174,7 +185,13 @@ criterion-3 answer: the successor data plane slots in as a provider
 swap, and this document forecloses nothing it needs.
 
 Attribute and entry caching mirror the v1 mount options and their
-bounded lifetimes. Directory entry revalidation is the module's own
+bounded lifetimes. Cached file data is dropped when attribute
+revalidation observes a size or modification-time change — the
+in-kernel analog of the auto-invalidation capability the userspace
+mount negotiates — so data staleness stays bounded by the attribute
+lifetime, exactly the v1 coherence bound; without this rule a held
+page would stay stale indefinitely, which the decided contract
+forbids. Directory entry revalidation is the module's own
 (the machinery FUSE supplied for free is rebuilt: a revalidation
 hook honoring the entry lifetime, with the stale-answer retry
 behavior of the kernel's path walk proven by a ring-2 experiment
@@ -189,12 +206,15 @@ forgets nodes; FUSE supplied that accounting and a native
 filesystem has none. Decided: the module keeps its own per-inode
 lookup count — incremented where the wire operations that admit
 nodes return them, decremented to a wire FORGET from the inode
-eviction callback, exactly one forget per admission. Eviction under
-guest memory pressure therefore drives the server's node table down
-the same way FUSE clients do, the descriptor-budget contract holds
-unchanged, and a mount teardown forgets everything it still holds.
-The mapping is pinned in ring 2 by the same node-accounting
-assertions the v1 suites run.
+eviction callback, exactly one forget per admission — and the
+directory-listing path owes the same compensating forget v1 states
+for entries counted but never delivered to the caller. Eviction
+under guest memory pressure therefore drives the server's node
+table down the same way FUSE clients do and the descriptor-budget
+contract holds unchanged. No forget flush is owed at unmount: the
+server clears the session's nodes at teardown, per the decided
+lifecycle. The mapping is pinned in ring 2 by the same
+node-accounting assertions the v1 suites run.
 
 ## Security posture
 
@@ -203,7 +223,8 @@ imposed: mounting requires system administrator capability in the
 initial namespace (the standard bar for a network filesystem
 module); the mount is visible guest-wide like any mount — the
 userspace client's allow-other flag was a FUSE artifact and has no
-analog here, which THREAT-MODEL gains a line for; per-request
+analog here — THREAT-MODEL is owed a line for this when
+implementation opens; per-request
 credentials are the calling task's at call time, matching the
 request head's semantics; permission checking stays exactly v1's
 default-permissions model — the guest kernel checks against
@@ -248,25 +269,30 @@ law; the userspace URL grammar is not reused (its parser cannot
 exist in kernel space, and mount sources have their own
 convention). Options mirror the v1 mount options that survive the
 kernel context — read-only, the attribute and entry lifetimes, the
-privileged-bits opt-out — each mapping to its v1 semantic; unknown
-options refuse the mount with the parameter machinery's own error.
-The userspace `voidport mount` tool gains nothing here; whether it
-ever fronts the kernel mount is a later product decision, recorded
-as open.
+privileged-bits opt-out, and the reconnect stall window with its
+zero-means-fail-fast semantic — each mapping to its v1 semantic;
+unknown options refuse the mount with the parameter machinery's own
+error. The userspace `voidport mount` tool gains nothing here;
+whether it ever fronts the kernel mount is a later product
+decision — settled by decision when it arises, not by an
+experiment.
 
 ## Build integration and version policy
 
 The module builds out of tree with kbuild against the kernel dev
-output nix provides, as a flake output gated on the kernel offering
-Rust. **The kernel attribute is pinned singular**: the flake tracks
-one named kernel package set — the newest Rust-enabled kernel
-nixpkgs unstable carries — and the rule that makes ring 3 sound is
-stated: **the module is only ever loaded on the kernel it was built
-against**, so the development machine's ring-3 use requires the
-running kernel and the flake's kernel to be the same derivation,
-and the ladder checks that equality instead of assuming it (the
-review caught the running kernel one patch-level behind the flake's
-default — exactly the mismatch this rule exists for).
+output nix provides, as a flake output. **The kernel attribute is
+pinned singular and named**: the flake tracks `linuxPackages_latest`
+on nixpkgs unstable — the newest released kernel, release
+candidates excluded (every kernel the pin can select already
+carries Rust on this architecture, so a Rust gate would select
+nothing) — and the rule that makes ring 3 sound is stated: **the
+module is only ever loaded on the kernel it was built against**,
+so ring 3 is available only while the development machine boots
+that exact derivation; otherwise ring 2 is the only loading ring,
+and the ladder checks the equality instead of assuming it. The
+review measured both mismatch scales this rule exists for: the
+running kernel one patch level behind the flake's default set, and
+a full major version behind the named pin.
 
 Chase-newest comes with its protocol: every kernel bump runs the
 revalidation ladder — crate compile, helper compile, the frame
@@ -303,8 +329,11 @@ missing:
    the gate script from the devshell; guest addresses are
    allocated per run from the ladder's own registry so concurrent
    runs cannot collide; and the ring's cost is bounded by reusing
-   the flake's already-built kernel and image outputs. The torture
-   harness gains a kernel-mount arm in the same ring.
+   the flake's already-built kernel and image outputs. This ring
+   is a **ladder gate only**: the workspace check and the flake
+   package build stay unchanged and sandbox-clean, and neither
+   ever boots a guest. The torture harness gains a kernel-mount
+   arm in the same ring.
 3. **The development machine**, where loading is sanctioned, under
    the built-equals-booted rule — fast iteration, with the KVM
    ring as the place anything dangerous goes instead.
@@ -312,7 +341,13 @@ missing:
    debug kernel — address and undefined-behavior sanitizers, lock
    dependency validation, sleep-in-atomic checks, leak detection —
    on every ladder run, because hand-written unsafe against kernel
-   internals is exactly what those tools exist for.
+   internals is exactly what those tools exist for. The pin stays
+   singular in **source**: one kernel, two configurations. The
+   production configuration is the cached upstream build; the
+   debug configuration enables facilities the production kernel
+   ships disabled, so it is built locally once per kernel bump and
+   cached across ladder runs, with the module built once per
+   configuration under the built-equals-loaded rule.
 
 ## Layout, licensing, evidence durability
 
@@ -324,10 +359,21 @@ evidence stops living in throwaway space (the review's durability
 finding; until implementation opens, the probe records remain
 development artifacts and every load-bearing claim above is marked
 compile-proven or open accordingly — the phases re-prove each at
-its gate). License GPL-2.0-only, forced by the Rust runtime's
-exports and consistent with the recorded split; the protocol
-crate's permissive license is what makes the by-path consumption
-clean.
+its gate). The module's own crates stay outside the cargo
+workspace — kbuild builds them, and the workspace-wide denial of
+unsafe code is untouched; the shared session core joins the
+workspace as an ordinary member and stays unsafe-free, since every
+unsafe boundary lives in the kernel-Rust layer.
+
+Licensing, stated per crate because two copyleft versions do not
+combine: the module is GPL-2.0-only, forced by the Rust runtime's
+exports and consistent with the recorded split; the wire crate's
+permissive license is what makes the by-path consumption clean;
+and the **extracted session core carries the wire crate's
+permissive license too** — it cannot inherit the workspace's
+GPL-3.0-only and remain consumable by a GPL-2.0-only module, which
+is the same reasoning already recorded for the wire crate. The
+extraction phase owes the license table this entry.
 
 ## Upstreaming — possible, not pursued
 
@@ -343,18 +389,24 @@ out of tree after three years.
 Each phase gates the next; none is started by this document.
 
 1. **Frame over vsock, executed**: the probe module exchanges one
-   real frame with the v1 server at runtime, in a KVM guest first,
-   then ring 3. Converts the transport from compile-proven to
-   measured; no precedent exists.
+   real frame with the v1 server at runtime — in a minimal probe
+   guest first (the full ring-2 harness comes later), then ring 3.
+   Converts the transport from compile-proven to measured; no
+   precedent exists.
 2. **The shared core extraction**: the session logic leaves the
    userspace client for the no_std core crate, with the fixed-
-   capacity replay design, under the full increment pipeline (it
+   capacity replay design and the permissive license entry owed to
+   the license table, under the full increment pipeline (it
    refactors shipped code); the userspace client consumes it and
    the v1 suites prove nothing moved.
 3. **Read-only mount**: registration through the bindings and
    helpers, lookup, getattr, open, read, readdir, entry
-   revalidation, the FORGET mapping; ring 2 comes up with it; the
-   static-inline helper list is pinned by this phase's gate.
+   revalidation, the FORGET mapping; the full ring-2 harness comes
+   up with this phase; the static-inline helper list is pinned by
+   this phase's gate, and so is the **path-walk retry experiment**:
+   prove the kernel's walk retries the lookup after a stale answer
+   from entry revalidation, which the resilience contract's healing
+   depends on.
 4. **The full operation set**: writes through the page-cache
    provider, mutations, locks, xattrs, special files, recorded
    privileged bits, the credential-path probe; each ported with
@@ -373,8 +425,9 @@ Each phase gates the next; none is started by this document.
    measured classes are never conflated — checkable by reading,
    and the review that enforced it is part of the record.
 2. Every open question is named with the experiment that settles
-   it, and every phase's unknowns are listed in that phase or an
-   earlier one.
+   it — except an open marked as a product decision, which is
+   settled by decision and carries no experiment — and every
+   phase's unknowns are listed in that phase or an earlier one.
 3. The v2 data plane slots in at the named provider boundary
    without restructuring the layers — checkable against the v2
    mandate's decided shape.
