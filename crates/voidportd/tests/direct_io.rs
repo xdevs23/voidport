@@ -19,8 +19,9 @@
 //! block-aligned and direct I/O refuses them, so an aligned guest request only
 //! serves because the server bounces it through an aligned buffer. That is what
 //! the round-trip proofs are for — real bytes, out and back, through an
-//! uncached descriptor — and the refusals the backing filesystem gives are
-//! proved to pass through unchanged beside them.
+//! uncached descriptor — and the answer the backing filesystem gives a
+//! misaligned request, refusal or service, is proved to pass through unchanged
+//! beside them.
 //!
 //! Uncached I/O is the backing filesystem's to offer: one that supports no
 //! `O_DIRECT` at all cannot prove the two uncached postures, and the tests that
@@ -393,17 +394,18 @@ fn an_unaligned_request_answers_what_the_backing_filesystem_answers_locally() {
     }
 
     // What the filesystem itself says, to a local program holding an aligned
-    // buffer and naming an offset that is not a multiple of a block.
+    // buffer and naming an offset that is not a multiple of a block. Refusal
+    // is one filesystem's policy, not a law — ext4 answers `EINVAL`, btrfs
+    // serves the request from its buffered fallback — so the answer is taken
+    // as it comes, and the guest is owed that same answer, whichever it is.
     let local = fs::OpenOptions::new()
         .read(true)
         .custom_flags(OFlags::DIRECT.bits() as i32)
         .open(&path)
         .expect("the host file opens uncached");
     let mut buffer = vec![0u8; BLOCK * 2];
-    let refused = local
-        .read_at(aligned(&mut buffer), 1)
-        .expect_err("an unaligned offset is refused");
-    let locally = refused.raw_os_error().expect("an errno");
+    let window = aligned(&mut buffer);
+    let locally = local.read_at(window, 1);
 
     let mut guest = server.mount("through", "/tree");
     let file = guest.lookup(ROOT, "data.bin").expect("the file");
@@ -411,15 +413,34 @@ fn an_unaligned_request_answers_what_the_backing_filesystem_answers_locally() {
         .open(file.node_id, direct(O_RDONLY))
         .expect("the file opens");
 
-    // The same misalignment over the wire, and the same errno back: the bounce
-    // fixes the buffer the guest cannot see and never repairs the offset or the
-    // length it chose. The wire carries a status, which is the negated errno.
-    assert_eq!(
-        guest
-            .read(handle, 1, BLOCK as u32)
-            .expect_err("the same unaligned request"),
-        -locally
-    );
+    // The same misalignment over the wire, and the same answer back: the
+    // bounce fixes the buffer the guest cannot see and never repairs the
+    // offset or the length it chose.
+    match locally {
+        // The wire carries a status, which is the negated errno.
+        Err(refused) => {
+            eprintln!("the backing filesystem refuses the misaligned offset");
+            let locally = refused.raw_os_error().expect("an errno");
+            assert_eq!(
+                guest
+                    .read(handle, 1, BLOCK as u32)
+                    .expect_err("the same unaligned request"),
+                -locally
+            );
+        }
+        // A filesystem that repairs the offset serves the guest the same
+        // bytes it served the local program.
+        Ok(served) => {
+            eprintln!("the backing filesystem repairs the misaligned offset");
+            assert_eq!(
+                guest
+                    .read(handle, 1, BLOCK as u32)
+                    .expect("the same request served")
+                    .as_slice(),
+                &window[..served]
+            );
+        }
+    }
     guest.release(handle).expect("the handle releases");
 }
 
