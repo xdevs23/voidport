@@ -3146,13 +3146,54 @@ contradicted sentence is replaced.)
 7. Both gates pass with the new suites executing; the performance
    report carries the A/B.
 
-## Privileged bits (normative for the privileged-bits increment; contract written 2026-08-17)
+## Recorded metadata (normative pattern; decided 2026-08-17 — one design for everything of this kind)
+
+Whenever the guest expects a real filesystem to hold something the
+host backing cannot represent — because the server's user lacks the
+privilege, or the host would give the value a meaning it must not
+have there — the answer is always the same mechanism, never a
+special case: the guest truth is **recorded** in one server-owned
+extended attribute on the backing file, presentation **merges** the
+record over what the host really holds, mutation records what the
+host refuses, and the same two switches exist every time — a
+per-namespace server switch that disables the feature loudly, and a
+client mount option that opts a mount out. The record is invisible
+through the mount, versioned inside the one attribute so instances
+compose, and enforcement of recorded meaning is always the guest
+kernel's, in its own trust domain.
+
+Known instances of the class, each its own increment on the shared
+mechanism:
+
+- **Privileged mode bits** (setuid, setgid) — the first instance,
+  contracted below.
+- **File capabilities** (the security capability attribute an
+  unprivileged server cannot set host-side) — same shape as the
+  bits; queued.
+- **Device nodes** — mknod for character and block devices, refused
+  today under the special-file decision, becomes representable: a
+  placeholder on the host, the device identity recorded, the guest
+  sees a device node whose meaning its own kernel supplies. This
+  deliberately re-opens the earlier deferral when its increment is
+  taken up; recorded here so the deferral and the pattern do not
+  contradict silently.
+- **Ownership beyond the host's reach** — a chown the host refuses
+  the server (arbitrary owners under passthrough without
+  privilege) could record instead of failing. This one extends the
+  decided ownership-mapping design instead of sitting beside it,
+  so it needs its own contract against that section before
+  anything is built.
+- **Privileged extended attributes** (trusted and system
+  namespaces) — recordable under the same mechanism; queued behind
+  the xattr-rules interaction.
+
+## Privileged bits (normative for the privileged-bits increment; contract written 2026-08-17 — the first instance of the recorded-metadata pattern)
 
 The guest should see a filesystem as close to a real one as
 possible: setuid and setgid work, persist, and strip exactly as
 local semantics demand — while the host-side backing file never
 carries a privileged bit the server's own user set. The two truths
-are reconciled by recording.
+are reconciled by recording, per the pattern above.
 
 - **Recording**: the privileged bits a guest sets live in a
   voidport-owned extended attribute on the backing file, never in
