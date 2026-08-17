@@ -1206,9 +1206,14 @@ in PERFORMANCE.md (raw data kept out of tree).
      nonzero reserved field anywhere in a fixed struct is a framing error
      on parse, and encoders refuse to emit one. The earlier looseness
      (only the request head validated) is retracted; repurposing any
-     reserved field requires a PROTOCOL_VERSION bump. Exception: the
+     reserved field requires a PROTOCOL_VERSION bump. Exceptions: the
      handshake client/server negotiation flag fields keep must-be-zero on
-     send / ignore-unknown on receive, as already decided.
+     send / ignore-unknown on receive, as already decided; and the write
+     request's `write_flags` field, which has carried the same
+     must-be-zero-on-send / ignore-unknown-on-receive rule from day one
+     and gains its first flag under the 2026-08-17 additive amendment to
+     the stability rule (the strictly-enforced `reserved` field beside it
+     stays a framing error when nonzero).
   6. Strict framing binds the encoder symmetrically: an encoder must not
      be able to produce a frame the peer's parser rejects, and the
      negotiated `max_frame_len` bounds encoded frames too.
@@ -3234,15 +3239,31 @@ Whenever the guest expects a real filesystem to hold something the
 host backing cannot represent — because the server's user lacks the
 privilege, or the host would give the value a meaning it must not
 have there — the answer is always the same mechanism, never a
-special case: the guest truth is **recorded** in one server-owned
-extended attribute on the backing file, presentation **merges** the
-record over what the host really holds, mutation records what the
-host refuses, and the same two switches exist every time — a
-per-namespace server switch that disables the feature loudly, and a
-client mount option that opts a mount out. The record is invisible
-through the mount, versioned inside the one attribute so instances
-compose, and enforcement of recorded meaning is always the guest
-kernel's, in its own trust domain.
+special case: the guest truth is **recorded in a namespace-scoped
+table in the server's own state**, keyed by the backing entry's
+host identity (device and inode, the same identity discipline the
+descriptor budget proved), persisted with the state file under its
+rename-over discipline, and **merged** over what the host really
+holds at presentation. Mutation records what the host refuses; the
+same two switches exist every time — a per-namespace server switch
+that disables the feature loudly, and a client mount option that
+opts a mount out; enforcement of recorded meaning is always the
+guest kernel's, in its own trust domain.
+
+(Reworked 2026-08-17, the same day, from a per-file extended
+attribute to the state table — the attribute shape accumulated
+guards under review exactly as the design law predicts: a hiding
+problem on four xattr paths, per-session caches needing
+cross-session invalidation, a per-entry host syscall on the listing
+path the hot-path work had deliberately removed, a write-failure
+mode of its own, and a file-kind restriction from the user xattr
+namespace. The table dissolves every one by construction: the
+server is the single point of truth, a memory read is the merge, no
+host syscall exists to fail or to price, nothing needs hiding, and
+every file kind records. The trade, stated: recorded truth does not
+travel with host-side copies of the file — the identity does not
+follow a copy — and an entry whose identity no longer matches is
+retired exactly as the descriptor budget retires stale identities.)
 
 Known instances of the class, each its own increment on the shared
 mechanism:
@@ -3277,62 +3298,60 @@ local semantics demand — while the host-side backing file never
 carries a privileged bit the server's own user set. The two truths
 are reconciled by recording, per the pattern above.
 
-Reworked 2026-08-17 after its probing spec review; every decision
-below is the rework.
+Reworked 2026-08-17 twice, each after a probing review; every
+decision below is the current rework, built on the pattern's state
+table.
 
-- **Recording**: the privileged bits a guest sets live in ONE
-  server-owned user-namespace extended attribute on the backing
-  file — a small versioned record, the pattern's one attribute,
-  its concrete name pinned by the implementation and never
-  meaningful to guests. Recording covers regular files and
-  directories, the kinds whose privileged bits carry meaning and
-  the kinds the user xattr namespace exists on; on other kinds a
-  chmod adding the bits refuses (EPERM) with the deviation stated —
-  a local FIFO would accept a meaningless bit, this filesystem
-  refuses it. Presentation ORs the recorded bits into the mode the
-  guest sees; a host file genuinely carrying bits presents them
-  as-is.
-- **The attribute is invisible on all four xattr paths**: never in
-  a listing, a get answers ENODATA, a set refuses, and a remove
-  answers ENODATA — the same not-there chain the xattr rules use,
-  so its absence is indistinguishable from any other absent
-  attribute.
-- **Setting**: a chmod that adds privileged bits succeeds by
-  recording them; the host mode receives only what the host
-  permits the server's user, as mode changes do today. **A
-  recording that cannot be written fails the chmod with the host's
-  errno** — bits are never silently lost; the common shared-graft
-  case where the server's user cannot write the attribute is a
-  loud refusal, not a quiet downgrade. The recorded truth survives
-  restart and remount because it lives on the file.
-- **Presentation is enumerated and priced**: the recorded bits
-  join the mode in every attribute-bearing reply — getattr,
-  lookup, the readdirplus entry, the create/mkdir reply, and the
-  setattr reply. The node caches the recorded state once admitted,
-  so steady-state operations pay nothing; a listing pays one
-  attribute read per newly admitted entry in namespaces where the
-  feature is enabled, measured and stated in the performance
-  report by the increment.
-- **Stripping follows the kernel's own delegation**: on a
-  direct-io mount the kernel marks every write by a caller without
-  the file-mode privilege and delegates the clearing; the client
-  forwards the mark — the write request's reserved flags field
-  gains its first flag, additive under the amended ABI stability
-  rule, so the protocol version stays 1 — and the server clears
-  per the local rule it can evaluate: setuid always, setgid when
-  the group-execute bit is set. The one corner the wire cannot
-  carry — a caller outside the file's group on a file without
-  group-execute, where the local kernel also strips — is preserved
-  instead, a stated deviation bounded to a legacy-locking corner.
-  The server consults the handle's cached mode first, so a write
-  to a plain file pays no attribute work at all. On a cached mount
-  the kernel strips through its own path today and keeps doing so;
-  the recorded bits follow the mode change it sends. An elder
-  server ignores the unknown flag and strips nothing — fail-open
-  for stripping under version skew until both sides update;
-  stated, not hidden.
+- **Recording**: the privileged bits a guest sets live in the
+  namespace's recorded-metadata table, keyed by the backing entry's
+  host identity, persisted with the state file. Every file kind
+  records — the table has no kind restriction. Presentation ORs the
+  recorded bits into the mode the guest sees; a host file genuinely
+  carrying bits presents them as-is; nothing exists on the backing
+  file to hide, so the guest's xattr surface is untouched by this
+  increment.
+- **Setting**: the mode a chmod delivers has already passed the
+  guest kernel's own permission and setgid-clearing logic under the
+  caller's full credentials — the wire carries the post-VFS mode,
+  which is what closes the group-membership predicate no wire field
+  could carry. The server records the privileged bits from that
+  mode and **masks them out of the host chmod** — a stated change
+  from today, where the host mode received them verbatim where the
+  host allowed it (an owner may set setuid on its own file, and the
+  backing file must never carry it). Recording is a state mutation
+  under the persist discipline: it cannot fail apart from the
+  server failing, and a table the state file cannot hold fails the
+  chmod loudly at the persist boundary like any other mutation.
+- **Presentation is a memory merge at the one funnel**: the
+  attribute presenter ORs the table's bits into every
+  attribute-bearing reply — getattr, lookup, the readdirplus
+  entry, the create and mkdir replies, the setattr reply, and the
+  namespace root's own attributes. No host syscall, no per-session
+  cache, no invalidation: the table is the single point of truth
+  and a lookup in it is the whole cost, on every path including
+  the pinless listing walk.
+- **Stripping follows the kernel's own delegation, with no
+  negotiation**: the running kernel marks direct-io writes by
+  callers without the file-mode privilege unconditionally — probed
+  and measured on the deployment kernel, and the increment's
+  census criterion re-proves it before anything lands. The client
+  forwards the mark on `write_flags` — the field that has carried
+  must-be-zero-on-send, ignore-unknown-on-receive from day one —
+  on **every chunk of a split write**, stripping being idempotent.
+  The server clears per the mode-only local rule: setuid always,
+  setgid when group-execute is set — the kernel's own write-strip
+  predicate, fully evaluable from the mode. Clearing is a table
+  update and a masked host chmod where host bits are involved. On
+  a cached mount the kernel strips through its own paths today —
+  the capability probe on writes, its own mode change on truncate
+  — and keeps doing so with the table following the mode changes
+  it sends; no INIT capability is negotiated, so none of the
+  kernel's own stripping is ever turned off. An elder server
+  ignores the unknown flag and strips nothing — fail-open for
+  stripping under version skew until both sides update; stated,
+  not hidden.
 - **The operator surface is the house shape**: a per-namespace
-  boolean in the state file (enabled by default), runtime-mutable
+  switch in the state file (enabled by default), runtime-mutable
   through the existing namespace mutation of the control plane,
   persisted like every mutation, live at the next operation.
   Disabled, presentation masks privileged bits — recorded and
@@ -3343,38 +3362,46 @@ below is the rework.
 - **Enforcement is the guest kernel's**, in its own trust domain:
   the server presents bits, the guest decides what exec does with
   them — the posture THREAT-MODEL states for every presented
-  attribute.
+  attribute, extended with one line: a record presents its bits
+  even where the host backing sits on a mount whose own kernel
+  ignores them.
 
 ### Acceptance criteria — privileged-bits increment (reworked 2026-08-17)
 
-1. A guest chmod adding setuid or setgid on a regular file or
-   directory succeeds, the bits present through every mount and
-   every attribute-bearing reply, survive server restart and
-   remount, and the backing file's host mode never gains them; on
-   a FIFO or socket the chmod refuses EPERM; a recording the host
-   refuses fails the chmod with the host's errno and loses
-   nothing.
+1. A guest chmod adding setuid or setgid succeeds on every file
+   kind, the bits present through every mount, every
+   attribute-bearing reply and the namespace root, survive server
+   restart and remount through the persisted table, and the
+   backing file's host mode never gains them — including the
+   owner-settable case where the host would have accepted them,
+   pinned by a test that the host chmod is masked.
 2. Stripping matches local semantics in a paired comparison on
    both mount modes: a write by a caller without the file-mode
-   privilege clears setuid, clears setgid when group-execute is
-   set, and preserves the stated out-of-group corner; truncate
-   clears as the local filesystem does; the direct-io defect case
-   is the regression test.
-3. The recording attribute is invisible on all four xattr paths,
-   regardless of xattr rules; a remove answers ENODATA and the
-   recorded bits survive it.
+   privilege clears setuid and clears setgid when group-execute is
+   set (the mode-only predicate), on every chunk of a split write;
+   truncate clears through the kernel's own path with the table
+   following; a chmod by an out-of-group caller arrives already
+   stripped by the guest kernel, pinned by test; the direct-io
+   defect case is the regression test.
+3. The wire census proves the mark arrives without any INIT
+   capability negotiation on the deployment kernel, and that
+   negotiating nothing left the kernel's own cached-mount and
+   truncate stripping untouched.
 4. The disabled namespace masks and refuses per the contract, the
    change binding at the next operation without remount; the mount
    option does the same client-side.
-5. The wire flag is covered: golden vectors carry it, an elder
-   server ignores it (interop test), the version stays 1 under the
-   amended stability rule, and the skew posture is documented.
-6. The hot path is unpriced only where it is free: a syscall
-   census shows no added per-write host work on files without
-   recorded or host-real bits, and the per-new-entry listing cost
-   is measured and stated.
+5. The wire flag is covered: golden vectors carry it on
+   `write_flags`, an elder server ignores it (interop test), the
+   version stays 1 under the amended stability rule with the
+   reserved-fields clause's exception naming the field, and the
+   skew posture is documented.
+6. The cost is a table lookup: a syscall census shows zero added
+   host work on any attribute path including the pinless listing
+   walk, and identity retirement prunes entries whose backing
+   identity no longer matches, pinned by test.
 7. Both gates pass with the new suites executing; THREAT-MODEL
-   carries the enforcement posture.
+   carries the enforcement posture including the nosuid-host-mount
+   line.
 
 ## Write-ahead (PAUSED 2026-08-17, the same day it was written — the spec review measured three of its premises false; superseded by the write-streaming contract above; the text below is kept as the record of the shape that was refuted)
 
