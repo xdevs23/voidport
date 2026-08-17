@@ -769,16 +769,52 @@ impl Session {
     /// stays owned by the server identity, and presentation forward-maps
     /// whatever the host actually recorded, so the guest's view stays
     /// consistent either way.
-    pub fn apply_create_ownership(&self, fd: BorrowedFd<'_>, caller: GuestIds, follow: bool) {
-        let host = self.namespace().ownership().reverse_for_create(caller);
-        let flags = if follow {
-            rustix::fs::AtFlags::empty()
-        } else {
-            rustix::fs::AtFlags::SYMLINK_NOFOLLOW
-        };
-        let result = rustix::fs::chownat(
+    pub fn apply_create_ownership(&self, fd: BorrowedFd<'_>, caller: GuestIds) {
+        self.chown_created(
             rustix::fs::CWD,
             crate::host::open::proc_path(fd).as_str(),
+            rustix::fs::AtFlags::empty(),
+            caller,
+        );
+    }
+
+    /// [`Self::apply_create_ownership`], for a symlink, which is owned through
+    /// the directory it was created in and its own name.
+    ///
+    /// A symlink is the one created kind a descriptor cannot speak for. An
+    /// `O_PATH` pin of it answers `EPERM` to a chown naming the empty path, and
+    /// the `/proc/self/fd` form makes the *magic link* the final component — so
+    /// `AT_SYMLINK_NOFOLLOW` there owns procfs' own object, reports success,
+    /// and leaves the link the guest made owned by the server. Naming the entry
+    /// in its parent is what reaches the link itself.
+    ///
+    /// It stays as contained as the creation was: the descriptor is the very
+    /// one the `symlinkat` was issued against, the name is that same single
+    /// component, and `AT_SYMLINK_NOFOLLOW` keeps the chown off whatever the
+    /// link names. What the name can no longer promise is the *inode* — a host
+    /// writer that replaces the name in between is owned instead of the link —
+    /// and it is bounded to the directory a create was already admitted into.
+    pub fn apply_create_symlink_ownership(&self, site: &Site, caller: GuestIds) {
+        self.chown_created(
+            site.directory.as_fd(),
+            site.name.as_bytes(),
+            rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            caller,
+        );
+    }
+
+    /// Applies the create ownership contract to one named host entry.
+    fn chown_created<P: rustix::path::Arg>(
+        &self,
+        directory: BorrowedFd<'_>,
+        path: P,
+        flags: rustix::fs::AtFlags,
+        caller: GuestIds,
+    ) {
+        let host = self.namespace().ownership().reverse_for_create(caller);
+        let result = rustix::fs::chownat(
+            directory,
+            path,
             Some(rustix::process::Uid::from_raw(host.uid)),
             Some(rustix::process::Gid::from_raw(host.gid)),
             flags,

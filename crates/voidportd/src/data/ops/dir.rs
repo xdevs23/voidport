@@ -402,11 +402,15 @@ fn adopt(
         // while the guest's is the one the design says applies and has already
         // been subtracted.
         Adoption::Created { caller, mode } => {
-            session.apply_create_ownership(fd.as_fd(), caller, true);
+            session.apply_create_ownership(fd.as_fd(), caller);
             super::file::apply_mode(fd.as_fd(), mode)?;
         }
+        // A symlink is the exception: it is owned through the site — the
+        // directory descriptor the creation was issued against and the one
+        // component it created — because no descriptor on a symlink can be
+        // chowned.
         Adoption::CreatedSymlink(caller) => {
-            session.apply_create_ownership(fd.as_fd(), caller, false);
+            session.apply_create_symlink_ownership(site, caller);
         }
         Adoption::Linked => {}
     }

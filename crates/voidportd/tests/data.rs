@@ -586,53 +586,58 @@ fn made_by(
     ]
 }
 
-/// The symlink arm of create ownership, which does not hold.
+/// A symlink is one of the created kinds, so it lands with the create
+/// ownership contract like the rest of them.
 ///
-/// **Observed on this tree:** a symlink a guest creates keeps the *server's*
-/// own uid and gid instead of the caller's reverse-mapped ones. Every other
-/// created kind takes them. Under passthrough ownership a guest therefore
-/// creates a symlink and sees it owned by somebody else, which is not what the
-/// same sequence does locally.
-///
-/// The adoption path chowns a new entry through `/proc/self/fd/N`, and for the
-/// symlink it passes `AT_SYMLINK_NOFOLLOW` so the link and not its target is
-/// re-owned. Measured directly with a standalone C probe on this kernel:
-/// `fchownat("/proc/self/fd/N", …, AT_SYMLINK_NOFOLLOW)` **returns 0 and
-/// changes nothing** — with that flag the final component is the procfs magic
-/// link itself, so the call re-owns that and reports success. The server's own
-/// failure logging therefore never fires either, because there is no failure to
-/// log. The two obvious alternatives were measured on the same probe and both
-/// answer `EPERM` on an `O_PATH` descriptor: `fchownat(fd, "", AT_EMPTY_PATH |
-/// AT_SYMLINK_NOFOLLOW)` and following the magic link without the flag. So this
-/// is not a one-line correction, which is why the test is ignored and the
-/// behavior is reported instead of patched.
+/// The contract binds the **link itself**: the chown is never followed through
+/// to what the link names, and it reaches the link through the directory it
+/// was created in and its own name — a descriptor standing in for a symlink is
+/// a `/proc/self/fd` magic link, and owning *that* is not owning the entry the
+/// guest made. One caller creating a symlink, a directory and a FIFO in one
+/// namespace therefore gets one owner across all three.
 #[test]
-#[ignore = "a guest-created symlink keeps the server's ownership; see the doc comment"]
 fn a_created_symlink_carries_the_ownership_contract_too() {
-    let fixture = Fixture::start("create-ownership-symlink");
-    let server = (
-        rustix::process::getuid().as_raw(),
-        rustix::process::getgid().as_raw(),
-    );
-    let privileged = rustix::process::getuid().is_root();
+    /// The guest identity the creates are made under. `plain` is passthrough
+    /// ownership, so these are also the host ids the entries must land with.
+    const GUEST: (u32, u32) = (4242, 4243);
 
-    let mut plain = fixture.server.mount("plain", "/tree");
-    plain.as_user(4242, 4242);
-    let entry = plain
-        .symlink(ROOT, "link-plain", "elsewhere")
-        .expect("creatable");
-    // `symlink_metadata`, so the link is judged and not whatever it names.
-    let host = fs::symlink_metadata(fixture.tree("link-plain")).expect("the host entry exists");
+    let fixture = Fixture::start("symlink-ownership");
+    let mut client = fixture.server.mount("plain", "/tree");
+    client.as_user(GUEST.0, GUEST.1);
+
+    let link = client
+        .symlink(ROOT, "link", "data.bin")
+        .expect("a guest may create a symlink");
+    assert!(link.is_symlink());
+    client.mkdir(ROOT, "dir", 0o755).expect("creatable");
+    client.mknod(ROOT, "pipe", 0o010_644).expect("creatable");
+
+    let owner = |name: &str| {
+        let metadata = fs::symlink_metadata(fixture.tree(name)).expect("the host entry exists");
+        (metadata.uid(), metadata.gid())
+    };
+    // Applied to the link, not through it: the file the link names is a
+    // pre-existing entry no create owns, and it keeps the ids it had.
     assert_eq!(
-        (host.uid(), host.gid()),
-        if privileged { (4242, 4242) } else { server },
-        "a symlink lands with the reverse-mapped ids the server can apply"
+        owner("data.bin"),
+        (
+            rustix::process::getuid().as_raw(),
+            rustix::process::getgid().as_raw()
+        )
     );
-    assert_eq!(
-        (entry.attr.uid.get(), entry.attr.gid.get()),
-        (host.uid(), host.gid()),
-        "passthrough presents exactly what the host recorded"
-    );
+    // Whatever the host permits, it permits for every kind alike, so the three
+    // creates agree.
+    assert_eq!(owner("link"), owner("dir"), "symlink against directory");
+    assert_eq!(owner("link"), owner("pipe"), "symlink against fifo");
+    if rustix::process::getuid().is_root() {
+        // And where a host id other than the server's own is applicable, the
+        // contract is the caller's reverse-mapped identity.
+        assert_eq!(owner("link"), GUEST);
+    } else {
+        // Without `CAP_CHOWN` no other id is applicable, and that failure is
+        // not fatal: the entries stay the server's own.
+        assert_eq!(owner("link").0, rustix::process::getuid().as_raw());
+    }
 }
 
 // ---------------------------------------------------------------------------

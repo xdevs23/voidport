@@ -129,7 +129,7 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
 
     if created {
         let caller = GuestIds::new(request.head().uid.get(), request.head().gid.get());
-        session.apply_create_ownership(fd.as_fd(), caller, true);
+        session.apply_create_ownership(fd.as_fd(), caller);
         apply_mode(fd.as_fd(), mode)?;
     }
 
