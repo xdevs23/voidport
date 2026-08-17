@@ -3130,6 +3130,37 @@ client streaming pays, is exactly what that data plane replaces.
   gives them; and always, every backing open uncached, under which
   the bound moves from the wire to the storage.
 
+### Acceptance criteria — parallel-direct-writes increment
+
+1. The open reply announces the capability on direct-io mounts and
+   an asynchronous-I/O writer doing in-place overwrites of a
+   preallocated, never-mapped file measurably exceeds the serial
+   baseline on one file; the census proves several writes in
+   flight.
+2. The honest bounds are pinned: append and size-extending writes
+   stay kernel-serialized (census: one in flight), and the
+   regression arm proves announcing the capability changed nothing
+   for the plain sequential writer.
+3. Both gates pass with the new tests executing.
+
+### Acceptance criteria — host-direct-io-postures increment
+
+1. The per-namespace setting round-trips the state file and the
+   control plane's namespace mutation, persisted, live at the next
+   open; the default posture is byte-identical to today.
+2. Passthrough: a guest handle opened O_DIRECT gets a backing open
+   with O_DIRECT — proven by the backing descriptor's flags — and
+   an unaligned request answers the same errno the backing
+   filesystem gives locally; a handle without O_DIRECT rides the
+   host cache unchanged.
+3. Always: every backing open in the namespace carries O_DIRECT,
+   reads and writes alike, and the alignment posture is the
+   backing filesystem's; the performance note states where the
+   bound moved when measured.
+4. The artifacts carry the setting: the state example, the README
+   semantics section, and the man pages.
+5. Both gates pass with the new suites executing.
+
 ## The parked write-streaming contract (2026-08-17, parked the same day by the design law above — kept as the record, with its review findings noted in place)
 
 - **Scope: direct-io mounts.** A cached mount already streams through
