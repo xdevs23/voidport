@@ -331,6 +331,34 @@ impl IdMapping {
     }
 }
 
+/// Which ownership mode a namespace is in, without what the mode configures.
+///
+/// [`OwnershipSpec`] carries the mode *and* its tables and ids; this is the
+/// mode alone, which is all a summary shows. Both spell a mode the same way
+/// because both take their names from the same variants, so a name shown in a
+/// listing is the name the schema tags a policy with.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OwnershipMode {
+    /// Host ids translated through explicit tables.
+    Map,
+    /// Host ids shown as-is.
+    Passthrough,
+    /// Every file presented as one configured owner.
+    Static,
+}
+
+impl fmt::Display for OwnershipMode {
+    /// Honors width and alignment, so modes can be tabulated.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::Map => "map",
+            Self::Passthrough => "passthrough",
+            Self::Static => "static",
+        })
+    }
+}
+
 /// Ownership policy in source form, one shape per mode.
 ///
 /// The per-mode shapes are the schema: `map` requires its tables, `static`
@@ -369,13 +397,13 @@ pub enum OwnershipSpec {
 }
 
 impl OwnershipSpec {
-    /// The mode name, as the schema spells it.
+    /// The mode this policy is in, without its configuration.
     #[must_use]
-    pub fn mode_name(&self) -> &'static str {
+    pub fn mode(&self) -> OwnershipMode {
         match self {
-            Self::Map { .. } => "map",
-            Self::Passthrough {} => "passthrough",
-            Self::Static { .. } => "static",
+            Self::Map { .. } => OwnershipMode::Map,
+            Self::Passthrough {} => OwnershipMode::Passthrough,
+            Self::Static { .. } => OwnershipMode::Static,
         }
     }
 }
@@ -742,6 +770,48 @@ mod tests {
         );
     }
 
+    /// The mode alone is spelled exactly as the policy it came from tags
+    /// itself, on the wire and on an operator's screen alike: three names, one
+    /// spelling each, and a summary that carries the mode says what the schema
+    /// says.
+    #[test]
+    fn an_ownership_mode_is_spelled_the_way_the_policy_tags_itself() {
+        let cases = [
+            (
+                OwnershipSpec::Map {
+                    unmapped: UnmappedPolicy::Squash,
+                    squash_uid: DEFAULT_SQUASH_ID,
+                    squash_gid: DEFAULT_SQUASH_ID,
+                    uid_map: Vec::new(),
+                    gid_map: Vec::new(),
+                },
+                OwnershipMode::Map,
+                "map",
+            ),
+            (
+                OwnershipSpec::Passthrough {},
+                OwnershipMode::Passthrough,
+                "passthrough",
+            ),
+            (
+                OwnershipSpec::Static { uid: 0, gid: 0 },
+                OwnershipMode::Static,
+                "static",
+            ),
+        ];
+        for (spec, mode, name) in cases {
+            assert_eq!(spec.mode(), mode);
+            assert_eq!(json(&mode), format!(r#""{name}""#));
+            assert_eq!(mode.to_string(), name);
+            assert_eq!(parse::<OwnershipMode>(&format!(r#""{name}""#)), mode);
+            // The tag the whole policy serializes under is the same name.
+            assert!(
+                json(&spec).starts_with(&format!(r#"{{"mode":"{name}""#)),
+                "{spec:?}"
+            );
+        }
+    }
+
     #[test]
     fn namespace_specs_deny_unknown_fields_and_default_their_policy() {
         let spec: NamespaceSpec = parse(r#"{"name":"project"}"#);
@@ -749,7 +819,7 @@ mod tests {
             spec,
             NamespaceSpec::new(NamespaceName::new("project").expect("valid"))
         );
-        assert_eq!(spec.ownership.mode_name(), "passthrough");
+        assert_eq!(spec.ownership.mode(), OwnershipMode::Passthrough);
         assert_eq!(spec.permission, PermissionMode::Passthrough);
         assert_eq!(spec.auth, AuthMode::None);
         assert!(spec.rules.is_empty());

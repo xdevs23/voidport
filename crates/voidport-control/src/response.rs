@@ -12,7 +12,7 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::policy::{AuthMode, NamespaceName, NamespaceSpec, PermissionMode};
+use crate::policy::{AuthMode, NamespaceName, NamespaceSpec, OwnershipMode, PermissionMode};
 
 /// The response envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -144,8 +144,8 @@ pub enum Reply {
 pub struct NamespaceSummary {
     /// The namespace name.
     pub name: NamespaceName,
-    /// Its ownership mode, as the schema spells it.
-    pub ownership: String,
+    /// Its ownership mode, without what the mode configures.
+    pub ownership: OwnershipMode,
     /// Its permission mode.
     pub permission: PermissionMode,
     /// Its auth mode.
@@ -476,7 +476,7 @@ mod tests {
     fn summaries_describe_a_namespace_at_a_glance() {
         let summary = NamespaceSummary {
             name: NamespaceName::new("project").expect("valid"),
-            ownership: "map".to_owned(),
+            ownership: OwnershipMode::Map,
             permission: PermissionMode::Passthrough,
             auth: AuthMode::None,
             rules: 3,

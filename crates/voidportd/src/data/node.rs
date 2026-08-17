@@ -208,18 +208,13 @@ pub enum NodeKey {
 impl NodeKey {
     /// The key a resolved entry gets.
     #[must_use]
-    pub fn of(
-        path: &NamespacePath,
-        kind: FileKind,
-        identity: (u64, u64),
-        mode: EffectiveMode,
-    ) -> Self {
-        if kind.is_directory() {
+    pub fn of(path: &NamespacePath, identity: HostIdentity, mode: EffectiveMode) -> Self {
+        if identity.kind.is_directory() {
             Self::Directory(path.clone())
         } else {
             Self::Inode {
-                device: identity.0,
-                inode: identity.1,
+                device: identity.device,
+                inode: identity.inode,
                 mode,
             }
         }

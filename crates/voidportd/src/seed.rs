@@ -223,8 +223,8 @@ impl Seed {
         } else if existing.ownership != seeded.ownership {
             Some((
                 "ownership mode",
-                existing.ownership.mode_name().to_owned(),
-                OwnershipSpec::default().mode_name().to_owned(),
+                existing.ownership.mode().to_string(),
+                OwnershipSpec::default().mode().to_string(),
             ))
         } else {
             None

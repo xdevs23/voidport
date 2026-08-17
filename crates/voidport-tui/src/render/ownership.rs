@@ -30,7 +30,7 @@ pub(super) fn draw(frame: &mut Frame, model: &Model, area: Rect) {
         lines.push(header("Ownership".to_owned()));
         lines.push(Line::from(format!(
             "  mode        {}",
-            spec.ownership.mode_name()
+            spec.ownership.mode()
         )));
         match &spec.ownership {
             OwnershipSpec::Passthrough {} => {

@@ -182,7 +182,7 @@ fn render_xattr_rule(rule: &XattrRule) -> String {
 
 /// Renders the ownership policy, one line per configured fact.
 fn render_ownership(ownership: &OwnershipSpec) -> Vec<String> {
-    let mut lines = vec![format!("ownership:  {}", ownership.mode_name())];
+    let mut lines = vec![format!("ownership:  {}", ownership.mode())];
     match ownership {
         OwnershipSpec::Passthrough {} => {}
         OwnershipSpec::Static { uid, gid } => {
@@ -234,7 +234,7 @@ mod tests {
     use super::*;
     use voidport_control::{
         AuthMode, ControlError, ErrorCode, IdSentinel, NamespaceName, NamespaceSummary,
-        PermissionMode, ShareMode, UnmappedPolicy,
+        OwnershipMode, PermissionMode, ShareMode, UnmappedPolicy,
     };
 
     fn name(raw: &str) -> NamespaceName {
@@ -305,7 +305,7 @@ mod tests {
         let rendered = render(&Response::ok(Reply::NamespaceList {
             namespaces: vec![NamespaceSummary {
                 name: name("project"),
-                ownership: "map".to_owned(),
+                ownership: OwnershipMode::Map,
                 permission: PermissionMode::Passthrough,
                 auth: AuthMode::None,
                 rules: 3,

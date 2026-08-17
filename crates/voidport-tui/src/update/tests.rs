@@ -7,8 +7,8 @@ use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use voidport_control::{
     AuthMode, ControlError, ErrorCode, IdMapping, IdSentinel, ListenerInfo, NamespaceName,
-    NamespaceSpec, NamespaceSummary, OwnershipSpec, PermissionMode, Request, Rule, SessionSummary,
-    ShareMode, UnmappedPolicy,
+    NamespaceSpec, NamespaceSummary, OwnershipMode, OwnershipSpec, PermissionMode, Request, Rule,
+    SessionSummary, ShareMode, UnmappedPolicy,
 };
 
 use std::path::PathBuf;
@@ -45,7 +45,7 @@ fn type_text(model: &mut Model, text: &str) {
 fn summary(name_: &str, rules: usize) -> NamespaceSummary {
     NamespaceSummary {
         name: name(name_),
-        ownership: "passthrough".to_owned(),
+        ownership: OwnershipMode::Passthrough,
         permission: PermissionMode::Passthrough,
         auth: AuthMode::None,
         rules,

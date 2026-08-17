@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 use percent_encoding::{AsciiSet, CONTROLS, percent_encode};
 use voidport_control::NamespaceName;
 
-use crate::data::listener::{Endpoint, TCP, UNIX, VSOCK};
+use crate::data::listener::{Endpoint, Transport};
 
 /// The document the plain-transport note points at.
 pub const THREAT_MODEL: &str = "docs/THREAT-MODEL.md";
@@ -77,8 +77,8 @@ const SEGMENT: &AsciiSet = &CONTROLS
 /// One listener's copy-paste mount command.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct MountCommand {
-    /// The transport the listener serves, as the state file spells it.
-    pub transport: &'static str,
+    /// The transport the listener serves.
+    pub transport: Transport,
     /// The mount URL, in the client's grammar.
     pub url: String,
     /// The mountpoint the line suggests. The guest picks its own; this one only
@@ -127,7 +127,7 @@ impl LaunchSummary {
         Self {
             namespace: namespace.clone(),
             control_socket: control_socket.to_path_buf(),
-            plaintext_tcp: mounts.iter().any(|mount| mount.transport == TCP),
+            plaintext_tcp: mounts.iter().any(|mount| mount.transport == Transport::Tcp),
             mounts,
         }
     }
@@ -172,9 +172,9 @@ fn mount_command(
     let (transport, authority) = match endpoint {
         // `SocketAddr`'s own rendering is the URL grammar's: an IPv6 literal
         // comes out bracketed, and the port is the one that was bound.
-        Endpoint::Tcp(address) => (TCP, format!("voidport://{address}")),
+        Endpoint::Tcp(address) => (Transport::Tcp, format!("voidport://{address}")),
         Endpoint::Unix(path) => (
-            UNIX,
+            Transport::Unix,
             format!(
                 "voidport+unix://{}",
                 percent_encode(path.as_os_str().as_bytes(), AUTHORITY)
@@ -191,7 +191,10 @@ fn mount_command(
             } else {
                 *cid
             };
-            (VSOCK, format!("voidport+vsock://{dialled}:{port}"))
+            (
+                Transport::Vsock,
+                format!("voidport+vsock://{dialled}:{port}"),
+            )
         }
     };
     MountCommand {
@@ -256,7 +259,7 @@ mod tests {
         assert_eq!(
             summary.mounts,
             vec![MountCommand {
-                transport: TCP,
+                transport: Transport::Tcp,
                 url: format!("voidport://127.0.0.1:{port}/@share"),
                 mountpoint: PathBuf::from("/mnt/share"),
             }]
@@ -292,7 +295,7 @@ mod tests {
         assert_eq!(
             summary.mounts,
             vec![MountCommand {
-                transport: UNIX,
+                transport: Transport::Unix,
                 url: format!("voidport+unix://{encoded}/@share"),
                 mountpoint: PathBuf::from("/mnt/share"),
             }]
@@ -326,7 +329,7 @@ mod tests {
         assert_eq!(
             summary.mounts,
             vec![MountCommand {
-                transport: VSOCK,
+                transport: Transport::Vsock,
                 url: format!("voidport+vsock://{}:{port}/@share", vsock::VMADDR_CID_HOST),
                 mountpoint: PathBuf::from("/mnt/share"),
             }]
@@ -367,8 +370,8 @@ mod tests {
 
         let summary = LaunchSummary::new(&name("a b"), &endpoints, &scratch.join("control.sock"));
         assert_eq!(summary.mounts.len(), 2);
-        assert_eq!(summary.mounts[0].transport, TCP);
-        assert_eq!(summary.mounts[1].transport, UNIX);
+        assert_eq!(summary.mounts[0].transport, Transport::Tcp);
+        assert_eq!(summary.mounts[1].transport, Transport::Unix);
         assert!(summary.plaintext_tcp);
         // The namespace rides in a path segment, so a name the grammar reserves
         // characters of is encoded, not printed raw.

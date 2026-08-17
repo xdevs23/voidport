@@ -10,7 +10,7 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use voidport_control::{NamespaceName, NamespaceSummary};
+use voidport_control::{NamespaceName, NamespaceSummary, OwnershipMode};
 
 use crate::namespace::Namespace;
 
@@ -85,10 +85,14 @@ impl<'a> IntoIterator for &'a Registry {
 /// The summary is derived from the built form, so it describes what the server
 /// is actually serving, not what the file says.
 #[must_use]
-pub fn summarize(namespace: &Namespace, ownership_mode: &str, rules: usize) -> NamespaceSummary {
+pub fn summarize(
+    namespace: &Namespace,
+    ownership_mode: OwnershipMode,
+    rules: usize,
+) -> NamespaceSummary {
     NamespaceSummary {
         name: namespace.name().clone(),
-        ownership: ownership_mode.to_owned(),
+        ownership: ownership_mode,
         permission: namespace.permission(),
         auth: namespace.auth(),
         rules,
@@ -181,9 +185,9 @@ mod tests {
     #[test]
     fn a_summary_describes_the_built_namespace() {
         let namespace = namespace("project", Vec::new());
-        let summary = summarize(&namespace, OwnershipSpec::default().mode_name(), 0);
+        let summary = summarize(&namespace, OwnershipSpec::default().mode(), 0);
         assert_eq!(summary.name, name("project"));
-        assert_eq!(summary.ownership, "passthrough");
+        assert_eq!(summary.ownership, OwnershipMode::Passthrough);
         assert_eq!(summary.rules, 0);
     }
 }

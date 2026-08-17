@@ -33,6 +33,7 @@ use crate::control::service::Published;
 use crate::data::caps::Limits;
 use crate::data::handle::{DirListing, HandleTable, ListingEntry};
 use crate::data::ino::InoAllocator;
+use crate::data::listener::Transport;
 use crate::data::node::{Interned, Move, Node, NodeBacking, NodeKey, NodeTable, ROOT_NODE_ID};
 use crate::data::pin::{DescriptorBudget, NodePin, Pinned};
 use crate::data::server::{Identity, Registries};
@@ -49,8 +50,8 @@ use crate::rules::{
 /// Where a session came from, for the operator's session list.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Peer {
-    /// The transport it arrived on: `tcp` or `unix`.
-    pub transport: &'static str,
+    /// The transport it arrived on.
+    pub transport: Transport,
     /// The peer address, as the transport describes it.
     pub address: String,
 }
@@ -58,7 +59,7 @@ pub struct Peer {
 impl Peer {
     /// Describes a peer.
     #[must_use]
-    pub fn new(transport: &'static str, address: impl Into<String>) -> Self {
+    pub fn new(transport: Transport, address: impl Into<String>) -> Self {
         Self {
             transport,
             address: address.into(),
@@ -189,10 +190,7 @@ impl Session {
                 if !host.kind().is_directory() {
                     return Err(Errno::NOTDIR);
                 }
-                let root_ino = {
-                    let (device, inode) = host.identity();
-                    ino.host(device, inode)
-                };
+                let root_ino = ino.host(host.host_identity());
                 // The mount root must be presentable: a root the ownership
                 // policy hides is a namespace the guest cannot see into.
                 host.present(root_ino, *mode, namespace.ownership())
@@ -390,7 +388,7 @@ impl Session {
             id: self.id,
             namespace: self.name.clone(),
             subpath: self.subpath.to_string(),
-            transport: self.peer.transport.to_owned(),
+            transport: self.peer.transport.to_string(),
             peer: self.peer.address.clone(),
             nodes,
             handles,
@@ -633,16 +631,16 @@ impl Session {
         mode: EffectiveMode,
     ) -> Result<Resolved, Errno> {
         let host = HostAttr::of(fd.as_fd())?;
-        let identity = host.identity();
-        let ino = self.ino.host(identity.0, identity.1);
+        let identity = host.host_identity();
+        let ino = self.ino.host(identity);
         // The ownership filter runs on what was just pinned: an entry whose
         // owner the policy hides does not exist, whatever the session may
         // already hold under that name.
         let fresh = host
             .present(ino, mode, namespace.ownership())
             .ok_or(Errno::NOENT)?;
-        let kind = host.kind();
-        let key = NodeKey::of(&path, kind, identity, mode);
+        let kind = identity.kind;
+        let key = NodeKey::of(&path, identity, mode);
         let found = host.node_identity();
         let pin = self.budget.pin(Pinned {
             fd,

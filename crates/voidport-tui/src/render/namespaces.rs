@@ -39,7 +39,7 @@ pub(super) fn draw(frame: &mut Frame, model: &Model, area: Rect) {
             };
             let text = row(&[
                 (summary.name.as_str(), 24),
-                (&summary.ownership, 12),
+                (&summary.ownership.to_string(), 12),
                 (&summary.permission.to_string(), 12),
                 (&summary.auth.to_string(), 6),
                 (&summary.rules.to_string(), 5),

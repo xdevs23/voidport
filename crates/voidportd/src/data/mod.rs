@@ -48,7 +48,7 @@ pub mod vsock;
 
 pub use caps::Limits;
 pub use conn::MAX_FRAME_LEN;
-pub use listener::{BoundListener, DataListeners, Endpoint, ListenerError};
+pub use listener::{BoundListener, DataListeners, Endpoint, ListenerError, Transport};
 pub use pin::{DescriptorBudget, NodePin};
 pub use server::{DataPlane, Identity};
 pub use session::{Peer, Session};

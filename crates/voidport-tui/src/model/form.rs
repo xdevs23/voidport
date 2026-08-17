@@ -213,7 +213,7 @@ impl Form {
                     "mode",
                     "map | passthrough | static",
                     OWNERSHIP_MODES,
-                    current.mode_name(),
+                    current.mode().to_string(),
                 ),
                 Field::choice(
                     "unmapped",

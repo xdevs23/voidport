@@ -286,22 +286,15 @@ impl HostAttr {
         Ok(Self { stat })
     }
 
-    /// The `(device, inode)` pair the server keys synthetic inos by.
-    #[must_use]
-    pub fn identity(&self) -> (u64, u64) {
-        (
-            makedev(self.stat.stx_dev_major, self.stat.stx_dev_minor),
-            self.stat.stx_ino as u64,
-        )
-    }
-
     /// Everything a listing remembers about the entry: its identity and kind.
+    ///
+    /// This is also what a host entry's ino is keyed by, so the pair travels
+    /// as one value and is never assembled twice from loose numbers.
     #[must_use]
     pub fn host_identity(&self) -> HostIdentity {
-        let (device, inode) = self.identity();
         HostIdentity {
-            device,
-            inode,
+            device: makedev(self.stat.stx_dev_major, self.stat.stx_dev_minor),
+            inode: self.stat.stx_ino as u64,
             kind: self.kind(),
         }
     }
@@ -310,11 +303,11 @@ impl HostAttr {
     /// included.
     #[must_use]
     pub fn node_identity(&self) -> NodeIdentity {
-        let (device, inode) = self.identity();
+        let entry = self.host_identity();
         NodeIdentity {
-            device,
-            inode,
-            kind: self.kind(),
+            device: entry.device,
+            inode: entry.inode,
+            kind: entry.kind,
             birth: self.birth(),
         }
     }

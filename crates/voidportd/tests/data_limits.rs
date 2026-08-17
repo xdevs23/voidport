@@ -145,7 +145,7 @@ fn a_vsock_listener_binds_from_the_state_file() {
         Some((vsock::VMADDR_CID_ANY, port)),
         "an unnamed cid is the wildcard, which on a host means its guests",
     );
-    assert_eq!(listeners[0].transport(), "vsock");
+    assert_eq!(listeners[0].transport().as_str(), "vsock");
 }
 
 /// A vsock port no mount URL could name is refused at load, with the listener

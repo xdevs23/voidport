@@ -411,7 +411,7 @@ impl Service {
                 let namespace = snapshot.registry.get(&spec.name)?;
                 Some(summarize(
                     &namespace,
-                    spec.ownership.mode_name(),
+                    spec.ownership.mode(),
                     spec.rules.len(),
                 ))
             })

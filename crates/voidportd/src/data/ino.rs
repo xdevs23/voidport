@@ -25,6 +25,7 @@ use std::sync::Mutex;
 
 use voidport_control::NamespaceName;
 
+use crate::host::HostIdentity;
 use crate::rules::NamespacePath;
 
 /// The bit that marks an ino as belonging to the synthesized-directory space.
@@ -59,14 +60,19 @@ impl InoAllocator {
     }
 
     /// The ino of a host entry, allocating one on first sight.
+    ///
+    /// Keyed by the entry's device and inode and not by its kind, which a host
+    /// inode fixes when it is created: the pair is the whole of the identity
+    /// this table has to hold apart.
     #[must_use]
-    pub fn host(&self, device: u64, inode: u64) -> u64 {
+    pub fn host(&self, entry: HostIdentity) -> u64 {
+        let key = (entry.device, entry.inode);
         let mut state = self.locked();
-        if let Some(ino) = state.host.get(&(device, inode)) {
+        if let Some(ino) = state.host.get(&key) {
             return *ino;
         }
         let ino = state.allocate();
-        state.host.insert((device, inode), ino);
+        state.host.insert(key, ino);
         ino
     }
 
@@ -118,6 +124,7 @@ impl State {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::host::FileKind;
 
     fn namespace(raw: &str) -> NamespaceName {
         NamespaceName::new(raw).expect("valid namespace name")
@@ -127,22 +134,32 @@ mod tests {
         NamespacePath::parse(raw).expect("valid namespace path")
     }
 
+    /// A host entry with that device and inode. The kind is not part of the
+    /// key, so any one will do.
+    fn entry(device: u64, inode: u64) -> HostIdentity {
+        HostIdentity {
+            device,
+            inode,
+            kind: FileKind::Regular,
+        }
+    }
+
     #[test]
     fn a_host_inode_keeps_its_number() {
         let allocator = InoAllocator::new();
-        let first = allocator.host(7, 11);
-        assert_eq!(allocator.host(7, 11), first);
+        let first = allocator.host(entry(7, 11));
+        assert_eq!(allocator.host(entry(7, 11)), first);
         // A hardlink alias is the same host inode, so the same ino.
-        assert_eq!(allocator.host(7, 11), first);
+        assert_eq!(allocator.host(entry(7, 11)), first);
         // Same inode number on another device is another file.
-        assert_ne!(allocator.host(8, 11), first);
+        assert_ne!(allocator.host(entry(8, 11)), first);
         assert_eq!(allocator.allocated(), 2);
     }
 
     #[test]
     fn synthesized_directories_live_in_a_disjoint_space() {
         let allocator = InoAllocator::new();
-        let host = allocator.host(7, 11);
+        let host = allocator.host(entry(7, 11));
         let synthetic = allocator.synthesized(&namespace("p"), &path("/a"));
         assert_eq!(host & SYNTHETIC_INO_TAG, 0);
         assert_eq!(synthetic & SYNTHETIC_INO_TAG, SYNTHETIC_INO_TAG);
@@ -166,7 +183,7 @@ mod tests {
         let allocator = InoAllocator::new();
         let mut seen = Vec::new();
         for index in 0..4u64 {
-            seen.push(allocator.host(1, index));
+            seen.push(allocator.host(entry(1, index)));
             seen.push(allocator.synthesized(&namespace("p"), &path(&format!("/{index}"))));
         }
         let low_bits: Vec<u64> = seen.iter().map(|ino| ino & !SYNTHETIC_INO_TAG).collect();

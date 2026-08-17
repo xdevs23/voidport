@@ -184,7 +184,7 @@ pub async fn serve<S: DataStream>(stream: S, plane: Arc<DataPlane>, peer: Peer) 
     let transport = peer.transport;
     let address = peer.address.clone();
     if let Err(error) = converse(stream, plane, peer).await {
-        tracing::debug!(%error, transport, peer = %address, "data connection ended");
+        tracing::debug!(%error, %transport, peer = %address, "data connection ended");
     }
 }
 

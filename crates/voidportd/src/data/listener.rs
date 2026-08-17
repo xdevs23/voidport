@@ -40,6 +40,7 @@
 //! joined on the way out, which is what keeps clean shutdown structural:
 //! nothing here is a detached task.
 
+use std::fmt;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -55,6 +56,40 @@ use super::server::DataPlane;
 use super::session::Peer;
 use super::vsock;
 use crate::socket::{BindError, UnixSocket};
+
+/// A data-plane transport, as the state file and the wire spell it.
+///
+/// The set is closed and it is the same set [`Listener`] tags itself with, so
+/// a session, a bound endpoint and a configured listener all name a transport
+/// with one vocabulary and none of them can name one that does not exist.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum Transport {
+    /// A TCP socket.
+    Tcp,
+    /// A unix socket.
+    Unix,
+    /// A vsock endpoint.
+    Vsock,
+}
+
+impl Transport {
+    /// The name, as everything that writes a transport down writes it.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Tcp => "tcp",
+            Self::Unix => "unix",
+            Self::Vsock => "vsock",
+        }
+    }
+}
+
+impl fmt::Display for Transport {
+    /// Honors width and alignment, so transports can be tabulated.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(self.as_str())
+    }
+}
 
 /// A listener's address as bound: what a guest dials.
 ///
@@ -78,13 +113,13 @@ pub enum Endpoint {
 }
 
 impl Endpoint {
-    /// The transport name a session records.
+    /// The transport a session records.
     #[must_use]
-    pub fn transport(&self) -> &'static str {
+    pub fn transport(&self) -> Transport {
         match self {
-            Self::Tcp(_) => TCP,
-            Self::Unix(_) => UNIX,
-            Self::Vsock { .. } => VSOCK,
+            Self::Tcp(_) => Transport::Tcp,
+            Self::Unix(_) => Transport::Unix,
+            Self::Vsock { .. } => Transport::Vsock,
         }
     }
 
@@ -106,7 +141,7 @@ impl Endpoint {
     /// How this endpoint reports itself over the control plane.
     #[must_use]
     pub fn info(&self) -> ListenerInfo {
-        ListenerInfo::new(self.transport(), self.render())
+        ListenerInfo::new(self.transport().as_str(), self.render())
     }
 
     /// The address a TCP listener bound, port 0 resolved. Tests need it to
@@ -272,7 +307,7 @@ impl BoundListener {
                                 if let Err(error) = stream.set_nodelay(true) {
                                     tracing::warn!(%error, "a data connection could not disable Nagle");
                                 }
-                                let peer = Peer::new(TCP, address.to_string());
+                                let peer = Peer::new(Transport::Tcp, address.to_string());
                                 tokio::spawn(conn::serve(stream, Arc::clone(&plane), peer));
                             }
                             Err(error) => tracing::warn!(%error, "a data connection was not accepted"),
@@ -294,7 +329,7 @@ impl BoundListener {
                         _ = stopped.wait_for(|stopped| *stopped) => break,
                         accepted = listener.accept() => match accepted {
                             Ok((stream, _)) => {
-                                let peer = Peer::new(UNIX, socket.path().display().to_string());
+                                let peer = Peer::new(Transport::Unix, socket.path().display().to_string());
                                 tokio::spawn(conn::serve(stream, Arc::clone(&plane), peer));
                             }
                             Err(error) => tracing::warn!(%error, "a data connection was not accepted"),
@@ -327,7 +362,7 @@ impl BoundListener {
                         accepted = acceptor.accept() => match accepted {
                             Ok((connection, address)) => {
                                 let peer = Peer::new(
-                                    VSOCK,
+                                    Transport::Vsock,
                                     format!("{}:{}", address.cid(), address.port()),
                                 );
                                 tokio::spawn(conn::serve(connection, Arc::clone(&plane), peer));
@@ -345,15 +380,6 @@ impl BoundListener {
         }
     }
 }
-
-/// The transport name a TCP session records.
-pub const TCP: &str = "tcp";
-
-/// The transport name a unix session records.
-pub const UNIX: &str = "unix";
-
-/// The transport name a vsock session records.
-pub const VSOCK: &str = "vsock";
 
 /// Every data listener the server currently holds, bound or serving.
 ///
@@ -442,7 +468,7 @@ impl Live {
             }
         };
         tracing::info!(
-            transport = endpoint.transport(),
+            transport = %endpoint.transport(),
             endpoint = endpoint.render(),
             "serving a data listener"
         );
@@ -616,7 +642,7 @@ impl DataListeners {
             }
         };
         tracing::info!(
-            transport = listener.endpoint.transport(),
+            transport = %listener.endpoint.transport(),
             endpoint = listener.endpoint.render(),
             "closing a data listener"
         );
@@ -718,6 +744,36 @@ mod tests {
     use super::*;
     use crate::testing::Scratch;
 
+    /// A transport is spelled one way, and it is the way the configured
+    /// listener tags itself: what a session reports and what a bound endpoint
+    /// lists are the three names a state file is written with.
+    #[test]
+    fn a_transport_is_spelled_the_way_the_configured_listener_tags_itself() {
+        let cases = [
+            (
+                Transport::Tcp,
+                "tcp",
+                Listener::Tcp {
+                    addr: "127.0.0.1:9000".parse().expect("valid address"),
+                },
+            ),
+            (
+                Transport::Unix,
+                "unix",
+                Listener::Unix {
+                    path: PathBuf::from("/run/voidport/data.sock"),
+                },
+            ),
+            (Transport::Vsock, "vsock", Listener::vsock(1024)),
+        ];
+        for (transport, name, configured) in cases {
+            assert_eq!(transport.as_str(), name);
+            assert_eq!(transport.to_string(), name);
+            assert_eq!(configured.transport(), name);
+            assert_eq!(Peer::new(transport, "somewhere").transport, transport);
+        }
+    }
+
     /// A vsock listener binds like the other two, and reports the address it
     /// bound in the mount grammar's `cid:port` form.
     #[test]
@@ -730,7 +786,7 @@ mod tests {
             .expect("the wildcard cid binds");
 
         let endpoint = bound[0].endpoint();
-        assert_eq!(endpoint.transport(), VSOCK);
+        assert_eq!(endpoint.transport(), Transport::Vsock);
         assert_eq!(endpoint.vsock_address(), Some((ANY_CID, port)));
         assert_eq!(endpoint.render(), format!("any:{port}"));
         assert!(endpoint.tcp_address().is_none());
@@ -779,17 +835,20 @@ mod tests {
         .expect("both bind");
 
         let tcp = bound[0].endpoint();
-        assert_eq!(tcp.transport(), TCP);
+        assert_eq!(tcp.transport(), Transport::Tcp);
         let address = tcp.tcp_address().expect("a tcp listener");
         assert_ne!(address.port(), 0, "the ephemeral port is resolved");
         assert!(tcp.unix_path().is_none());
 
         let unix = bound[1].endpoint();
-        assert_eq!(unix.transport(), UNIX);
+        assert_eq!(unix.transport(), Transport::Unix);
         assert_eq!(unix.unix_path(), Some(path.as_path()));
         assert!(path.exists());
         assert_eq!(unix.render(), path.display().to_string());
-        assert_eq!(unix.info(), ListenerInfo::new(UNIX, unix.render()));
+        assert_eq!(
+            unix.info(),
+            ListenerInfo::new(Transport::Unix.as_str(), unix.render())
+        );
 
         drop(bound);
         assert!(!path.exists(), "a dropped unix listener unlinks its path");
