@@ -3,8 +3,10 @@
 //! The shape of a connection is fixed by the design's concurrency contract:
 //!
 //! * **one reader task** per connection, which does nothing but frame bytes;
-//! * **each request served on the runtime**, with the host syscalls on the
-//!   blocking pool, so a slow disk stalls one request, not the reactor;
+//! * **each request served on the blocking pool**, closure and all: the host
+//!   syscalls run there and the very same closure queues the reply, so a slow
+//!   disk stalls one request, not the reactor, and a plain request costs one
+//!   hop onto the pool and none back;
 //! * **a request that waits, waits as a future.** A blocking lock whose range
 //!   another owner holds hands back a [`ops::LockWait`] instead of sleeping in
 //!   the syscall, and this task polls it. Hundreds of stacked waiters therefore
@@ -73,6 +75,7 @@
 
 use std::collections::HashSet;
 use std::io;
+use std::panic::{self, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 
 use rustix::io::Errno;
@@ -153,9 +156,10 @@ const READ_BUFFER_BYTES: usize = 64 * 1024;
 /// A cap sizes this queue when there is one: no more replies can exist than
 /// requests in flight. With no cap there is no such number, and a queue is
 /// still needed because `mpsc` is bounded — so this is the depth chosen for
-/// that case. It bounds nothing a guest can ask for: a full queue makes the
-/// task that produced a reply wait for the writer to drain one, which is the
-/// same wait the writer's socket would impose one step later.
+/// that case. It bounds nothing a guest can ask for: a full queue moves the
+/// finished reply to a task that waits for the writer to drain one, which is
+/// the same wait the writer's socket would impose one step later — and never
+/// a parked pool thread, which the dispatch comment explains.
 const REPLY_QUEUE_DEPTH: usize = 1024;
 
 /// The payload size at which a reply is scheduled as **bulk**.
@@ -294,56 +298,107 @@ where
         }
 
         let session = Arc::clone(session);
-        let registering = Arc::clone(&session);
         let outgoing = outgoing.clone();
         let mut cancelled = stopped.clone();
-        tokio::spawn(async move {
-            // The permit is released when this task ends, whichever way it
-            // ends, which is what keeps the cap honest — a parked lock wait
-            // holds one exactly as the blocking wait it replaced did.
-            let _permit = permit;
+        // The request is served **from** the blocking closure, which queues its
+        // own reply. What this replaced was an outer task that did nothing but
+        // await the pool and forward what came back, and that join cost two of
+        // the five voluntary context switches every round trip paid.
+        //
+        // The queue handoff must never park this pool thread: pool threads
+        // are a process-global, hard-capped resource shared with every other
+        // connection AND the control plane, and a guest that stops draining
+        // its socket would otherwise pin one per request until the pool is
+        // gone. So the closure only ever try-sends; the rare full-queue case
+        // falls back to a spawned task that awaits the send — the same
+        // bounded wait the awaited handoff imposed, held by a task again.
+        //
+        // Replies enter the queue in completion order, from whichever thread
+        // finished one, exactly as before: not one byte and not one ordering
+        // rule of the two-class outbox changes here.
+        tokio::task::spawn_blocking(move || {
+            // The permit rides in with the closure and is released when the
+            // closure ends, whichever way it ends — or, on the two arms that
+            // hand the rest of the request to a task, when *that* task ends.
+            // That is what keeps the cap honest: a parked lock wait holds one
+            // exactly as the blocking wait it replaced did.
             let request_id = request_id_of(&bytes);
-            let served =
-                tokio::task::spawn_blocking(move || ops::serve(&session, &bytes, MAX_FRAME_LEN))
-                    .await;
-            let message = match served {
-                Ok(Ok(Served::Reply(bytes))) => Outgoing::Frame { request_id, bytes },
-                Ok(Ok(Served::Silent)) => return,
-                Ok(Ok(Served::Subscribed(bytes))) => {
+            let message = match serve_request(&session, &bytes) {
+                Ok(Served::Reply(bytes)) => Outgoing::Frame { request_id, bytes },
+                Ok(Served::Silent) => return,
+                Ok(Served::Subscribed(bytes)) => {
                     // The confirm goes on the reply queue *first*, and only
                     // then is the subscription registered — which is what
                     // queues the snapshot. The writer prefers replies over
                     // notifications, so a confirm already queued can never be
                     // overtaken by a snapshot part queued after it. That is the
                     // contract's ordering, established here, not hoped
-                    // for downstream.
-                    outgoing.send(Outgoing::Frame { request_id, bytes }).await;
-                    registering.subscribe();
+                    // for downstream. It takes a task because the two steps
+                    // must not be split by a queue full enough to park this
+                    // pool thread between them.
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        outgoing.send(Outgoing::Frame { request_id, bytes }).await;
+                        session.subscribe();
+                    });
                     return;
                 }
-                Ok(Ok(Served::Waiting(wait))) => {
+                Ok(Served::Waiting(wait)) => {
                     // The wait is a future, so the connection dying really does
                     // cancel it: the select drops it where a blocking SETLKW
                     // would have held a pool thread until the holder let go.
-                    let settled = tokio::select! {
-                        biased;
-                        _ = cancelled.wait_for(|stopped| *stopped) => return,
-                        settled = wait.settle() => settled,
-                    };
-                    match settled {
-                        Ok(bytes) => Outgoing::Frame { request_id, bytes },
-                        Err(error) => Outgoing::Poisoned(error),
-                    }
+                    // Which is the whole reason this arm keeps a task — holding
+                    // the wait here would hold the pool thread it exists to
+                    // give back.
+                    tokio::spawn(async move {
+                        let _permit = permit;
+                        let settled = tokio::select! {
+                            biased;
+                            _ = cancelled.wait_for(|stopped| *stopped) => return,
+                            settled = wait.settle() => settled,
+                        };
+                        let message = match settled {
+                            Ok(bytes) => Outgoing::Frame { request_id, bytes },
+                            Err(error) => Outgoing::Poisoned(error),
+                        };
+                        outgoing.send(message).await;
+                    });
+                    return;
                 }
-                Ok(Err(error)) => Outgoing::Poisoned(error),
-                Err(error) => {
-                    tracing::error!(%error, "a request handler failed");
-                    Outgoing::Poisoned(FramingError::LengthOverflow)
-                }
+                Err(error) => Outgoing::Poisoned(error),
             };
-            outgoing.send(message).await;
+            // Fast path: room in the queue, the reply is in, the permit drops
+            // with the closure. Full queue: the wait moves to a task carrying
+            // the reply and the permit, so the pool thread is free the moment
+            // the closure ends. Within one class the fallback may land after
+            // a reply finished later — the wire orders nothing across request
+            // ids, so that is permitted, and the writer's class scheduling is
+            // untouched either way.
+            if let Err(message) = outgoing.try_send(message) {
+                tokio::spawn(async move {
+                    let _permit = permit;
+                    outgoing.send(message).await;
+                });
+            }
         });
     }
+}
+
+/// Serves one request, turning a handler that unwinds into a poisoning.
+///
+/// Nothing joins the blocking task any more — the closure queues its own reply
+/// — so a panic that escaped it would end the request in silence, leaving the
+/// client waiting for an answer that can never come and its id outstanding for
+/// as long as the connection lives. Catching it keeps exactly what awaiting the
+/// join used to do with a failed handler: log it, and close the connection.
+fn serve_request(session: &Session, bytes: &[u8]) -> Result<Served, FramingError> {
+    let served = panic::catch_unwind(AssertUnwindSafe(|| {
+        ops::serve(session, bytes, MAX_FRAME_LEN)
+    }));
+    served.unwrap_or_else(|_| {
+        tracing::error!("a request handler failed");
+        Err(FramingError::LengthOverflow)
+    })
 }
 
 /// What a request holds while it is in flight: a permit where the session is
@@ -392,17 +447,37 @@ struct Outbox {
 }
 
 impl Outbox {
-    /// Queues one message in the class its size puts it in.
+    /// The queue a message belongs in.
     ///
     /// A poisoning is a control signal, not a reply, and it takes the
     /// small queue so that a connection closes on a fault without waiting
     /// behind whatever data is still queued.
-    async fn send(&self, message: Outgoing) {
-        let queue = match &message {
+    fn queue(&self, message: &Outgoing) -> &mpsc::Sender<Outgoing> {
+        match message {
             Outgoing::Frame { bytes, .. } if bytes.len() >= BULK_REPLY_BYTES => &self.bulk,
             Outgoing::Frame { .. } | Outgoing::Poisoned(_) => &self.small,
-        };
-        let _ = queue.send(message).await;
+        }
+    }
+
+    /// Queues one message in the class its size puts it in.
+    async fn send(&self, message: Outgoing) {
+        let _ = self.queue(&message).send(message).await;
+    }
+
+    /// Queues one message without waiting, handing it back when the queue
+    /// is full so the caller can move the wait somewhere that may hold it.
+    ///
+    /// Classification is the one [`send`](Self::send) uses, so which class a
+    /// reply lands in never depends on which side queued it. A closed queue
+    /// swallows the message: the connection is tearing down and the reply has
+    /// nowhere to go, exactly as the awaited send treats it.
+    fn try_send(&self, message: Outgoing) -> Result<(), Outgoing> {
+        use tokio::sync::mpsc::error::TrySendError;
+        match self.queue(&message).try_send(message) {
+            Ok(()) => Ok(()),
+            Err(TrySendError::Full(message)) => Err(message),
+            Err(TrySendError::Closed(_)) => Ok(()),
+        }
     }
 }
 
