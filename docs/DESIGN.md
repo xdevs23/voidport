@@ -3289,31 +3289,43 @@ Whenever the guest expects a real filesystem to hold something the
 host backing cannot represent — because the server's user lacks the
 privilege, or the host would give the value a meaning it must not
 have there — the answer is always the same mechanism, never a
-special case: the guest truth is **recorded in a namespace-scoped
-table in the server's own state**, keyed by the backing entry's
-host identity (device and inode, the same identity discipline the
-descriptor budget proved), persisted with the state file under its
-rename-over discipline, and **merged** over what the host really
-holds at presentation. Mutation records what the host refuses; the
-same two switches exist every time — a per-namespace server switch
-that disables the feature loudly, and a client mount option that
-opts a mount out; enforcement of recorded meaning is always the
-guest kernel's, in its own trust domain.
+special case: the guest truth is **recorded in a per-namespace
+sidecar record file** beside the state file, keyed by
+graft-relative path, loaded wholesale into an authoritative
+in-memory table at namespace build, and **merged** over what the
+host really holds at presentation — a memory lookup, free on every
+path including the pinless listing walk. Mutation updates the
+table and persists the sidecar **debounced** under the rename-over
+discipline: recent metadata may be lost to a crash exactly as a
+local filesystem loses its most recent unsynced metadata — the
+same crash contract, stated. A rename through the server moves the
+record with the entry; a host-side rename orphans it, losing the
+recorded truth conservatively — bits are only ever lost, never
+resurrected onto an unrelated file. Entries whose paths no longer
+resolve prune at load and on resolution miss. The same two
+switches exist every time — a per-namespace server switch that
+disables the feature loudly, and a client mount option that opts a
+mount out; enforcement of recorded meaning is always the guest
+kernel's, in its own trust domain.
 
-(Reworked 2026-08-17, the same day, from a per-file extended
-attribute to the state table — the attribute shape accumulated
-guards under review exactly as the design law predicts: a hiding
-problem on four xattr paths, per-session caches needing
-cross-session invalidation, a per-entry host syscall on the listing
-path the hot-path work had deliberately removed, a write-failure
-mode of its own, and a file-kind restriction from the user xattr
-namespace. The table dissolves every one by construction: the
-server is the single point of truth, a memory read is the merge, no
-host syscall exists to fail or to price, nothing needs hiding, and
-every file kind records. The trade, stated: recorded truth does not
-travel with host-side copies of the file — the identity does not
-follow a copy — and an entry whose identity no longer matches is
-retired exactly as the descriptor budget retires stale identities.)
+(Decided 2026-08-17 on the third shape, after two rejections the
+reviews measured. Rejected: the per-file extended attribute — a
+hiding problem on four xattr paths, per-session caches needing
+cross-session invalidation, a per-entry host syscall on the pinless
+listing walk, a recording-write failure mode of its own, and a
+file-kind restriction from the user xattr namespace. Rejected: the
+identity-keyed table inside the state document — persisted
+device-and-inode identity measurably recycles across boots, which
+would resurrect privileged bits onto unrelated files, and riding
+the state document's persist put a milliseconds-scale global-lock
+cycle on the data path, against the no-global-locks law. The
+sidecar keeps the table's strengths — memory merge, every file
+kind, nothing to hide — with none of either failure: paths cannot
+resurrect, restart loads completely, and the sidecar's own
+debounced persist touches neither the state document nor any
+global lock. The trade, stated: recorded truth does not travel
+with host-side copies or renames of the backing file — the server
+is the bookkeeper, not the file.)
 
 Known instances of the class, each its own increment on the shared
 mechanism:
@@ -3348,30 +3360,34 @@ local semantics demand — while the host-side backing file never
 carries a privileged bit the server's own user set. The two truths
 are reconciled by recording, per the pattern above.
 
-Reworked 2026-08-17 twice, each after a probing review; every
-decision below is the current rework, built on the pattern's state
-table.
+Reworked 2026-08-17 three times, each after a probing review; every
+decision below is the current rework, built on the pattern's
+sidecar.
 
 - **Recording**: the privileged bits a guest sets live in the
-  namespace's recorded-metadata table, keyed by the backing entry's
-  host identity, persisted with the state file. Every file kind
-  records — the table has no kind restriction. Presentation ORs the
-  recorded bits into the mode the guest sees; a host file genuinely
-  carrying bits presents them as-is; nothing exists on the backing
-  file to hide, so the guest's xattr surface is untouched by this
-  increment.
+  namespace's sidecar-backed table, keyed by graft-relative path.
+  Every file kind records — the table has no kind restriction.
+  Presentation ORs the recorded bits into the mode the guest sees;
+  a host file genuinely carrying bits presents them as-is; nothing
+  exists on the backing file to hide, so the guest's xattr surface
+  is untouched by this increment. **Creates record too**: a guest
+  create or mkdir whose mode carries privileged bits records them
+  and masks them out of the host mode it applies — the create path
+  and the chmod path share the one masking rule.
 - **Setting**: the mode a chmod delivers has already passed the
   guest kernel's own permission and setgid-clearing logic under the
-  caller's full credentials — the wire carries the post-VFS mode,
-  which is what closes the group-membership predicate no wire field
+  caller's full credentials — the wire carries the post-VFS mode
+  (which the mount's default-permissions posture guarantees), and
+  that is what closes the group-membership predicate no wire field
   could carry. The server records the privileged bits from that
   mode and **masks them out of the host chmod** — a stated change
   from today, where the host mode received them verbatim where the
-  host allowed it (an owner may set setuid on its own file, and the
-  backing file must never carry it). Recording is a state mutation
-  under the persist discipline: it cannot fail apart from the
-  server failing, and a table the state file cannot hold fails the
-  chmod loudly at the persist boundary like any other mutation.
+  host allowed it. The table update is immediate and authoritative;
+  the sidecar persist is debounced with its cadence stated at the
+  constant, and the crash contract is a local filesystem's: the
+  most recent metadata may be lost, never corrupted, never
+  resurrected. A rename through the server moves the record; a
+  host-side rename orphans it, conservatively.
 - **Presentation is a memory merge at the one funnel**: the
   attribute presenter ORs the table's bits into every
   attribute-bearing reply — getattr, lookup, the readdirplus
@@ -3421,10 +3437,11 @@ table.
 1. A guest chmod adding setuid or setgid succeeds on every file
    kind, the bits present through every mount, every
    attribute-bearing reply and the namespace root, survive server
-   restart and remount through the persisted table, and the
-   backing file's host mode never gains them — including the
-   owner-settable case where the host would have accepted them,
-   pinned by a test that the host chmod is masked.
+   restart and remount through the sidecar (loaded wholesale, so a
+   cold listing is complete), and the backing file's host mode
+   never gains them — through chmod AND through creates carrying a
+   privileged mode, pinned by tests that the host mode is masked on
+   both paths.
 2. Stripping matches local semantics in a paired comparison on
    both mount modes: a write by a caller without the file-mode
    privilege clears setuid and clears setgid when group-execute is
@@ -3447,8 +3464,12 @@ table.
    skew posture is documented.
 6. The cost is a table lookup: a syscall census shows zero added
    host work on any attribute path including the pinless listing
-   walk, and identity retirement prunes entries whose backing
-   identity no longer matches, pinned by test.
+   walk. The sidecar's debounce cadence is stated at its constant
+   and the crash window pinned by a kill test (recent records lost,
+   never corrupted, the file always a whole document); a rename
+   through the server moves the record and a host-side rename
+   orphans it, both pinned by test; entries whose paths no longer
+   resolve prune at load and on miss.
 7. Both gates pass with the new suites executing; THREAT-MODEL
    carries the enforcement posture including the nosuid-host-mount
    line.
