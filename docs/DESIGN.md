@@ -4509,9 +4509,10 @@ process, one host, tokio + blocking-pool host I/O, FUSE data path):
   mount). (Amended 2026-08-15 on the bottleneck question: the v2
   client answer is a **kernel module** for the built-image VM case —
   where the whole image is built anyway — while FUSE remains the
-  userspace-mount client, io_uring moves to v3, and zero-copy server
-  paths plus the metadata-via-FUSE / data-via-direct-transport split
-  remain v2 axes.)
+  userspace-mount client, io_uring moves out (deferred to v3 here,
+  removed outright 2026-08-18 — no roadmap carries it), and
+  zero-copy server paths plus the metadata-via-FUSE /
+  data-via-direct-transport split remain v2 axes.)
 - **auth: none does not survive multi-tenancy at scale** —
   authentication is part of v2 design scope, moving from the hardening
   tail to a v2 prerequisite, with vsock for the co-located case. For
@@ -4572,6 +4573,49 @@ shape. When v2 opens, it begins with a dedicated
 architecture research and design phase producing its own authority
 document — measured bottleneck attribution first, no code before the
 design settles.
+
+## v3 mandate — protocol reach and backend composition (recorded 2026-08-18)
+
+Recorded now so v2 keeps the seams open; **v3 starts only when v2
+is finished, and the move is decided deliberately** — the same
+sequencing law v2 had. The io_uring evaluation once deferred here
+is removed outright the same day; no roadmap carries it.
+
+- **SMB and NFS as backends.** The server speaks smb and nfs as a
+  client itself, connecting directly to the remote server instead
+  of going through a kernel-mounted filesystem. A capability the
+  backend protocol lacks is added by other means — which means
+  exactly is an open design conversation, settled before this item
+  is built. Obligation on v2: the pluggable-backend seam must
+  admit backends that are network clients with capability sets
+  narrower than the host filesystem's.
+
+- **SMB and NFS as served protocols.** The client can start in smb
+  or nfs mode instead of mounting: namespaces map to shares by
+  default, and the mapping is configurable (command-line options
+  at minimum).
+
+- **Transparent per-file compression and encryption.** The server
+  holds the keys and performs the transforms; clients see plain
+  contents and none of the machinery. Obligation on v2: the
+  data-plane design must not foreclose a server-side transform
+  stage between policy and backing.
+
+- **voidport as the root filesystem.** Expected to fall out of the
+  v2 kernel client in the built-image case; recorded so any
+  leftovers — early-boot ordering, module availability in the
+  initramfs, mounting before userspace exists — are collected and
+  closed deliberately instead of discovered.
+
+- **Backend aggregation.** Multiple backends joined under one
+  namespace with composition semantics: duplication across members
+  with reads served by whichever member serves them best (the
+  mirror shape), and parity across heterogeneous members (the
+  parity shape) — for example two smb backends, two local drives
+  and two parity members, surviving any two member failures before
+  data is lost. Members differ in protocol, latency and trust,
+  which is what makes the composition layer an architecture design
+  of its own rehearsing nothing from single-backend v2.
 
 ## Roadmap
 
