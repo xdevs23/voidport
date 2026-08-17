@@ -53,7 +53,7 @@ pub struct Grafts {
 /// on the publish path, and this is the one moment the server already has the
 /// entry in hand. `None` is a target whose stat failed: the graft is pinned, so
 /// it is still a graft, and the subscription reports its kind as unknown
-/// instead of guessing.
+/// instead of a guess.
 #[derive(Debug)]
 struct PinnedGraft {
     fd: OwnedFd,

@@ -20,7 +20,7 @@
 # the whole tree under `--all` (which is what `./check` runs).
 set -euo pipefail
 
-words='rather than|worth|leg|lane|doctrine|caveat|twist|ruling|ruled|seat' # vocab-ok: the list itself
+words='rather than|worth|leg|lane|doctrine|caveat|twist|ruling|ruled|seat|belt-and-suspenders|wrinkle|guessing' # vocab-ok: the list itself
 
 refuse() {
   echo "vocab: refusing. These words are banned in tracked content." >&2
@@ -51,7 +51,7 @@ judge() {
 #
 # One diff, one awk. The hunk header carries the first new line number and how
 # many lines follow on each side, so the pass counts its way through a hunk
-# instead of guessing from the leading character — which keeps added content
+# instead of inferring from the leading character — which keeps added content
 # that itself starts with `+++` or `@@` out of the header rules.
 staged() {
   git diff --cached -U0 --diff-filter=ACMR | awk '
