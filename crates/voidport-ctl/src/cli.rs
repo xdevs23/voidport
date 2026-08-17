@@ -16,8 +16,9 @@ use std::path::PathBuf;
 use anyhow::{Result, bail};
 use clap::{Args, Parser, Subcommand, ValueEnum};
 use voidport_control::{
-    AuthMode, HostId, IdMapping, IdSentinel, Listener, NamespaceName, NamespaceSpec, OwnershipSpec,
-    PermissionMode, Request, Rule, ShareMode, UnmappedPolicy, XattrRule, XattrVerdict,
+    AuthMode, HostDirectIo, HostId, IdMapping, IdSentinel, Listener, NamespaceName, NamespaceSpec,
+    OwnershipSpec, PermissionMode, Request, Rule, ShareMode, UnmappedPolicy, XattrRule,
+    XattrVerdict,
 };
 
 /// The voidport operator CLI.
@@ -60,6 +61,10 @@ pub enum Command {
     /// Permission mode operations.
     #[command(subcommand)]
     Permission(PermissionCommand),
+    /// Host-side direct-I/O operations: whether the server's backing reads and
+    /// writes ride the host page cache.
+    #[command(subcommand)]
+    DirectIo(DirectIoCommand),
     /// Auth mode operations.
     #[command(subcommand)]
     Auth(AuthCommand),
@@ -154,6 +159,9 @@ pub enum NamespaceCommand {
         /// Its permission mode.
         #[arg(long, value_enum, default_value_t = PermissionModeArg::Passthrough)]
         permission: PermissionModeArg,
+        /// Where its backing I/O sits with respect to the host page cache.
+        #[arg(long, value_enum, default_value_t = DirectIoArg::Cached)]
+        direct_io: DirectIoArg,
         /// Its auth mode.
         #[arg(long, value_enum, default_value_t = AuthModeArg::None)]
         auth: AuthModeArg,
@@ -288,6 +296,21 @@ pub enum PermissionCommand {
         /// The mode.
         #[arg(long, value_enum)]
         mode: PermissionModeArg,
+    },
+}
+
+/// `voidport-ctl direct-io …`
+#[derive(Debug, Subcommand)]
+pub enum DirectIoCommand {
+    /// Set where a namespace's backing I/O sits: on the host page cache, or
+    /// past it. Live at the next open; handles already open keep the posture
+    /// they were opened under.
+    Set {
+        /// The namespace.
+        namespace: String,
+        /// The posture.
+        #[arg(long, value_enum)]
+        posture: DirectIoArg,
     },
 }
 
@@ -477,6 +500,28 @@ impl From<PermissionModeArg> for PermissionMode {
     }
 }
 
+/// The host-side direct-I/O postures.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+pub enum DirectIoArg {
+    /// Backing I/O rides the host page cache.
+    Cached,
+    /// A guest handle opened `O_DIRECT` opens the backing file `O_DIRECT`,
+    /// alignment demands and all.
+    Passthrough,
+    /// Every backing open is uncached.
+    Always,
+}
+
+impl From<DirectIoArg> for HostDirectIo {
+    fn from(posture: DirectIoArg) -> Self {
+        match posture {
+            DirectIoArg::Cached => Self::Cached,
+            DirectIoArg::Passthrough => Self::Passthrough,
+            DirectIoArg::Always => Self::Always,
+        }
+    }
+}
+
 /// The auth modes.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub enum AuthModeArg {
@@ -535,11 +580,13 @@ impl Command {
                 name,
                 ownership,
                 permission,
+                direct_io,
                 auth,
             }) => Request::NamespaceCreate {
                 namespace: NamespaceSpec {
                     name: namespace_name(name)?,
                     permission: (*permission).into(),
+                    direct_io: (*direct_io).into(),
                     auth: (*auth).into(),
                     ownership: ownership.to_spec(false)?,
                     rules: Vec::new(),
@@ -618,6 +665,10 @@ impl Command {
                     mode: (*mode).into(),
                 }
             }
+            Self::DirectIo(DirectIoCommand::Set { namespace, posture }) => Request::DirectIoSet {
+                namespace: namespace_name(namespace)?,
+                posture: (*posture).into(),
+            },
             Self::Auth(AuthCommand::Set { namespace, mode }) => Request::AuthSet {
                 namespace: namespace_name(namespace)?,
                 mode: (*mode).into(),
@@ -685,6 +736,14 @@ mod tests {
                 "set",
                 "p",
                 "--mode",
+                "passthrough",
+            ],
+            &[
+                "voidport-ctl",
+                "direct-io",
+                "set",
+                "p",
+                "--posture",
                 "passthrough",
             ],
             &["voidport-ctl", "auth", "set", "p", "--mode", "none"],

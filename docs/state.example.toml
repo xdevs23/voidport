@@ -147,6 +147,24 @@ name = "project"
 # mode. Presentation is UX only; enforcement is always server-side.
 permission = "passthrough"
 
+# Where this namespace's backing I/O sits with respect to the host page cache.
+# A mount's own `--direct-io` is guest-side presentation: it keeps the guest
+# from holding a page cache so the host's is the one cache in the system, and
+# the server's reads and writes ride that cache. This is the setting that
+# reaches past it, and the only thing that puts `O_DIRECT` on a backing file.
+#
+#   "cached"       the default: backing I/O rides the host page cache
+#   "passthrough"  a guest handle opened O_DIRECT opens the backing file
+#                  O_DIRECT; one that did not rides the host cache
+#   "always"       every backing open is uncached, reads and writes alike
+#
+# Under the two uncached postures the server serves through buffers aligned to
+# what the backing file demands, so an aligned request round-trips its data;
+# a request the backing filesystem itself calls misaligned answers the errno it
+# gives locally. Changing this is live at the next open; handles already open
+# keep the posture they were opened under.
+direct_io = "cached"
+
 # How clients authenticate. v1: `none`.
 auth = "none"
 
@@ -320,6 +338,7 @@ write = "allow"
 [[namespaces]]
 name = "logs"
 permission = "passthrough"
+direct_io = "always"
 auth = "none"
 
 [namespaces.ownership]

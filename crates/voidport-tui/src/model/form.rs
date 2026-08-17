@@ -15,8 +15,8 @@
 //! form does not guess at it.
 
 use voidport_control::{
-    AuthMode, HostId, IdMapping, IdSentinel, NamespaceName, NamespaceSpec, OwnershipSpec,
-    PermissionMode, Request, Rule, ShareMode, UnmappedPolicy,
+    AuthMode, HostDirectIo, HostId, IdMapping, IdSentinel, NamespaceName, NamespaceSpec,
+    OwnershipSpec, PermissionMode, Request, Rule, ShareMode, UnmappedPolicy,
 };
 
 /// One editable field.
@@ -358,6 +358,10 @@ impl Form {
                     namespace: NamespaceSpec {
                         name,
                         permission,
+                        // A namespace is created with the minimum its policy
+                        // requires, so its backing I/O starts on the host page
+                        // cache like every other default.
+                        direct_io: HostDirectIo::default(),
                         auth,
                         ownership,
                         rules: Vec::new(),

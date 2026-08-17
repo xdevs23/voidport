@@ -173,8 +173,8 @@ const _: () = assert!(voidport_control::ANY_CID == vsock::VMADDR_CID_ANY);
 mod tests {
     use super::*;
     use voidport_control::{
-        AuthMode, DEFAULT_SQUASH_ID, HostId, IdMapping, IdSentinel, OwnershipSpec, PermissionMode,
-        Rule, ShareMode, XattrRule, XattrVerdict,
+        AuthMode, DEFAULT_SQUASH_ID, HostDirectIo, HostId, IdMapping, IdSentinel, OwnershipSpec,
+        PermissionMode, Rule, ShareMode, XattrRule, XattrVerdict,
     };
 
     fn name(raw: &str) -> NamespaceName {
@@ -202,6 +202,7 @@ mod tests {
                 NamespaceSpec {
                     name: name("project"),
                     permission: PermissionMode::Passthrough,
+                    direct_io: HostDirectIo::Cached,
                     auth: AuthMode::None,
                     ownership: OwnershipSpec::Map {
                         unmapped: voidport_control::UnmappedPolicy::Hide,
@@ -223,6 +224,7 @@ mod tests {
                 NamespaceSpec {
                     name: name("scratch"),
                     permission: PermissionMode::Passthrough,
+                    direct_io: HostDirectIo::Cached,
                     auth: AuthMode::None,
                     ownership: OwnershipSpec::Static { uid: 0, gid: 0 },
                     rules: Vec::new(),

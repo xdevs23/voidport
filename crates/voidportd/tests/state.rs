@@ -9,7 +9,9 @@ use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use support::{TempDir, daemon_config, environment};
-use voidport_control::{NamespaceName, NamespaceSpec, Request, Response, Rule, ShareMode};
+use voidport_control::{
+    HostDirectIo, NamespaceName, NamespaceSpec, Request, Response, Rule, ShareMode,
+};
 use voidportd::control::service::Service;
 use voidportd::data::pin::DescriptorLimit;
 use voidportd::error::render;
@@ -146,6 +148,18 @@ fn the_commented_example_state_file_loads() {
     assert!(!project.xattr().writable(b"user.other"));
     assert!(project.xattr().readable(b"user.other"));
     assert!(!project.xattr().writable(b"system.posix_acl_access"));
+
+    // And the direct-I/O postures it documents are the postures it builds:
+    // the default on one namespace, uncached backing I/O on the other.
+    assert_eq!(project.direct_io(), HostDirectIo::Cached);
+    assert_eq!(
+        loaded
+            .registry
+            .get(&name("logs"))
+            .expect("built")
+            .direct_io(),
+        HostDirectIo::Always
+    );
 
     // It documents the schema, so it must also round-trip like any other.
     let text = loaded.document.to_toml().expect("serializable");

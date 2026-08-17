@@ -94,6 +94,7 @@ pub fn summarize(
         name: namespace.name().clone(),
         ownership: ownership_mode,
         permission: namespace.permission(),
+        direct_io: namespace.direct_io(),
         auth: namespace.auth(),
         rules,
     }

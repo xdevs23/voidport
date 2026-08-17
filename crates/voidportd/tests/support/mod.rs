@@ -24,7 +24,9 @@ use voidportd::testing::{create_directory, pinned_environment, scratch_root};
     unused_imports,
     reason = "each integration test file uses part of this"
 )]
-pub use voidportd::testing::{ControlClient, RunningServer, daemon_config, open_descriptors};
+pub use voidportd::testing::{
+    ControlClient, RunningServer, daemon_config, descriptor_flags, open_descriptors,
+};
 
 /// Distinguishes temporary directories created within one process.
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);

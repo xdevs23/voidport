@@ -24,5 +24,6 @@ pub mod vsock;
 pub use control::ControlClient;
 pub use scratch::{Scratch, create_directory, scratch_root};
 pub use server::{
-    RunningServer, daemon_config, invoking_environment, open_descriptors, pinned_environment,
+    RunningServer, daemon_config, descriptor_flags, invoking_environment, open_descriptors,
+    pinned_environment,
 };

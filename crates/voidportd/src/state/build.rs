@@ -30,7 +30,7 @@ use voidport_control::{
 
 use super::Environment;
 use crate::host::{GraftError, Grafts};
-use crate::namespace::Namespace;
+use crate::namespace::{Namespace, PolicyModes};
 use crate::rules::{
     self, HostTarget, IdMap, IdMapError, IdMapping, Ownership, OwnershipError, OwnershipMode,
     RuleSpec, RuleTable, ServerIdentity, SquashIds, TableError, XattrRules, XattrRulesError,
@@ -54,8 +54,11 @@ pub fn build_namespace(
     let grafts = Grafts::pin(&rules).map_err(NamespaceError::Graft)?;
     Ok(Namespace::new(
         spec.name.clone(),
-        spec.permission,
-        spec.auth,
+        PolicyModes {
+            permission: spec.permission,
+            direct_io: spec.direct_io,
+            auth: spec.auth,
+        },
         ownership,
         rules,
         xattr,

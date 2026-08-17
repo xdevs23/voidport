@@ -592,8 +592,7 @@ mod tests {
         let grafts = Grafts::pin(&table).expect("the target exists");
         Namespace::new(
             voidport_control::NamespaceName::new("pin").expect("valid name"),
-            voidport_control::PermissionMode::Passthrough,
-            voidport_control::AuthMode::None,
+            crate::namespace::PolicyModes::default(),
             Ownership::new(
                 OwnershipMode::Passthrough,
                 ServerIdentity::new(1000, 100),

@@ -300,8 +300,8 @@ $ voidport-ctl session list
 ```
 
 `voidport-ctl` groups its operations as `namespace`, `rule`, `xattr`,
-`ownership`, `permission`, `auth`, `session`, and `info`; every subcommand has
-`--help`, and `--json` prints the raw response envelope.
+`ownership`, `permission`, `direct-io`, `auth`, `session`, and `info`; every
+subcommand has `--help`, and `--json` prints the raw response envelope.
 
 **Finding the server takes no flags.** Without `--socket`, `voidport-ctl` tries
 `$XDG_STATE_HOME/voidport/control.sock` — the socket a `voidportd share` launch
@@ -330,6 +330,21 @@ so keep it in a private directory — it is created owner-only (0600).
   afterwards is shared at its next lookup, and a guest `mkdir` of a matching
   name lands on the host durably. Two patterns on one directory may not both
   cover a name — that is refused when the rule is added, naming both rules.
+- **The host page cache is the one cache, unless a namespace says
+  otherwise**: a mount's `--direct-io` is guest-side — it exists so the
+  guest holds no second copy of the data, and the server's own reads and
+  writes ride the host's cache as any local program's would. Where that
+  is not wanted, `direct_io` is a per-namespace setting with three
+  postures: `cached` (the default, which masks a guest handle's own
+  `O_DIRECT`), `passthrough` — a guest handle opened `O_DIRECT` opens the
+  backing file `O_DIRECT` — and `always`, every backing open uncached.
+  Under the two uncached postures the server serves through buffers
+  aligned to what the backing file demands, so an aligned request
+  round-trips its data; a request the backing filesystem itself calls
+  misaligned answers the errno it gives locally, and under `always` the
+  storage, not the wire, may be what bounds throughput. Changing the
+  posture (`voidport-ctl direct-io set ns --posture passthrough`) is
+  live at the next open, like a rule change.
 - **Coherence**: writethrough caching with short TTLs (default 1 s). A
   writer's change is visible to other mounts within the TTL, including
   through already-open descriptors; fcntl record locks conflict correctly

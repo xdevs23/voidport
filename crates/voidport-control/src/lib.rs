@@ -71,9 +71,9 @@ pub use socket::{NoControlSocket, find_control_socket};
 
 pub use listener::{ANY_CID, Listener};
 pub use policy::{
-    AuthMode, DEFAULT_SQUASH_ID, HostId, IdMapping, IdSentinel, NamespaceName, NamespaceNameError,
-    NamespaceSpec, OwnershipMode, OwnershipSpec, PermissionMode, Rule, RuleKey, ShareMode,
-    UnknownMode, UnmappedPolicy, XattrRule, XattrVerdict,
+    AuthMode, DEFAULT_SQUASH_ID, HostDirectIo, HostId, IdMapping, IdSentinel, NamespaceName,
+    NamespaceNameError, NamespaceSpec, OwnershipMode, OwnershipSpec, PermissionMode, Rule, RuleKey,
+    ShareMode, UnknownMode, UnmappedPolicy, XattrRule, XattrVerdict,
 };
 pub use request::{OPERATIONS, Request, parse_request};
 pub use response::{

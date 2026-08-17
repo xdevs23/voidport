@@ -53,15 +53,16 @@ fn render_reply(reply: &Reply) -> String {
                 return "no namespaces".to_owned();
             }
             let mut lines = vec![format!(
-                "{:<24} {:<12} {:<12} {:<6} {}",
-                "NAME", "OWNERSHIP", "PERMISSION", "AUTH", "RULES"
+                "{:<24} {:<12} {:<12} {:<12} {:<6} {}",
+                "NAME", "OWNERSHIP", "PERMISSION", "DIRECT-IO", "AUTH", "RULES"
             )];
             lines.extend(namespaces.iter().map(|namespace| {
                 format!(
-                    "{:<24} {:<12} {:<12} {:<6} {}",
+                    "{:<24} {:<12} {:<12} {:<12} {:<6} {}",
                     namespace.name,
                     namespace.ownership,
                     namespace.permission,
+                    namespace.direct_io,
                     namespace.auth,
                     namespace.rules
                 )
@@ -143,6 +144,7 @@ fn render_namespace(namespace: &NamespaceSpec) -> String {
     let mut lines = vec![
         format!("namespace:  {}", namespace.name),
         format!("permission: {}", namespace.permission),
+        format!("direct-io:  {}", namespace.direct_io),
         format!("auth:       {}", namespace.auth),
     ];
     lines.extend(render_ownership(&namespace.ownership));
@@ -233,8 +235,8 @@ fn render_rule(rule: &Rule) -> String {
 mod tests {
     use super::*;
     use voidport_control::{
-        AuthMode, ControlError, ErrorCode, IdSentinel, NamespaceName, NamespaceSummary,
-        OwnershipMode, PermissionMode, ShareMode, UnmappedPolicy,
+        AuthMode, ControlError, ErrorCode, HostDirectIo, IdSentinel, NamespaceName,
+        NamespaceSummary, OwnershipMode, PermissionMode, ShareMode, UnmappedPolicy,
     };
 
     fn name(raw: &str) -> NamespaceName {
@@ -307,14 +309,17 @@ mod tests {
                 name: name("project"),
                 ownership: OwnershipMode::Map,
                 permission: PermissionMode::Passthrough,
+                direct_io: HostDirectIo::Passthrough,
                 auth: AuthMode::None,
                 rules: 3,
             }],
         }));
         let lines: Vec<&str> = rendered.lines().collect();
         assert!(lines[0].starts_with("NAME"), "{rendered}");
+        assert!(lines[0].contains("DIRECT-IO"), "{rendered}");
         assert!(lines[1].starts_with("project"), "{rendered}");
         assert!(lines[1].contains("map"), "{rendered}");
+        assert!(lines[1].contains("passthrough"), "{rendered}");
         assert!(lines[1].ends_with('3'), "{rendered}");
     }
 
@@ -351,6 +356,7 @@ mod tests {
             namespace: NamespaceSpec {
                 name: name("project"),
                 permission: PermissionMode::Passthrough,
+                direct_io: HostDirectIo::Always,
                 auth: AuthMode::None,
                 ownership: OwnershipSpec::Map {
                     unmapped: UnmappedPolicy::Hide,
@@ -372,6 +378,7 @@ mod tests {
             },
         }));
         assert!(rendered.contains("namespace:  project"), "{rendered}");
+        assert!(rendered.contains("direct-io:  always"), "{rendered}");
         assert!(rendered.contains("ownership:  map"), "{rendered}");
         assert!(rendered.contains("unmapped: hide"), "{rendered}");
         // The sentinel is shown as written, never resolved.

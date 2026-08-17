@@ -214,6 +214,12 @@ impl Seed {
                 existing.permission.to_string(),
                 seeded.permission.to_string(),
             ))
+        } else if existing.direct_io != seeded.direct_io {
+            Some((
+                "direct-io posture",
+                existing.direct_io.to_string(),
+                seeded.direct_io.to_string(),
+            ))
         } else if existing.auth != seeded.auth {
             Some((
                 "auth mode",
@@ -415,6 +421,7 @@ mod tests {
             voidport_control::PermissionMode::Passthrough
         );
         assert_eq!(spec.auth, voidport_control::AuthMode::None);
+        assert_eq!(spec.direct_io, voidport_control::HostDirectIo::Cached);
         assert_eq!(spec.ownership, OwnershipSpec::Passthrough {});
         assert_eq!(spec.rules, vec![seed.rule()]);
     }
@@ -655,6 +662,28 @@ mod tests {
         );
         assert!(error.to_string().contains("static"), "{error}");
         assert_eq!(document, before, "a refusal must not half-apply");
+
+        // Every scalar policy field is checked, not only the ownership one: a
+        // namespace whose backing I/O was configured uncached is not the
+        // namespace this launch would create.
+        let mut document = StateDocument::default();
+        let mut occupied = NamespaceSpec::new(name(DEFAULT_NAMESPACE));
+        occupied.direct_io = voidport_control::HostDirectIo::Always;
+        document.namespaces.push(occupied);
+        let error = seed()
+            .apply(&mut document, None)
+            .expect_err("the namespace collides");
+        assert!(
+            matches!(
+                &error,
+                SeedError::NamespaceConflict {
+                    field: "direct-io posture",
+                    ..
+                }
+            ),
+            "{error}"
+        );
+        assert!(error.to_string().contains("always"), "{error}");
     }
 
     #[test]

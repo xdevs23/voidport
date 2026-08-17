@@ -174,6 +174,65 @@ impl std::str::FromStr for PermissionMode {
     }
 }
 
+/// Where the server's backing I/O sits with respect to the host page cache.
+///
+/// A mount's own direct-io option is guest-side presentation: it keeps the
+/// guest from holding a page cache so the host's is the one cache in the
+/// system, and the server's backing I/O rides that cache as any local
+/// program's would. This setting is the per-namespace decision to reach past
+/// it, and it is the only thing that puts `O_DIRECT` on a backing description.
+///
+/// Uncached backing I/O carries the backing filesystem's alignment demands
+/// with it: under [`Passthrough`](Self::Passthrough) and [`Always`](Self::Always)
+/// the server serves through buffers aligned to what the backing file asks for,
+/// so an aligned guest request round-trips its data — and a request that
+/// filesystem itself calls misaligned is answered with the errno it gives
+/// locally, unchanged.
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum HostDirectIo {
+    /// Backing I/O rides the host page cache, whatever the guest handle asked
+    /// for.
+    #[default]
+    Cached,
+    /// A guest handle opened `O_DIRECT` opens the backing file `O_DIRECT`; a
+    /// handle that did not rides the host cache.
+    Passthrough,
+    /// Every backing open is uncached, whatever the guest handle asked for.
+    Always,
+}
+
+impl fmt::Display for HostDirectIo {
+    /// Honors width and alignment, so postures can be tabulated.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.pad(match self {
+            Self::Cached => "cached",
+            Self::Passthrough => "passthrough",
+            Self::Always => "always",
+        })
+    }
+}
+
+impl std::str::FromStr for HostDirectIo {
+    type Err = UnknownMode;
+
+    /// The inverse of [`Display`](fmt::Display), so a surface that offers the
+    /// posture by name sends the posture it showed.
+    fn from_str(text: &str) -> Result<Self, Self::Err> {
+        match text {
+            "cached" => Ok(Self::Cached),
+            "passthrough" => Ok(Self::Passthrough),
+            "always" => Ok(Self::Always),
+            _ => Err(UnknownMode {
+                kind: "direct-io",
+                value: text.to_owned(),
+            }),
+        }
+    }
+}
+
 /// How a client authenticates.
 ///
 /// v1 has one mode; the field exists so modes can be added without a protocol
@@ -213,15 +272,17 @@ impl std::str::FromStr for AuthMode {
 
 /// A mode name the schema does not define.
 ///
-/// Both mode enums have exactly one variant in v1, so an operator surface that
-/// offers a *list* of names and sends a *hardcoded* variant looks correct and
-/// stops being correct the day a second variant is added. Parsing back through
-/// [`FromStr`](std::str::FromStr) is what keeps the value shown and the value
-/// sent the same value, and this is what parsing an unknown name says.
+/// The permission and auth enums have exactly one variant in v1, so an operator
+/// surface that offers a *list* of names and sends a *hardcoded* variant looks
+/// correct and stops being correct the day a second variant is added. Parsing
+/// back through [`FromStr`](std::str::FromStr) is what keeps the value shown
+/// and the value sent the same value, and this is what parsing an unknown name
+/// says.
 #[derive(Clone, Debug, PartialEq, Eq, thiserror::Error)]
 #[error("{value:?} is not a {kind} mode this version defines")]
 pub struct UnknownMode {
-    /// Which setting the name was offered for (`permission`, `auth`).
+    /// Which setting the name was offered for (`permission`, `auth`,
+    /// `direct-io`).
     pub kind: &'static str,
     /// The name that did not parse.
     pub value: String,
@@ -623,6 +684,10 @@ pub struct NamespaceSpec {
     /// How host permission bits present.
     #[serde(default)]
     pub permission: PermissionMode,
+    /// Where the server's backing I/O sits with respect to the host page
+    /// cache.
+    #[serde(default)]
+    pub direct_io: HostDirectIo,
     /// How clients authenticate.
     #[serde(default)]
     pub auth: AuthMode,
@@ -645,6 +710,7 @@ impl NamespaceSpec {
         Self {
             name,
             permission: PermissionMode::default(),
+            direct_io: HostDirectIo::default(),
             auth: AuthMode::default(),
             ownership: OwnershipSpec::default(),
             rules: Vec::new(),
@@ -821,6 +887,7 @@ mod tests {
         );
         assert_eq!(spec.ownership.mode(), OwnershipMode::Passthrough);
         assert_eq!(spec.permission, PermissionMode::Passthrough);
+        assert_eq!(spec.direct_io, HostDirectIo::Cached);
         assert_eq!(spec.auth, AuthMode::None);
         assert!(spec.rules.is_empty());
         assert!(spec.rule("/a").is_none());
@@ -910,7 +977,7 @@ mod tests {
         assert!(spec.xattr.is_empty());
         assert_eq!(
             json(&spec),
-            r#"{"name":"project","permission":"passthrough","auth":"none","ownership":{"mode":"passthrough"}}"#
+            r#"{"name":"project","permission":"passthrough","direct_io":"cached","auth":"none","ownership":{"mode":"passthrough"}}"#
         );
         assert!(spec.xattr_rule("user.*").is_none());
 
@@ -949,6 +1016,8 @@ mod tests {
     fn the_source_form_displays_readably() {
         assert_eq!(ShareMode::Hidden.to_string(), "hidden");
         assert_eq!(PermissionMode::Passthrough.to_string(), "passthrough");
+        assert_eq!(HostDirectIo::Cached.to_string(), "cached");
+        assert_eq!(HostDirectIo::Always.to_string(), "always");
         assert_eq!(AuthMode::None.to_string(), "none");
         assert_eq!(UnmappedPolicy::Hide.to_string(), "hide");
         assert_eq!(HostId::from(1000u32).to_string(), "1000");
@@ -968,6 +1037,20 @@ mod tests {
         for mode in [AuthMode::None].iter().copied() {
             assert_eq!(mode.to_string().parse(), Ok(mode));
         }
+        for posture in [
+            HostDirectIo::Cached,
+            HostDirectIo::Passthrough,
+            HostDirectIo::Always,
+        ] {
+            assert_eq!(posture.to_string().parse(), Ok(posture));
+        }
+        assert_eq!(
+            "quantum"
+                .parse::<HostDirectIo>()
+                .expect_err("no such posture")
+                .kind,
+            "direct-io"
+        );
         let refused = "quantum"
             .parse::<PermissionMode>()
             .expect_err("no such mode");

@@ -12,7 +12,8 @@ use serde::{Deserialize, Serialize};
 
 use crate::listener::Listener;
 use crate::policy::{
-    AuthMode, NamespaceName, NamespaceSpec, OwnershipSpec, PermissionMode, Rule, XattrRule,
+    AuthMode, HostDirectIo, NamespaceName, NamespaceSpec, OwnershipSpec, PermissionMode, Rule,
+    XattrRule,
 };
 use crate::response::{ControlError, ErrorCode};
 
@@ -125,6 +126,16 @@ requests! {
         /// The new permission mode.
         mode: PermissionMode,
     } => "permission-set",
+    /// Sets a namespace's host-side direct-I/O posture.
+    ///
+    /// Live at the next open, like every other policy change: descriptions
+    /// already open keep the posture they were opened under.
+    DirectIoSet {
+        /// The namespace to change.
+        namespace: NamespaceName,
+        /// The new posture.
+        posture: HostDirectIo,
+    } => "direct-io-set",
     /// Sets a namespace's auth mode.
     AuthSet {
         /// The namespace to change.
@@ -252,6 +263,13 @@ mod tests {
                 r#"{"op":"permission-set","namespace":"p","mode":"passthrough"}"#,
             ),
             (
+                Request::DirectIoSet {
+                    namespace: name("p"),
+                    posture: HostDirectIo::Passthrough,
+                },
+                r#"{"op":"direct-io-set","namespace":"p","posture":"passthrough"}"#,
+            ),
+            (
                 Request::AuthSet {
                     namespace: name("p"),
                     mode: AuthMode::None,
@@ -340,6 +358,10 @@ mod tests {
             Request::PermissionSet {
                 namespace: name("p"),
                 mode: PermissionMode::Passthrough,
+            },
+            Request::DirectIoSet {
+                namespace: name("p"),
+                posture: HostDirectIo::Cached,
             },
             Request::AuthSet {
                 namespace: name("p"),

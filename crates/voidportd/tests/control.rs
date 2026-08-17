@@ -12,9 +12,9 @@ use std::time::Duration;
 
 use support::{RunningServer, TempDir, daemon_config, environment};
 use voidport_control::{
-    AuthMode, ErrorCode, IdMapping, IdSentinel, NamespaceName, NamespaceSpec, OwnershipSpec,
-    PermissionMode, Reply, Request, Response, Rule, ShareMode, UnmappedPolicy, XattrRule,
-    XattrVerdict,
+    AuthMode, ErrorCode, HostDirectIo, IdMapping, IdSentinel, NamespaceName, NamespaceSpec,
+    OwnershipSpec, PermissionMode, Reply, Request, Response, Rule, ShareMode, UnmappedPolicy,
+    XattrRule, XattrVerdict,
 };
 use voidportd::control::{CONTROL_SOCKET_MODE, ControlSocket, MAX_REQUEST_LINE, socket::BindError};
 use voidportd::daemon::{DaemonConfig, StartupError};
@@ -194,10 +194,14 @@ fn every_operation_works_over_the_socket() {
         },
     });
 
-    // permission-set and auth-set
+    // permission-set, direct-io-set and auth-set
     client.expect_ok(&Request::PermissionSet {
         namespace: name("scratch"),
         mode: PermissionMode::Passthrough,
+    });
+    client.expect_ok(&Request::DirectIoSet {
+        namespace: name("scratch"),
+        posture: HostDirectIo::Always,
     });
     client.expect_ok(&Request::AuthSet {
         namespace: name("scratch"),
@@ -211,6 +215,7 @@ fn every_operation_works_over_the_socket() {
         panic!("expected a namespace");
     };
     assert_eq!(namespace.rules.len(), 2);
+    assert_eq!(namespace.direct_io, HostDirectIo::Always);
     assert_eq!(
         namespace.xattr,
         vec![
@@ -299,6 +304,10 @@ fn operations_naming_absent_things_are_refused() {
         Request::PermissionSet {
             namespace: name("nope"),
             mode: PermissionMode::Passthrough,
+        },
+        Request::DirectIoSet {
+            namespace: name("nope"),
+            posture: HostDirectIo::Always,
         },
         Request::AuthSet {
             namespace: name("nope"),

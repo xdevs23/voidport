@@ -186,11 +186,12 @@ fn relative(path: &NamespacePath, depth: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::namespace::PolicyModes;
     use crate::rules::{
         Ownership, OwnershipMode, RuleSpec, RuleTable, ServerIdentity, ShareMode, SquashIds,
     };
     use crate::testing::Scratch;
-    use voidport_control::{AuthMode, NamespaceName, PermissionMode};
+    use voidport_control::NamespaceName;
 
     /// A namespace over a real host tree, so the pinned graft kinds are real.
     fn namespace(rules: Vec<RuleSpec>) -> Namespace {
@@ -198,8 +199,7 @@ mod tests {
         let grafts = crate::host::Grafts::pin(&table).expect("every target exists");
         Namespace::new(
             NamespaceName::new("test").expect("valid name"),
-            PermissionMode::Passthrough,
-            AuthMode::None,
+            PolicyModes::default(),
             Ownership::new(
                 OwnershipMode::Passthrough,
                 ServerIdentity::new(1000, 100),

@@ -11,10 +11,26 @@
 
 use std::sync::Arc;
 
-use voidport_control::{AuthMode, NamespaceName, PermissionMode};
+use voidport_control::{AuthMode, HostDirectIo, NamespaceName, PermissionMode};
 
 use crate::host::Grafts;
 use crate::rules::{Ownership, RuleTable, XattrRules};
+
+/// The policy modes a namespace carries, one value instead of a run of
+/// same-shaped constructor arguments.
+///
+/// They belong together: each is a single scalar of one state-file entry, none
+/// of them is built or validated (a mode either parses or the document does
+/// not load), and they are read one at a time by the operation that cares.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct PolicyModes {
+    /// How host permission bits present.
+    pub permission: PermissionMode,
+    /// Where backing I/O sits with respect to the host page cache.
+    pub direct_io: HostDirectIo,
+    /// How clients authenticate.
+    pub auth: AuthMode,
+}
 
 /// One namespace, built and immutable.
 ///
@@ -25,8 +41,7 @@ use crate::rules::{Ownership, RuleTable, XattrRules};
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Namespace {
     name: NamespaceName,
-    permission: PermissionMode,
-    auth: AuthMode,
+    modes: PolicyModes,
     ownership: Ownership,
     rules: RuleTable,
     xattr: XattrRules,
@@ -43,8 +58,7 @@ impl Namespace {
     #[must_use]
     pub fn new(
         name: NamespaceName,
-        permission: PermissionMode,
-        auth: AuthMode,
+        modes: PolicyModes,
         ownership: Ownership,
         rules: RuleTable,
         xattr: XattrRules,
@@ -52,8 +66,7 @@ impl Namespace {
     ) -> Self {
         Self {
             name,
-            permission,
-            auth,
+            modes,
             ownership,
             rules,
             xattr,
@@ -76,13 +89,25 @@ impl Namespace {
     /// How host permission bits present.
     #[must_use]
     pub fn permission(&self) -> PermissionMode {
-        self.permission
+        self.modes.permission
+    }
+
+    /// Where this namespace's backing I/O sits with respect to the host page
+    /// cache.
+    ///
+    /// Read at the open that derives a backing description's flags, so a
+    /// posture changed through the control plane is live at the next open and
+    /// leaves open descriptions alone — the same rule a share-mode change
+    /// follows.
+    #[must_use]
+    pub fn direct_io(&self) -> HostDirectIo {
+        self.modes.direct_io
     }
 
     /// How clients authenticate.
     #[must_use]
     pub fn auth(&self) -> AuthMode {
-        self.auth
+        self.modes.auth
     }
 
     /// The ownership algebra, with its environmental inputs already injected.

@@ -369,6 +369,12 @@ impl Service {
                     Ok(())
                 })
             }
+            Request::DirectIoSet { namespace, posture } => {
+                self.mutate_namespace(&namespace, |spec| {
+                    spec.direct_io = posture;
+                    Ok(())
+                })
+            }
             Request::AuthSet { namespace, mode } => self.mutate_namespace(&namespace, |spec| {
                 spec.auth = mode;
                 Ok(())

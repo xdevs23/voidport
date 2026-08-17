@@ -34,8 +34,8 @@ use rustix::fs::OFlags;
 use rustix::io::Errno;
 
 use crate::data::ids::IdSpace;
-use crate::host::HostIdentity;
 use crate::host::open::reopen;
+use crate::host::{BackingIo, HostIdentity};
 use crate::rules::{Name, Resolution};
 
 /// One entry of a materialized directory listing.
@@ -119,6 +119,11 @@ pub struct FileHandle {
     pinned: Arc<OwnedFd>,
     /// Whether the handle was opened for writing.
     writable: bool,
+    /// Whether this description reaches its file through the host page cache or
+    /// past it, and — where it is uncached — the alignment its transfers must
+    /// meet. Decided once, from the flags the description was opened with, so a
+    /// posture changed afterwards leaves this handle exactly as it was.
+    backing: BackingIo,
     /// One open file description per wire lock owner, created on that owner's
     /// first lock and dropped when its locks are released.
     owners: Mutex<HashMap<u64, Arc<OwnedFd>>>,
@@ -126,12 +131,17 @@ pub struct FileHandle {
 
 impl FileHandle {
     /// Wraps an opened descriptor.
+    ///
+    /// `flags` are the flags the description was opened with, which is what
+    /// decides how its reads and writes reach the file.
     #[must_use]
-    pub fn new(fd: OwnedFd, pinned: Arc<OwnedFd>, writable: bool) -> Self {
+    pub fn new(fd: OwnedFd, pinned: Arc<OwnedFd>, writable: bool, flags: OFlags) -> Self {
+        let backing = BackingIo::of(fd.as_fd(), flags);
         Self {
             fd,
             pinned,
             writable,
+            backing,
             owners: Mutex::new(HashMap::new()),
         }
     }
@@ -140,6 +150,12 @@ impl FileHandle {
     #[must_use]
     pub fn fd(&self) -> BorrowedFd<'_> {
         self.fd.as_fd()
+    }
+
+    /// How this handle's reads and writes reach the backing file.
+    #[must_use]
+    pub fn backing_io(&self) -> BackingIo {
+        self.backing
     }
 
     /// Whether the handle may be written.
@@ -417,7 +433,7 @@ mod tests {
             .expect("the file pins"),
         );
         let fd = reopen(pinned.as_fd(), OFlags::RDWR).expect("the pin reopens");
-        FileHandle::new(fd, pinned, true)
+        FileHandle::new(fd, pinned, true, OFlags::RDWR)
     }
 
     #[test]
@@ -549,7 +565,7 @@ mod tests {
             .expect("the file pins"),
         );
         let fd = reopen(pinned.as_fd(), OFlags::RDONLY).expect("the pin reopens");
-        let handle = FileHandle::new(fd, pinned, false);
+        let handle = FileHandle::new(fd, pinned, false, OFlags::RDONLY);
         assert!(!handle.is_writable());
         // Read-write is not available, so the fallback description is.
         assert!(handle.lock_description(7).is_ok());

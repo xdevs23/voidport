@@ -6,9 +6,9 @@
 use super::*;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use voidport_control::{
-    AuthMode, ControlError, ErrorCode, IdMapping, IdSentinel, ListenerInfo, NamespaceName,
-    NamespaceSpec, NamespaceSummary, OwnershipMode, OwnershipSpec, PermissionMode, Request, Rule,
-    SessionSummary, ShareMode, UnmappedPolicy,
+    AuthMode, ControlError, ErrorCode, HostDirectIo, IdMapping, IdSentinel, ListenerInfo,
+    NamespaceName, NamespaceSpec, NamespaceSummary, OwnershipMode, OwnershipSpec, PermissionMode,
+    Request, Rule, SessionSummary, ShareMode, UnmappedPolicy,
 };
 
 use std::path::PathBuf;
@@ -47,6 +47,7 @@ fn summary(name_: &str, rules: usize) -> NamespaceSummary {
         name: name(name_),
         ownership: OwnershipMode::Passthrough,
         permission: PermissionMode::Passthrough,
+        direct_io: HostDirectIo::Cached,
         auth: AuthMode::None,
         rules,
     }

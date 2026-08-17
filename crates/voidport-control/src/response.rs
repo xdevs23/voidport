@@ -12,7 +12,9 @@ use std::fmt;
 
 use serde::{Deserialize, Serialize};
 
-use crate::policy::{AuthMode, NamespaceName, NamespaceSpec, OwnershipMode, PermissionMode};
+use crate::policy::{
+    AuthMode, HostDirectIo, NamespaceName, NamespaceSpec, OwnershipMode, PermissionMode,
+};
 
 /// The response envelope.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -148,6 +150,8 @@ pub struct NamespaceSummary {
     pub ownership: OwnershipMode,
     /// Its permission mode.
     pub permission: PermissionMode,
+    /// Its host-side direct-I/O posture.
+    pub direct_io: HostDirectIo,
     /// Its auth mode.
     pub auth: AuthMode,
     /// How many rules its table holds.
@@ -478,13 +482,14 @@ mod tests {
             name: NamespaceName::new("project").expect("valid"),
             ownership: OwnershipMode::Map,
             permission: PermissionMode::Passthrough,
+            direct_io: HostDirectIo::Cached,
             auth: AuthMode::None,
             rules: 3,
         };
         let encoded = serde_json::to_string(&summary).expect("serializable");
         assert_eq!(
             encoded,
-            r#"{"name":"project","ownership":"map","permission":"passthrough","auth":"none","rules":3}"#
+            r#"{"name":"project","ownership":"map","permission":"passthrough","direct_io":"cached","auth":"none","rules":3}"#
         );
         assert_eq!(
             serde_json::from_str::<NamespaceSummary>(&encoded).expect("parses"),

@@ -188,3 +188,29 @@ pub fn open_descriptors(path: &Path) -> usize {
         .filter(|entry| fs::read_link(entry.path()).is_ok_and(|target| target == path))
         .count()
 }
+
+/// The status flags of every descriptor of this process that points at `path`.
+///
+/// `/proc/self/fd` names what a descriptor points at; the flags it was opened
+/// with are in `/proc/self/fdinfo`, as the octal `flags:` field. That is the
+/// only place the *description* — not the request that asked for it — can be
+/// read back, which is what a test asserting on how the server opened a
+/// backing file needs.
+#[must_use]
+pub fn descriptor_flags(path: &Path) -> Vec<u32> {
+    let Ok(entries) = fs::read_dir("/proc/self/fd") else {
+        return Vec::new();
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter(|entry| fs::read_link(entry.path()).is_ok_and(|target| target == path))
+        .filter_map(|entry| {
+            let info = fs::read_to_string(
+                Path::new("/proc/self/fdinfo").join(entry.file_name().as_os_str()),
+            )
+            .ok()?;
+            let flags = info.lines().find_map(|line| line.strip_prefix("flags:"))?;
+            u32::from_str_radix(flags.trim(), 8).ok()
+        })
+        .collect()
+}

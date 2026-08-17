@@ -16,6 +16,8 @@
 //!   invariant of the design.
 //! * [`attr`] turns host metadata into the wire's presented attributes, through
 //!   the namespace's ownership algebra and presented-bits function.
+//! * [`direct`] is what an *uncached* backing description demands of the
+//!   server's own buffers, and the aligned bounce that meets it.
 //! * [`xattr`] is the `user.*` passthrough; [`lock`] is byte-range OFD locking.
 //!
 //! What is deliberately **not** here: the syscalls the data plane issues on a
@@ -33,6 +35,7 @@
 //! (share-mode enforcement, reserved xattr namespaces).
 
 pub mod attr;
+pub mod direct;
 pub mod grafts;
 pub mod lock;
 pub mod open;
@@ -41,5 +44,6 @@ pub mod xattr;
 pub use attr::{
     FileKind, HostAttr, HostIdentity, NodeIdentity, SynthesizedTimes, synthesized_attr,
 };
+pub use direct::BackingIo;
 pub use grafts::{GraftError, Grafts};
 pub use open::{CONTAINMENT, create_child, dup, pin_child, pin_relative, reopen};

@@ -1412,6 +1412,76 @@ bound — the value is load-bearing, measured, not chosen round).
 
 Raw records and harness scripts kept out of tree.
 
+## 2026-08-17 — the host-direct-io postures: what the bounce costs, and where the bound moved
+
+The two uncached postures (`direct_io = "passthrough"` and
+`"always"`) put `O_DIRECT` on the backing description, and direct
+I/O refuses a buffer that is not aligned to what the backing file
+demands. The server's own buffers never are — a read payload sits
+behind a fixed response head, a write is a slice of the request
+frame — so an uncached description serves through an aligned bounce
+buffer, one allocation and one copy per request. This section is
+what that costs and what changes underneath it.
+
+### Environment
+
+Same machine as the sections above. Backing store `/tmp` on ext4 on
+`/dev/vdb`; kernel 6.18.43. `STATX_DIOALIGN` is answered on this
+filesystem: memory alignment 512, offset alignment 512 — so the
+`statx` path is what supplies the number here and the logical-block
+fallback is not exercised.
+
+In-process server, tcp data listener on loopback, one 256 MiB file
+per namespace, sequential 128 KiB reads. The cached arm is measured
+page-cache-hot, which is the posture's whole claim; the uncached arm
+cannot be, by construction. Two runs, five repetitions each.
+
+### The bound moves from the wire to the storage — criterion 3
+
+| arm | GiB/s, five repetitions (run 1 / run 2) |
+|---|---|
+| `cached` (host page cache) | 1.63 1.66 1.72 1.75 1.63 / 1.67 1.46 2.01 1.87 1.75 |
+| `always` (uncached) | 0.47 0.50 0.53 0.75 0.67 / 0.34 0.53 0.53 0.71 0.71 |
+
+**The uncached posture reads at 0.34-0.75 GiB/s against the cached
+default's 1.46-2.01 GiB/s — 2.4x to 3.5x slower, and no longer
+bounded by the same thing.** The cached arm is bounded by the wire
+and the copy, as every earlier section measured; the uncached arm is
+bounded by `/dev/vdb` answering 128 KiB serial reads with no
+readahead behind them, which is why its repetitions climb as the
+device's own queue warms while the cached arm's stay flat. That is
+the trade the posture exists to make, stated at its own numbers: an
+operator who chooses `always` is choosing the storage as the bound.
+
+### The bounce itself — the same syscall, once through an aligned buffer
+
+Isolated from the storage: the same page-cache-hot description, read
+straight into the server's buffer, then read through the aligned
+bounce and copied out. Only the allocation and the copy differ.
+
+| request | plain us/req | bounced us/req | added |
+|---|---|---|---|
+| read 4 KiB | 0.708-0.771 | 0.918-0.964 | +0.21-0.19 us (+25-30%) |
+| read 64 KiB | 3.66-4.14 | 4.82-6.00 | +1.17-1.86 us (+32-45%) |
+| read 128 KiB | 6.47-9.22 | 9.39-12.56 | +2.92-3.34 us (+36-45%) |
+| write 4 KiB | 1.13-1.25 | 1.29-1.30 | +0.05-0.16 us (+4-15%) |
+| write 64 KiB | 9.96-11.57 | 10.96-11.36 | -0.61-+1.40 us (within noise) |
+| write 128 KiB | 18.27-18.37 | 20.66-21.20 | +2.39-2.83 us (+13-15%) |
+
+**The bounce costs about 3 us on a 128 KiB read and about 0.2 us on
+a 4 KiB one** — a memory copy at roughly 40 GiB/s plus one
+allocation, which is what those figures work out to. It is the
+smaller of the two costs by a wide margin: 3 us of copy against the
+~180 us a 128 KiB uncached read spends waiting for the device at the
+0.7 GiB/s measured above. On the write side it is within noise below
+64 KiB, because the syscall dominates.
+
+Two bounds on these numbers, stated: the bounce arm here runs
+against a *cached* description, so it measures the copy and the
+allocation and nothing about `O_DIRECT` itself; and the allocation
+is a fresh `Vec` per request, so an allocator under memory pressure
+would pay more than this warm one did.
+
 ## 2026-08-17 — per-entry cost re-measured on the current stack
 
 The entry-cost and reclaim numbers above predate the descriptor

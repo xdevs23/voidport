@@ -8,8 +8,9 @@
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use voidport_control::{
-    AuthMode, IdMapping, IdSentinel, ListenerInfo, NamespaceName, NamespaceSpec, NamespaceSummary,
-    OwnershipMode, OwnershipSpec, PermissionMode, Rule, SessionSummary, ShareMode, UnmappedPolicy,
+    AuthMode, HostDirectIo, IdMapping, IdSentinel, ListenerInfo, NamespaceName, NamespaceSpec,
+    NamespaceSummary, OwnershipMode, OwnershipSpec, PermissionMode, Rule, SessionSummary,
+    ShareMode, UnmappedPolicy,
 };
 use voidport_tui::model::form::Form;
 use voidport_tui::model::view::View;
@@ -90,6 +91,7 @@ fn namespaces(model: &mut Model) {
             name: name("alpha"),
             ownership: OwnershipMode::Passthrough,
             permission: PermissionMode::Passthrough,
+            direct_io: HostDirectIo::Cached,
             auth: AuthMode::None,
             rules: 1,
         },
@@ -97,6 +99,7 @@ fn namespaces(model: &mut Model) {
             name: name("project"),
             ownership: OwnershipMode::Map,
             permission: PermissionMode::Passthrough,
+            direct_io: HostDirectIo::Cached,
             auth: AuthMode::None,
             rules: 3,
         },

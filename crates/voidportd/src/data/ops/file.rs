@@ -6,6 +6,7 @@ use std::time::Duration;
 
 use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
+use voidport_control::HostDirectIo;
 use voidport_proto::error::FramingError;
 use voidport_proto::frame::FrameWriter;
 use voidport_proto::message::Request;
@@ -38,7 +39,13 @@ use crate::rules::GuestIds;
 /// flag is what places a guest's appends at the true end of the file, so
 /// removing `O_APPEND` from this set would not merely lose a flag, it would
 /// turn concurrent appends from two mounts into silent overwrites.
-fn open_flags(raw: u32) -> OFlags {
+///
+/// `O_DIRECT` is the one flag the guest does not decide. Where the server's
+/// backing I/O sits — on the host page cache or past it — is the namespace's
+/// [`HostDirectIo`] posture, and this is the single point that derives the flag
+/// from it: a guest handle's own `O_DIRECT` is guest-side presentation until a
+/// posture says otherwise.
+fn open_flags(raw: u32, posture: HostDirectIo) -> OFlags {
     let requested = OFlags::from_bits_truncate(raw);
     let allowed = OFlags::RDONLY
         | OFlags::WRONLY
@@ -48,9 +55,13 @@ fn open_flags(raw: u32) -> OFlags {
         | OFlags::NONBLOCK
         | OFlags::DSYNC
         | OFlags::SYNC
-        | OFlags::NOATIME
-        | OFlags::DIRECT;
-    requested & allowed
+        | OFlags::NOATIME;
+    let direct = match posture {
+        HostDirectIo::Cached => OFlags::empty(),
+        HostDirectIo::Passthrough => requested & OFlags::DIRECT,
+        HostDirectIo::Always => OFlags::DIRECT,
+    };
+    (requested & allowed) | direct
 }
 
 /// Whether an open asks for write access.
@@ -68,7 +79,8 @@ fn writes(flags: OFlags) -> bool {
 pub fn open(context: &Context<'_>, request: Request<'_, OpenRequest>) -> OpResult {
     let session = context.session;
     let node = session.node(request.head().node_id.get())?;
-    let flags = open_flags(request.body().flags.get());
+    let namespace = session.namespace();
+    let flags = open_flags(request.body().flags.get(), namespace.direct_io());
     // Enforcement is unconditional, so it happens before the open decides
     // anything else: an open for write through a read-only node is `EROFS`
     // whether that node is a file or a directory.
@@ -90,11 +102,11 @@ pub fn open(context: &Context<'_>, request: Request<'_, OpenRequest>) -> OpResul
     // The handle takes the node's pin with it, which is what keeps an open
     // file working through eviction: the budget bounds what the *cache* holds,
     // and a handle's own reference is its own.
-    let pinned = node.descriptor(&session.namespace())?.ok_or(Errno::STALE)?;
+    let pinned = node.descriptor(&namespace)?.ok_or(Errno::STALE)?;
     let fd = reopen(pinned.as_fd(), flags)?;
     let handle = session.handles().insert(
         node.id,
-        Handle::File(Arc::new(FileHandle::new(fd, pinned, writes(flags)))),
+        Handle::File(Arc::new(FileHandle::new(fd, pinned, writes(flags), flags))),
     )?;
     context.reply(&OpenResponse {
         handle: U64::new(handle),
@@ -111,7 +123,7 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
     let site = session.site(&parent, &name)?;
     let body = request.body();
 
-    let flags = open_flags(body.flags.get());
+    let flags = open_flags(body.flags.get(), session.namespace().direct_io());
     let mode = super::dir::permissions(body.mode.get(), body.umask.get());
     let exclusive = OFlags::from_bits_truncate(body.flags.get()).contains(OFlags::EXCL);
     let open = |flags, mode| create_child(site.directory.as_fd(), &site.name, flags, mode);
@@ -157,7 +169,7 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
     // both counts for the operator — could deadlock against.
     let inserted = session.handles().insert(
         resolved.node.id,
-        Handle::File(Arc::new(FileHandle::new(fd, node_pin, true))),
+        Handle::File(Arc::new(FileHandle::new(fd, node_pin, true, flags))),
     );
     let handle = match inserted {
         Ok(handle) => handle,
@@ -187,6 +199,14 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
 /// into before the header is written over the bytes in front of it, so a read
 /// costs one copy from the kernel and none after. This is the zero-copy hot
 /// path the wire format exists for.
+///
+/// A handle whose backing description is uncached is the one exception, and it
+/// is not a choice: direct I/O refuses a buffer that does not sit on the
+/// backing file's alignment, and the payload region sits behind a fixed
+/// response head. [`BackingIo`](crate::host::BackingIo) is what the handle
+/// carries for exactly this —
+/// it serves the transfer through an aligned buffer and copies the bytes into
+/// place, which is the cost the uncached postures pay per request.
 pub fn read(context: &Context<'_>, request: Request<'_, ReadRequest>) -> OpResult {
     let body = request.body();
     let file = context.session.handles().file(body.handle.get())?;
@@ -196,7 +216,9 @@ pub fn read(context: &Context<'_>, request: Request<'_, ReadRequest>) -> OpResul
 
     let fixed = fixed_len::<ReadResponse>();
     let mut buffer = vec![0u8; fixed + size];
-    let read = rustix::io::pread(file.fd(), &mut buffer[fixed..], body.offset.get())?;
+    let read = file
+        .backing_io()
+        .read(file.fd(), &mut buffer[fixed..], body.offset.get())?;
 
     let response = ReadResponse {
         data_len: U32::new(u32::try_from(read).map_err(|_| Errno::OVERFLOW)?),
@@ -257,10 +279,17 @@ pub fn read(context: &Context<'_>, request: Request<'_, ReadRequest>) -> OpResul
 /// is split by the guest kernel into several, which another client's appends
 /// may land between. A record written in one write of at most that size is
 /// never torn.
+///
+/// The bytes are the request frame's own, so an uncached handle copies them
+/// into an aligned buffer first — see [`read`], and
+/// [`BackingIo`](crate::host::BackingIo) for why the server's buffers can never
+/// satisfy direct I/O on their own.
 pub fn write(context: &Context<'_>, request: Request<'_, WriteRequest>) -> OpResult {
     let body = request.body();
     let file = context.session.handles().file(body.handle.get())?;
-    let written = rustix::io::pwrite(file.fd(), request.data(), body.offset.get())?;
+    let written = file
+        .backing_io()
+        .write(file.fd(), request.data(), body.offset.get())?;
     context.reply(&WriteResponse {
         written: U32::new(u32::try_from(written).map_err(|_| Errno::OVERFLOW)?),
     })
@@ -636,6 +665,12 @@ fn conflict_reply(request: &FileLock, conflict: Option<Conflict>) -> FileLock {
 mod tests {
     use super::*;
 
+    /// The flags a cached namespace derives, which is every test that is not
+    /// about the posture.
+    fn cached_flags(raw: u32) -> OFlags {
+        open_flags(raw, HostDirectIo::Cached)
+    }
+
     #[test]
     fn resolution_flags_never_survive_a_reopen() {
         let raw = OFlags::RDWR
@@ -644,7 +679,7 @@ mod tests {
             | OFlags::NOFOLLOW
             | OFlags::DIRECTORY
             | OFlags::APPEND;
-        let flags = open_flags(raw.bits());
+        let flags = cached_flags(raw.bits());
         assert!(flags.contains(OFlags::RDWR));
         assert!(flags.contains(OFlags::APPEND));
         assert!(!flags.contains(OFlags::CREATE));
@@ -658,11 +693,44 @@ mod tests {
     #[test]
     fn an_append_open_keeps_its_flag() {
         for access in [OFlags::WRONLY, OFlags::RDWR] {
-            let flags = open_flags((access | OFlags::APPEND).bits());
+            let flags = cached_flags((access | OFlags::APPEND).bits());
             assert!(flags.contains(OFlags::APPEND), "{access:?}");
             assert!(writes(flags), "an appending open is an open for write");
         }
-        assert!(!open_flags(OFlags::WRONLY.bits()).contains(OFlags::APPEND));
+        assert!(!cached_flags(OFlags::WRONLY.bits()).contains(OFlags::APPEND));
+    }
+
+    /// The three postures, at the one point that derives the flag from them.
+    ///
+    /// The guest's own `O_DIRECT` is presentation until a posture says
+    /// otherwise: the default namespace rides the host page cache whatever the
+    /// handle asked for, passthrough forwards exactly what it asked for, and
+    /// always opens uncached whatever it asked for.
+    #[test]
+    fn the_posture_decides_whether_the_backing_open_is_uncached() {
+        let asked = (OFlags::RDWR | OFlags::DIRECT).bits();
+        let plain = OFlags::RDWR.bits();
+
+        assert!(!open_flags(asked, HostDirectIo::Cached).contains(OFlags::DIRECT));
+        assert!(!open_flags(plain, HostDirectIo::Cached).contains(OFlags::DIRECT));
+
+        assert!(open_flags(asked, HostDirectIo::Passthrough).contains(OFlags::DIRECT));
+        assert!(!open_flags(plain, HostDirectIo::Passthrough).contains(OFlags::DIRECT));
+
+        assert!(open_flags(asked, HostDirectIo::Always).contains(OFlags::DIRECT));
+        assert!(open_flags(plain, HostDirectIo::Always).contains(OFlags::DIRECT));
+
+        // The posture decides that one flag and nothing else about the
+        // description.
+        for posture in [
+            HostDirectIo::Cached,
+            HostDirectIo::Passthrough,
+            HostDirectIo::Always,
+        ] {
+            let flags = open_flags((OFlags::RDWR | OFlags::APPEND).bits(), posture);
+            assert!(flags.contains(OFlags::APPEND), "{posture}");
+            assert_eq!(flags - OFlags::DIRECT, OFlags::RDWR | OFlags::APPEND);
+        }
     }
 
     /// The host behaviour the whole append story rests on.
@@ -679,7 +747,7 @@ mod tests {
         let path = scratch.file("log", b"0123456789");
         let fd = rustix::fs::open(
             &path,
-            open_flags((OFlags::WRONLY | OFlags::APPEND).bits()),
+            cached_flags((OFlags::WRONLY | OFlags::APPEND).bits()),
             Mode::empty(),
         )
         .expect("the file opens for appending");
@@ -700,10 +768,12 @@ mod tests {
 
     #[test]
     fn write_access_is_recognized_in_every_spelling() {
-        assert!(writes(open_flags(OFlags::WRONLY.bits())));
-        assert!(writes(open_flags(OFlags::RDWR.bits())));
-        assert!(writes(open_flags((OFlags::RDONLY | OFlags::TRUNC).bits())));
-        assert!(!writes(open_flags(OFlags::RDONLY.bits())));
+        assert!(writes(cached_flags(OFlags::WRONLY.bits())));
+        assert!(writes(cached_flags(OFlags::RDWR.bits())));
+        assert!(writes(cached_flags(
+            (OFlags::RDONLY | OFlags::TRUNC).bits()
+        )));
+        assert!(!writes(cached_flags(OFlags::RDONLY.bits())));
     }
 
     #[test]
