@@ -188,6 +188,14 @@ mod tests {
     /// server's own unaligned buffer is what direct I/O refuses, and the
     /// refusal is asserted right beside the success so the bounce cannot
     /// silently stop being needed.
+    ///
+    /// Whether the kernel refuses is the backing filesystem's own policy,
+    /// not a law: ext4 answers a misaligned direct request `EINVAL`, btrfs
+    /// quietly falls back to buffered I/O and serves it. The bounce exists
+    /// for the refusing kind, so the refusal arms run exactly there — on a
+    /// repairing filesystem they would assert another filesystem's
+    /// behavior, and the proof says which kind it ran against instead of
+    /// presuming one.
     #[test]
     fn an_aligned_bounce_serves_what_an_unaligned_buffer_cannot() {
         let scratch = Scratch::new("direct");
@@ -219,16 +227,20 @@ mod tests {
         assert_eq!(read, written, "the bounce did not round-trip the data");
 
         // The buffer the wire would have handed the kernel: one byte into an
-        // allocation, which is what a frame buffer's payload region looks like.
+        // allocation, which is what a frame buffer's payload region looks
+        // like. This is the probe that tells the two filesystem kinds apart.
         let mut unaligned = vec![0u8; PAGE + 1];
-        assert!(
-            rustix::io::pread(fd.as_fd(), &mut unaligned[1..], 0).is_err(),
-            "an unaligned buffer must be refused, or the bounce is not needed"
-        );
-
-        // And what the guest chose is never repaired: an offset the filesystem
-        // calls misaligned is refused through the bounce exactly as locally.
-        assert!(backing.read(fd.as_fd(), &mut read, 1).is_err());
+        if rustix::io::pread(fd.as_fd(), &mut unaligned[1..], 0).is_err() {
+            // The refusing kind, where the bounce is load-bearing. What the
+            // guest chose is never repaired: an offset this filesystem calls
+            // misaligned is refused through the bounce exactly as locally.
+            assert!(backing.read(fd.as_fd(), &mut read, 1).is_err());
+        } else {
+            eprintln!(
+                "the scratch filesystem repairs misaligned direct I/O \
+                 itself; the refusal arms prove nothing here"
+            );
+        }
     }
 
     /// A cached description hands the kernel the caller's own buffer, which is
