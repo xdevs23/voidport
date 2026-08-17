@@ -507,8 +507,15 @@ earlier, looser wording of this section is retracted.
   the version — the unknown-opcode `ENOSYS` answer is the discovery
   mechanism, and older clients never see the new frames. The blanket
   form made the subscription increment's byte-compatibility criterion
-  self-contradictory.) Golden byte-vector tests pin the ABI of every
-  message type.
+  self-contradictory.) (Amended 2026-08-17, second additive case, for
+  the privileged-bits increment: a **reserved must-be-zero flags
+  field acquiring its first flag** is likewise additive when the zero
+  value preserves the old behavior exactly — reserved flag space is
+  the wire's own forward-compatibility mechanism, an elder peer
+  ignores the bit per the flags rule, and every existing frame is
+  byte-identical. The skew posture such a flag creates is stated at
+  the feature that adds it, never hidden.) Golden byte-vector tests
+  pin the ABI of every message type.
 
 **Requests and responses**
 
@@ -3270,63 +3277,103 @@ local semantics demand — while the host-side backing file never
 carries a privileged bit the server's own user set. The two truths
 are reconciled by recording, per the pattern above.
 
-- **Recording**: the privileged bits a guest sets live in a
-  voidport-owned extended attribute on the backing file, never in
-  the host mode. Presentation ORs the recorded bits into the mode
-  the guest sees; a host file that genuinely carries the bits
-  presents them as-is. The recording attribute is the server's
-  own: it is invisible to the guest's xattr surface — never listed,
-  never readable, never writable through the mount — and the xattr
-  rules cannot expose it.
+Reworked 2026-08-17 after its probing spec review; every decision
+below is the rework.
+
+- **Recording**: the privileged bits a guest sets live in ONE
+  server-owned user-namespace extended attribute on the backing
+  file — a small versioned record, the pattern's one attribute,
+  its concrete name pinned by the implementation and never
+  meaningful to guests. Recording covers regular files and
+  directories, the kinds whose privileged bits carry meaning and
+  the kinds the user xattr namespace exists on; on other kinds a
+  chmod adding the bits refuses (EPERM) with the deviation stated —
+  a local FIFO would accept a meaningless bit, this filesystem
+  refuses it. Presentation ORs the recorded bits into the mode the
+  guest sees; a host file genuinely carrying bits presents them
+  as-is.
+- **The attribute is invisible on all four xattr paths**: never in
+  a listing, a get answers ENODATA, a set refuses, and a remove
+  answers ENODATA — the same not-there chain the xattr rules use,
+  so its absence is indistinguishable from any other absent
+  attribute.
 - **Setting**: a chmod that adds privileged bits succeeds by
-  recording them; the host mode receives only what the host permits
-  the server's user, as mode changes do today. The recorded truth
-  survives restart and remount because it lives on the file.
-- **Stripping follows the kernel's own delegation**: on a direct-io
-  mount the kernel marks the write that must clear the bits, the
-  client forwards that mark on the wire — the write request's
-  flags field, zero until now, gains its first meaning — and the
-  server clears the recorded bits (and whatever host bits it may).
-  On a cached mount the kernel strips through its own path today
-  and keeps doing so; the recorded bits follow the mode change it
-  sends. This closes the recorded defect: bits surviving a
-  direct-io write that strips them locally. An elder server
-  ignores the unknown flag and strips nothing — a mixed-version
-  pair is fail-open for stripping until both sides update; stated,
-  not hidden, like every version-skew posture in this document.
-- **The server can refuse the feature entirely**: a per-namespace
-  switch disables privileged bits — presentation masks them
-  (recorded and host-real alike) and a chmod attempting to set
-  them refuses loudly. The default is enabled: the recorded
-  mechanism touches nothing on the host beyond one attribute.
-- **The client can opt a mount out**: a mount option masks
-  privileged bits on that mount and refuses setting them, the
-  mount-side analog of the classic nosuid stance.
+  recording them; the host mode receives only what the host
+  permits the server's user, as mode changes do today. **A
+  recording that cannot be written fails the chmod with the host's
+  errno** — bits are never silently lost; the common shared-graft
+  case where the server's user cannot write the attribute is a
+  loud refusal, not a quiet downgrade. The recorded truth survives
+  restart and remount because it lives on the file.
+- **Presentation is enumerated and priced**: the recorded bits
+  join the mode in every attribute-bearing reply — getattr,
+  lookup, the readdirplus entry, the create/mkdir reply, and the
+  setattr reply. The node caches the recorded state once admitted,
+  so steady-state operations pay nothing; a listing pays one
+  attribute read per newly admitted entry in namespaces where the
+  feature is enabled, measured and stated in the performance
+  report by the increment.
+- **Stripping follows the kernel's own delegation**: on a
+  direct-io mount the kernel marks every write by a caller without
+  the file-mode privilege and delegates the clearing; the client
+  forwards the mark — the write request's reserved flags field
+  gains its first flag, additive under the amended ABI stability
+  rule, so the protocol version stays 1 — and the server clears
+  per the local rule it can evaluate: setuid always, setgid when
+  the group-execute bit is set. The one corner the wire cannot
+  carry — a caller outside the file's group on a file without
+  group-execute, where the local kernel also strips — is preserved
+  instead, a stated deviation bounded to a legacy-locking corner.
+  The server consults the handle's cached mode first, so a write
+  to a plain file pays no attribute work at all. On a cached mount
+  the kernel strips through its own path today and keeps doing so;
+  the recorded bits follow the mode change it sends. An elder
+  server ignores the unknown flag and strips nothing — fail-open
+  for stripping under version skew until both sides update;
+  stated, not hidden.
+- **The operator surface is the house shape**: a per-namespace
+  boolean in the state file (enabled by default), runtime-mutable
+  through the existing namespace mutation of the control plane,
+  persisted like every mutation, live at the next operation.
+  Disabled, presentation masks privileged bits — recorded and
+  host-real alike — and a chmod attempting to set them refuses
+  (EPERM). The client mount option does the same for one mount,
+  the nosuid stance. Artifacts: the state example, the README
+  semantics section, and the man pages carry both switches.
 - **Enforcement is the guest kernel's**, in its own trust domain:
   the server presents bits, the guest decides what exec does with
   them — the posture THREAT-MODEL states for every presented
   attribute.
 
-### Acceptance criteria — privileged-bits increment
+### Acceptance criteria — privileged-bits increment (reworked 2026-08-17)
 
-1. A guest chmod adding setuid or setgid succeeds, the bits present
-   through every mount of the namespace, survive server restart and
-   remount, and the backing file's host mode never gains them.
-2. Stripping matches local semantics in a paired comparison on both
-   mount modes: a write by a caller without the file-capability
-   privilege clears the bits (recorded or host-real), truncate
-   clears them the way the local filesystem does, and the direct-io
-   defect case is the regression test.
-3. The recording attribute is invisible through the mount: not in
-   xattr listings, unreadable, unwritable, regardless of xattr
-   rules.
-4. The disabled namespace refuses: setting privileged bits fails
-   loudly, presentation masks recorded and host-real bits alike.
-   The mount option does the same client-side.
-5. The wire flag is covered: golden vectors carry the new write
-   flag, an elder server ignores it (interop test), and the
-   version-skew posture is documented.
-6. Both gates pass with the new suites executing; THREAT-MODEL
+1. A guest chmod adding setuid or setgid on a regular file or
+   directory succeeds, the bits present through every mount and
+   every attribute-bearing reply, survive server restart and
+   remount, and the backing file's host mode never gains them; on
+   a FIFO or socket the chmod refuses EPERM; a recording the host
+   refuses fails the chmod with the host's errno and loses
+   nothing.
+2. Stripping matches local semantics in a paired comparison on
+   both mount modes: a write by a caller without the file-mode
+   privilege clears setuid, clears setgid when group-execute is
+   set, and preserves the stated out-of-group corner; truncate
+   clears as the local filesystem does; the direct-io defect case
+   is the regression test.
+3. The recording attribute is invisible on all four xattr paths,
+   regardless of xattr rules; a remove answers ENODATA and the
+   recorded bits survive it.
+4. The disabled namespace masks and refuses per the contract, the
+   change binding at the next operation without remount; the mount
+   option does the same client-side.
+5. The wire flag is covered: golden vectors carry it, an elder
+   server ignores it (interop test), the version stays 1 under the
+   amended stability rule, and the skew posture is documented.
+6. The hot path is unpriced only where it is free: a syscall
+   census shows no added per-write host work on files without
+   recorded or host-real bits, and the per-new-entry listing cost
+   is measured and stated.
+7. Both gates pass with the new suites executing; THREAT-MODEL
    carries the enforcement posture.
 
 ## Write-ahead (PAUSED 2026-08-17, the same day it was written — the spec review measured three of its premises false; superseded by the write-streaming contract above; the text below is kept as the record of the shape that was refuted)
@@ -4313,12 +4360,19 @@ process, one host, tokio + blocking-pool host I/O, FUSE data path):
   all of v1 the normative state is `auth = "none"` with the transport
   as the trust model, exactly as THREAT-MODEL.md states it.
 
-The design law above all for the kernel work (decided 2026-08-17):
-everything is designed robustly from the start — a hazard is fixed
-through architecture, never through imperative code layered on top,
-and a shape that accumulates guards is reconsidered instead of
-patched, whatever better shape that means: graph-based, event
-driven, asynchronous, actor-shaped, or something else entirely.
+The design law above all for the kernel work (decided 2026-08-17;
+refined the same day): everything is designed robustly from the
+start — a hazard is fixed through architecture, never through
+imperative code layered on top, and a shape that accumulates guards
+is reconsidered instead of patched, whatever better shape that
+means: graph-based, event driven, asynchronous, actor-shaped, or
+something else entirely. The refinement binds every increment, not
+only the kernel: **when a change needs a bolt-on, stop and change
+the architecture instead** — hours of refactoring so the new work
+slots into the hollow lattice beat any guard or special case. Keep
+the branches small and few; where a conditional grows, replace it
+with indirection, abstraction, or structure that makes the case
+impossible instead of handled.
 
 Kernel-client preparations (decided 2026-08-17, research and
 feasibility probes only — module development starts when v1 is fully
