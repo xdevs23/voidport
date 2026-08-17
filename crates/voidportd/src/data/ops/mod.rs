@@ -225,21 +225,30 @@ impl Context<'_> {
 
     /// Encodes a successful response carrying `payload`.
     ///
+    /// The frame is built **once**, in the buffer that is handed back: the
+    /// writer borrows it, and only the finished length is taken out of that
+    /// borrow, so the reply is never copied into a second allocation of its own
+    /// size. [`file::read`] builds its frame the same way, for the same reason.
+    ///
     /// An encoding failure becomes `EOVERFLOW`, not a closed
     /// connection: the request was well framed, so the client is owed an
     /// answer, and a reply that does not fit is exactly what that errno means.
     fn reply_with<M: ResponseBody>(&self, body: &M, payload: &[u8]) -> OpResult {
         let mut buffer = vec![0u8; fixed_len::<M>() + payload.len()];
-        let mut encode = || -> Result<Vec<u8>, FramingError> {
-            let mut writer =
-                FrameWriter::response(&mut buffer, self.max_frame_len, self.request_id, body)?;
-            writer.payload(payload)?;
-            Ok(writer.finish()?.to_vec())
+        let length = {
+            let mut encode = || -> Result<usize, FramingError> {
+                let mut writer =
+                    FrameWriter::response(&mut buffer, self.max_frame_len, self.request_id, body)?;
+                writer.payload(payload)?;
+                Ok(writer.finish()?.len())
+            };
+            encode().map_err(|error| {
+                tracing::warn!(%error, "a reply could not be encoded");
+                Errno::OVERFLOW
+            })?
         };
-        encode().map_err(|error| {
-            tracing::warn!(%error, "a reply could not be encoded");
-            Errno::OVERFLOW
-        })
+        buffer.truncate(length);
+        Ok(buffer)
     }
 
     /// The largest payload a response of type `M` can carry on this session.

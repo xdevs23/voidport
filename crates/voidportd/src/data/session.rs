@@ -641,6 +641,9 @@ impl Session {
             .ok_or(Errno::NOENT)?;
         let kind = identity.kind;
         let key = NodeKey::of(&path, identity, mode);
+        // Which key shape this entry took decides whether a node the table
+        // already holds for it can be answered from the stat above; see below.
+        let keyed_by_inode = matches!(key, NodeKey::Inode { .. });
         let found = host.node_identity();
         let pin = self.budget.pin(Pinned {
             fd,
@@ -676,7 +679,24 @@ impl Session {
                 if let Some(held) = node.pin() {
                     held.rebind(recipe);
                 }
-                (self.counted_attr(namespace, &node)?, node.kind())
+                if keyed_by_inode {
+                    // An [`NodeKey::Inode`] key carries the host identity *and*
+                    // the effective mode, and the table proved both against the
+                    // node it handed back — so the node's own stat would read
+                    // the same inode and present it under the same mode against
+                    // the same ownership policy. The stat taken above is that
+                    // answer, one syscall earlier.
+                    //
+                    // **This holds only for that key shape.** A directory is
+                    // keyed by namespace path alone: the node behind it may be
+                    // a synthesized directory, or one admitted under a
+                    // different mode, and the reply owes the guest *that*
+                    // node's attributes — never the ones the resolution just
+                    // computed. It re-stats.
+                    (fresh, kind)
+                } else {
+                    (self.counted_attr(namespace, &node)?, node.kind())
+                }
             }
         };
         Ok(Resolved { node, attr, kind })
@@ -737,8 +757,8 @@ impl Session {
         }
         if let Some((directory, fd)) = parent.child_site(name, &backing, &namespace)? {
             return Ok(Site {
-                directory: crate::host::open::dup(fd.as_fd())?,
                 recipe: child_recipe(&directory, &backing, name),
+                directory: fd,
                 name: name.clone(),
                 backing,
                 mode,
@@ -752,7 +772,7 @@ impl Session {
         };
         let graft = namespace.grafts().graft_of(&backing).ok_or(Errno::NOENT)?;
         Ok(Site {
-            directory: pin_relative(graft, leading)?,
+            directory: Arc::new(pin_relative(graft, leading)?),
             recipe: backing.clone(),
             name: last.clone(),
             backing,
@@ -1114,7 +1134,15 @@ enum EntrySite<'a> {
 #[derive(Debug)]
 pub struct Site {
     /// The directory the entry lives in.
-    pub directory: OwnedFd,
+    ///
+    /// A child of a pinned directory takes the **node's own** descriptor, held
+    /// for as long as the site is: an in-flight operation keeping a descriptor
+    /// alive past an eviction is what the pin ledger is built to allow, so
+    /// duplicating the description to own it would buy nothing and cost every
+    /// mutation a `dup` and a `close`. Containment is the description's, not
+    /// the descriptor's, so a shared one is contained exactly as a private one
+    /// would be.
+    pub directory: Arc<OwnedFd>,
     /// The entry's name inside it — not necessarily the name the guest used,
     /// since a re-targeted rule renames as it re-points.
     pub name: Name,

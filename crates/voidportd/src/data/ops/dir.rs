@@ -355,13 +355,17 @@ pub fn readdirplus(context: &Context<'_>, request: Request<'_, ReaddirplusReques
         // remaining entry has vanished *is* end of directory, and says so.
         return Err(Errno::OVERFLOW);
     }
-    let entries = stream.finish().to_vec();
+    // The finished stream is handed to the reply as a borrow of the buffer it
+    // was built in: a listing is the largest payload this server sends, and
+    // copying it out to own it would cost a second allocation of that size for
+    // nothing — the reply's own buffer is where it is going anyway.
+    let entries = stream.finish();
     let entries_len = u32::try_from(entries.len()).map_err(|_| Errno::OVERFLOW)?;
     context.reply_with(
         &ReaddirplusResponse {
             entries_len: U32::new(entries_len),
         },
-        &entries,
+        entries,
     )
 }
 
