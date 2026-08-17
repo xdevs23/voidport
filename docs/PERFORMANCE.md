@@ -1766,3 +1766,104 @@ observe them except as lower latency.
 Raw records kept out of tree: the paired-round driver and its bench wrapper,
 the concurrent-reader ceiling probe, the cross-version interop runs, and the
 per-round JSON lines for the sequential and random legs.
+
+## 2026-08-17 — the privileged-bits table costs the server no host work
+
+The privileged-bits increment's sixth acceptance criterion asks for a
+syscall census: presentation is an in-memory merge at the one attribute
+funnel, so a server carrying the feature must issue exactly the host
+syscalls a server without it issues, on every attribute path including
+the pinless listing walk. The claim is about the enabled-and-empty
+state — the table present, the lookup taken, no record to find — which
+is what every namespace looks like until a guest sets a bit.
+
+Two arms, identical in everything but the namespace's
+`privileged_bits` switch, each `strace -f -c` from launch to `SIGTERM`.
+The workloads are this document's own attribute scenarios, driven
+through a real mount with both metadata timeouts at zero so that every
+guest `stat`, listing and walk step reaches the server instead of the
+guest's attribute cache: `stat-loop` (512 files), `readdir-loop` (1000
+entries) and `walk` (depth 3, fanout 8, 8 files per directory — 5264
+entries), one warmup and three measured repetitions each. Nothing in
+any run sets a privileged bit, so the table stays empty throughout.
+Kernel 6.18.43, dev-profile binaries, backing tree and mountpoint on
+ext4.
+
+### The counts
+
+Every syscall that touches the host filesystem, both arms of the full
+run:
+
+| syscall | enabled (no records) | control (feature off) |
+|---|---|---|
+| statx | 1 460 118 | 1 460 117 |
+| openat2 | 270 437 | 270 437 |
+| close | 266 217 | 266 217 |
+| fcntl | 266 208 | 266 208 |
+| fchownat | 6 782 | 6 782 |
+| fchmodat | 6 782 | 6 782 |
+| getdents64 | 6 082 | 6 082 |
+| open | 2 540 | 2 540 |
+| fsync | 1 512 | 1 512 |
+| mkdirat | 590 | 590 |
+| pwrite64 | 512 | 512 |
+| getxattr | 512 | 512 |
+| newfstatat | 8 | 8 |
+| unlink | 2 | 2 |
+
+Thirteen of the fourteen match exactly. `statx` differs by one call in
+1.46 million, which is one part in 1.5 million and cannot be a
+per-operation cost — a per-operation cost would show up as a multiple
+of the 1 460 117 attribute operations, not as a single call.
+
+A second pair of runs settles that directly, at a twenty-fifth of the
+scale (200 stats, 2 listings, a depth-1 walk): if the difference were
+per-operation it would shrink with the workload, and if it were a
+fixed startup or teardown cost it would stay at one. It is neither —
+it is zero:
+
+| syscall | enabled (no records) | control (feature off) |
+|---|---|---|
+| statx | 57 749 | 57 749 |
+| openat2 | 13 221 | 13 221 |
+| close | 11 689 | 11 689 |
+| fcntl | 11 680 | 11 680 |
+| fchownat | 1 598 | 1 598 |
+| fchmodat | 1 598 | 1 598 |
+| fsync | 1 512 | 1 512 |
+| pwrite64 | 512 | 512 |
+| getxattr | 512 | 512 |
+| getdents64 | 130 | 130 |
+| open | 44 | 44 |
+| mkdirat | 14 | 14 |
+| newfstatat | 8 | 8 |
+| unlink | 2 | 2 |
+
+Every filesystem syscall identical, the single `statx` included. The
+one-call difference in the large run is run-to-run jitter, not the
+feature.
+
+**Criterion 6's census clause passes: zero added host syscalls on the
+attribute paths, the listing walk included.** What the feature costs
+is what the design said it costs — an atomic-load lookup in memory,
+which issues no syscall and therefore appears nowhere in a census.
+
+### What this does not measure
+
+Wall-clock throughput. The two arms ran under `strace`, which
+multiplies the cost of every syscall by a large constant, so the
+scenario timings from these runs are a tracer's numbers and are not
+comparable with anything else in this document. The census counts
+calls, and calls are what the criterion is about; the latency of the
+in-memory lookup is measured nowhere here because there is no syscall
+to attribute it to.
+
+The arms also differ in the non-filesystem syscalls a scheduler
+decides — `futex`, `epoll_wait`, `mmap`, `clone3` — by fractions of a
+percent in both directions. Those are thread timing, not host work,
+and no claim is made about them.
+
+### Raw records
+
+Raw records kept out of tree: the two-arm census driver, the four
+`strace -c` summaries, and the per-scenario JSON lines.

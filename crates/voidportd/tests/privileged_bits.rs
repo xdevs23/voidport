@@ -357,6 +357,61 @@ fn a_disabled_namespace_masks_refuses_and_keeps_what_it_recorded() {
     );
 }
 
+/// A namespace whose root is a graft — a host directory, not a synthesized
+/// one — records and presents privileged bits on the root itself.
+///
+/// The root is the one node no lookup and no readdirplus entry can carry, so it
+/// is the one place where "presentation is a memory merge at the one funnel"
+/// has to hold through `getattr` alone. It is also the node a session reaches
+/// without naming anything, so the record has to be found from the root's own
+/// backing identity and survive the restart that revalidates every row.
+#[test]
+fn a_host_backed_namespace_root_presents_its_own_record() {
+    let fixture = Fixture::start("privbits-root");
+    // `/tree` is a graft: the session's root node is the host directory the
+    // rule targets, which is what makes the root host-backed.
+    let mut client = fixture.server.mount("plain", "/tree");
+
+    let settled = client
+        .setattr(ROOT, chmod(0o2755))
+        .expect("a chmod of the namespace root succeeds");
+    assert_eq!(
+        settled.mode.get() & PERMISSIONS,
+        0o2755,
+        "the setattr reply presents the root's own record"
+    );
+    assert_eq!(
+        client.getattr(ROOT).expect("the root stats").mode.get() & PERMISSIONS,
+        0o2755,
+        "and so does a plain getattr of the root"
+    );
+    assert_eq!(
+        fs::metadata(fixture.graft_root())
+            .expect("the grafted directory exists")
+            .mode()
+            & PERMISSIONS,
+        0o0755,
+        "the host directory behind the root never gains the bit either"
+    );
+
+    // The record is the namespace's: a second session reaching the same graft
+    // presents it without having asked for it.
+    let mut other = fixture.server.mount("plain", "/tree");
+    assert_eq!(
+        other.getattr(ROOT).expect("the root stats").mode.get() & PERMISSIONS,
+        0o2755
+    );
+
+    let (directory, server) = restarted(fixture);
+    let mut client = server.mount("plain", "/tree");
+    assert_eq!(
+        client.getattr(ROOT).expect("the root stats").mode.get() & PERMISSIONS,
+        0o2755,
+        "the root's row revalidated against the directory it names"
+    );
+    drop(directory);
+}
+
 /// Recorded truth survives a server restart through the revalidating sidecar,
 /// and a cold listing is complete.
 #[test]
