@@ -196,11 +196,20 @@ fn a_signalled_mount_unmounts_itself() {
         // this teardown has already taken down, so that attempt can only fail —
         // a warning there is an unmount that worked, reported as one that did
         // not, in every client log there is.
+        //
+        // Errors are held to the same line, and for a second reason: a callback
+        // the kernel was still owed when the signal landed is dropped unanswered
+        // by a teardown that does not wait for it, and what that leaves in the
+        // log is a warning *and* the failure to deliver the `EIO` that stands in
+        // for the answer. The exit status alone does not catch it — that
+        // teardown unmounts cleanly and exits zero.
         let said = guest.said();
-        assert!(
-            !said.contains("WARN"),
-            "{label}: a teardown that unmounted cleanly warned:\n{said}"
-        );
+        for alarm in ["WARN", "ERROR"] {
+            assert!(
+                !said.contains(alarm),
+                "{label}: a teardown that unmounted cleanly said {alarm}:\n{said}"
+            );
+        }
     }
 }
 

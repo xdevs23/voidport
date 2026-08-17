@@ -3209,7 +3209,17 @@ projects. Configurable, with these defaults:
   SIGINT/SIGTERM both (the main thread owns the signal handler and
   drives the teardown; the fuser session is joined per the required
   order). Teardown from Reconnecting or Degraded cancels the in-flight
-  attempt and backoff first. A busy mountpoint still surfaces EBUSY;
+  attempt and backoff first. A signalled teardown then **answers what
+  the kernel is already owed before it unmounts** (refined 2026-08-17,
+  when the unimplemented half of this contract was measured as a
+  teardown race under load): a callback replies
+  from the runtime, so a signal can land between a dispatch loop taking
+  a request and the reply going back, and unmounting there answers EIO
+  for work that may have completed and meets the kernel's EBUSY,
+  because whoever is waiting for that answer is a reference against the
+  mountpoint. The wait is bounded (2s) and it is the only thing the
+  retry of the unmount is gated on: a mountpoint held by something else
+  is refused once and reported. A busy mountpoint still surfaces EBUSY;
   v1 does no lazy or forced unmount. For death the client cannot
   intercept: **auto-unmount is opportunistic, not guaranteed**
   (reworked after the spec review proved the original default

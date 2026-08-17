@@ -49,8 +49,8 @@ use std::ffi::OsStr;
 use std::future::Future;
 use std::os::unix::ffi::OsStrExt as _;
 use std::path::Path;
-use std::sync::Arc;
-use std::time::{Duration, SystemTime};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::time::{Duration, Instant, SystemTime};
 
 use fuser::{
     BsdFileFlags, Errno, FileHandle, FopenFlags, Generation, INodeNo, IoctlFlags, KernelConfig,
@@ -145,6 +145,88 @@ impl DataCaching {
     }
 }
 
+/// The callbacks the kernel is still owed a reply for.
+///
+/// Every callback hands its work to the runtime and replies from there, so
+/// between a dispatch loop taking a request and that reply reaching the kernel
+/// there is a window where the mount owes the kernel an answer nobody else can
+/// give. A teardown that walks into that window costs twice: the guest is told
+/// `EIO` for work that may have completed, and the caller waiting for the
+/// answer is a reference the kernel counts against the mountpoint, so the
+/// unmount is refused. Both are avoidable by asking what is outstanding and
+/// waiting for it, which is what this counts — see
+/// [`Mount::serve_until_signalled`](crate::mount::Mount::serve_until_signalled).
+///
+/// It counts callbacks and not wire requests, because what the kernel is owed
+/// is one reply per callback however many round trips it takes.
+#[derive(Debug, Default)]
+pub struct InFlight {
+    owed: Mutex<usize>,
+    settled: Condvar,
+}
+
+impl InFlight {
+    /// Waits until nothing is owed, or until the deadline passes.
+    ///
+    /// The deadline is what makes it safe to call from a teardown: a callback
+    /// whose server never answers may not keep a process that was asked to stop
+    /// alive, so the wait ends either way and the caller carries on.
+    pub fn settle(&self, deadline: Instant) {
+        let owed = self.lock();
+        if *owed == 0 {
+            return;
+        }
+        let _held = self
+            .settled
+            .wait_timeout_while(
+                owed,
+                deadline.saturating_duration_since(Instant::now()),
+                |owed| *owed > 0,
+            )
+            .unwrap_or_else(|poison| poison.into_inner());
+    }
+
+    /// Whether the kernel is owed nothing right now.
+    #[must_use]
+    pub fn is_settled(&self) -> bool {
+        *self.lock() == 0
+    }
+
+    /// Takes on one callback, until the ticket it hands back is dropped.
+    fn owe(self: &Arc<Self>) -> Ticket {
+        *self.lock() += 1;
+        Ticket {
+            owed: Arc::clone(self),
+        }
+    }
+
+    fn lock(&self) -> MutexGuard<'_, usize> {
+        self.owed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+    }
+}
+
+/// One callback's place in [`InFlight`], given up when it is dropped.
+///
+/// Dropping is the whole mechanism, so that a callback whose task is dropped
+/// instead of finished — which is what a runtime being released does to it —
+/// stops being counted as owed just the same.
+#[derive(Debug)]
+struct Ticket {
+    owed: Arc<InFlight>,
+}
+
+impl Drop for Ticket {
+    fn drop(&mut self) {
+        let mut owed = self.owed.lock();
+        *owed = owed.saturating_sub(1);
+        if *owed == 0 {
+            self.owed.settled.notify_all();
+        }
+    }
+}
+
 /// A mounted voidport namespace, as the kernel sees it.
 #[derive(Debug)]
 pub struct VoidportFs {
@@ -168,6 +250,9 @@ pub struct VoidportFs {
     /// that is the mode with no kernel readahead in front of it. Shared for the
     /// same reason the directories are, and mutated only through its own lock.
     readahead: Arc<Readahead>,
+    /// The callbacks this adapter has taken and not yet replied to. Held here
+    /// as well as by the mount, which is what waits on it when it tears down.
+    inflight: Arc<InFlight>,
 }
 
 impl VoidportFs {
@@ -176,7 +261,9 @@ impl VoidportFs {
     /// `direct_io` is a *request*: whether it is honoured is decided in `init`,
     /// against the kernel's capabilities, and until then the mount caches the
     /// way every mount always has. `readahead` is the mount's prefetch engine,
-    /// which `init` activates on the same answer.
+    /// which `init` activates on the same answer. `inflight` is where the
+    /// callbacks the kernel is owed a reply for are counted, for the teardown
+    /// that has to wait them out.
     #[must_use]
     pub fn new(
         client: Arc<Client>,
@@ -185,6 +272,7 @@ impl VoidportFs {
         entry_ttl: Duration,
         direct_io: bool,
         readahead: Arc<Readahead>,
+        inflight: Arc<InFlight>,
     ) -> Self {
         Self {
             client,
@@ -195,6 +283,7 @@ impl VoidportFs {
             caching: DataCaching::Page,
             directories: Arc::default(),
             readahead,
+            inflight,
         }
     }
 
@@ -211,8 +300,17 @@ impl VoidportFs {
     }
 
     /// Hands one callback's work to the runtime.
+    ///
+    /// The callback is counted as owed from here — before the dispatch loop is
+    /// let go, so there is no instant where the kernel has handed over a
+    /// request that nothing accounts for — until the work is finished or
+    /// dropped.
     fn spawn(&self, work: impl Future<Output = ()> + Send + 'static) {
-        self.runtime.spawn(work);
+        let owed = self.inflight.owe();
+        self.runtime.spawn(async move {
+            work.await;
+            drop(owed);
+        });
     }
 }
 
@@ -1402,5 +1500,70 @@ mod tests {
                 | PollEvents::POLLRDNORM
                 | PollEvents::POLLWRNORM
         );
+    }
+
+    /// A mount owing the kernel nothing waits for nothing: a teardown of an
+    /// idle mount pays none of this.
+    #[test]
+    fn a_teardown_that_is_owed_nothing_does_not_wait() {
+        let inflight = Arc::<InFlight>::default();
+        assert!(inflight.is_settled());
+        let started = Instant::now();
+        inflight.settle(Instant::now() + Duration::from_secs(30));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    /// An outstanding callback is waited for until it is answered — and the
+    /// wait ends when the answer does, not when the deadline does.
+    #[test]
+    fn an_outstanding_callback_is_waited_out() {
+        let inflight = Arc::<InFlight>::default();
+        let owed = inflight.owe();
+        assert!(!inflight.is_settled());
+        let answering = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            drop(owed);
+        });
+        let started = Instant::now();
+        inflight.settle(Instant::now() + Duration::from_secs(30));
+        let waited = started.elapsed();
+        answering.join().expect("the answering thread finishes");
+        assert!(inflight.is_settled());
+        assert!(
+            waited >= Duration::from_millis(50) && waited < Duration::from_secs(30),
+            "the wait ended after {waited:?}, which is not when the callback was answered"
+        );
+    }
+
+    /// A callback that is never answered may not hold the teardown: the
+    /// deadline is what makes the wait a bounded one.
+    #[test]
+    fn a_callback_that_never_answers_is_waited_out_only_to_the_deadline() {
+        let inflight = Arc::<InFlight>::default();
+        let _owed = inflight.owe();
+        let started = Instant::now();
+        inflight.settle(Instant::now() + Duration::from_millis(100));
+        assert!(
+            started.elapsed() >= Duration::from_millis(100),
+            "the deadline was not waited for"
+        );
+        assert!(
+            !inflight.is_settled(),
+            "nothing answered, so it is still owed"
+        );
+    }
+
+    /// A task dropped instead of finished — which is what releasing the runtime
+    /// does to it — stops being counted, so the count is what is really owed.
+    #[test]
+    fn a_dropped_callback_stops_being_owed() {
+        let inflight = Arc::<InFlight>::default();
+        let first = inflight.owe();
+        let second = inflight.owe();
+        assert!(!inflight.is_settled());
+        drop(first);
+        assert!(!inflight.is_settled());
+        drop(second);
+        assert!(inflight.is_settled());
     }
 }

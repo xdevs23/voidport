@@ -19,6 +19,27 @@
 //! is torn down: the mount is still live and still usable. There is no lazy or
 //! forced unmount in v1.
 //!
+//! The **signalled** teardown has one step in front of those three: it answers
+//! what the kernel is already owed. A callback replies from the runtime, so a
+//! signal can land between a dispatch loop taking a request and the reply for
+//! it going back, and unmounting there costs twice — the guest is told `EIO`
+//! for work that may have completed, and the caller waiting for that answer is
+//! a reference the kernel counts against the mountpoint, so the unmount is
+//! refused `EBUSY` and the mountpoint is left behind. So the teardown waits for
+//! that work to settle and keeps trying the unmount while it does, for at most
+//! [`SETTLE_PATIENCE`], and for [`SETTLE_TAIL`] beyond it while the callers of
+//! the answers it has just given unwind out of the mount. Past those it
+//! proceeds exactly as it did before: one refusal, reported, and the process
+//! leaves.
+//!
+//! "What the kernel is owed" is two counts, not one. [`InFlight`] is the
+//! callbacks this mount's adapter has been handed and not yet answered, which
+//! is the part it can see; [`KernelQueue`] is what the kernel says it is still
+//! waiting for, which is the part it cannot — a request queued for a dispatch
+//! loop that has not picked it up yet belongs to no callback at all, and the
+//! measured window between the two is a fraction of a millisecond wide and is
+//! exactly where the flake lived.
+//!
 //! A mount that is **reconnecting** or **degraded** cancels its recovery before
 //! any of the three, which is what the resilience contract requires: nothing may
 //! be dialling a server or sleeping out a backoff while its mountpoint comes
@@ -70,13 +91,14 @@
 //! two `&mut self` callbacks are outside the parallel window by construction:
 //! `init` runs during `Session::new`'s handshake, before any loop is spawned,
 //! and `destroy` runs after every loop has been joined. Every other callback
-//! takes `&self`, and [`VoidportFs`](crate::fuse::VoidportFs) holds nothing but
-//! an `Arc<Client>`, a runtime handle, two durations and the caching mode
-//! `init` settled — no interior mutability at all, and the one field `init`
-//! writes is only ever read once the loops exist. Each callback clones the
-//! handle and spawns; the shared
-//! state that does mutate is the [`Client`]'s, behind its own locks, and it was
-//! already reached concurrently by the runtime's tasks under a single loop.
+//! takes `&self`, and [`VoidportFs`](crate::fuse::VoidportFs) holds no state a
+//! callback mutates in place: an `Arc<Client>`, a runtime handle, two durations
+//! and the caching mode `init` settled — the one field `init` writes, and it is
+//! only ever read once the loops exist. Each callback clones the handle and
+//! spawns; the shared state that does mutate — the [`Client`]'s, the open
+//! directories, the readahead pool and the count of callbacks the kernel is
+//! owed a reply for — is each behind its own lock, and all of it was already
+//! reached concurrently by the runtime's tasks under a single loop.
 
 use std::io;
 use std::num::NonZeroUsize;
@@ -84,15 +106,16 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::sync::mpsc::{Sender, channel};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use fuser::{BackgroundSession, Config, MountOption, Session, SessionACL};
+use rustix::io::Errno;
 use rustix::mount::UnmountFlags;
 
 use crate::client::{
     Client, ConnectError, DEFAULT_POOL_BYTES, DEFAULT_RECONNECT_STALL, Readahead, Resilience,
 };
-use crate::fuse::VoidportFs;
+use crate::fuse::{InFlight, VoidportFs};
 use crate::url::MountUrl;
 
 /// The default entry and attribute cache lifetime.
@@ -119,6 +142,50 @@ pub const FSNAME: &str = "voidport";
 /// deployment whose per-operation cost is far lower than voidport's 75–95 µs,
 /// can reach the point where a single loop binds. Nothing here assumes one.
 pub const DEFAULT_DISPATCH_THREADS: NonZeroUsize = NonZeroUsize::new(1).expect("1 is not zero");
+
+/// How long a signalled teardown gives the callbacks the kernel is owed.
+///
+/// The teardown answers what it owes before it takes the mountpoint down, and
+/// retries the unmount while it is doing so, because the guest side of an
+/// answer takes a moment to unwind after the answer reaches it. The bound is
+/// what keeps that from becoming a wait without an end: a server that never
+/// answers may not keep this process alive, so past the bound the teardown goes
+/// on exactly as it did before it — one unmount attempt, and the kernel's own
+/// refusal reported if it refuses.
+///
+/// **Two seconds.** What is being waited for is the rest of one wire round
+/// trip, which is tens of microseconds on an idle machine and single-figure
+/// milliseconds on a loaded one; two seconds is three orders of magnitude of
+/// room and still an order of magnitude inside the exit the contract promises.
+const SETTLE_PATIENCE: Duration = Duration::from_secs(2);
+
+/// How long a refused unmount keeps being retried after the mount owes
+/// nothing.
+///
+/// The count of what is outstanding falls the moment a reply is *sent*, and the
+/// guest side of it unwinds a moment later: until the caller has left the
+/// syscall it was in, its reference against the mountpoint is still there and
+/// the unmount is still refused, and that has been measured happening in the
+/// microseconds between one read of the count and the next. So the last word on
+/// an `EBUSY` is only taken after this long — a tenth of a second, which is
+/// four orders of magnitude more than the unwinding needs and short enough that
+/// a mountpoint genuinely held by a guest is still reported, and the process
+/// still leaves, at once.
+const SETTLE_TAIL: Duration = Duration::from_millis(100);
+
+/// How long the teardown pauses between unmount attempts while it settles.
+///
+/// Only ever waited when the kernel refused the unmount inside one of the two
+/// windows above, so it is the resolution of that retry and nothing else.
+const SETTLE_STEP: Duration = Duration::from_millis(5);
+
+/// How often the teardown asks the kernel what it is still waiting for.
+///
+/// The window being waited out is a fraction of a millisecond, so the question
+/// is asked often enough to answer inside it and rarely enough that waiting out
+/// a server that never answers costs a few thousand reads of one small file,
+/// not a spin.
+const SETTLE_POLL: Duration = Duration::from_micros(500);
 
 /// How long a signalled teardown waits for the FUSE session to finish.
 ///
@@ -327,6 +394,12 @@ pub struct Mount {
     /// adapter so that what it is holding can be asked about without going
     /// through the kernel.
     readahead: Arc<Readahead>,
+    /// The callbacks the kernel is owed a reply for, held here as well as
+    /// inside the FUSE adapter because the teardown is what waits on them.
+    inflight: Arc<InFlight>,
+    /// What the kernel says it is still waiting for, which is the part of the
+    /// same question the adapter cannot answer.
+    queue: KernelQueue,
     /// Taken by the teardown; `None` afterwards.
     session: Option<BackgroundSession>,
     /// Dropped after the session is joined, never before.
@@ -364,6 +437,7 @@ impl Mount {
         // is what keeps prefetching inside the coherence the mount already
         // promises.
         let readahead = Readahead::new(options.readahead, options.attr_timeout);
+        let inflight = Arc::<InFlight>::default();
         let filesystem = VoidportFs::new(
             Arc::clone(&client),
             runtime.handle().clone(),
@@ -371,6 +445,7 @@ impl Mount {
             options.entry_timeout,
             options.direct_io,
             Arc::clone(&readahead),
+            Arc::clone(&inflight),
         );
         let session = Session::new(filesystem, mountpoint, &options.config())
             .and_then(Session::spawn)
@@ -395,10 +470,15 @@ impl Mount {
             url = %url,
             "voidport mounted"
         );
+        // Looked up here, while the mount is going up, so that no teardown ever
+        // has to ask the mountpoint anything.
+        let queue = KernelQueue::of(mountpoint);
         Ok(Self {
             mountpoint: mountpoint.to_path_buf(),
             client,
             readahead,
+            inflight,
+            queue,
             session: Some(session),
             runtime: Some(runtime),
         })
@@ -484,9 +564,11 @@ impl Mount {
     ) -> io::Result<()> {
         // First, per the resilience contract: nothing may be dialling a server
         // or sleeping out a backoff while the mountpoint comes down, and a
-        // stalled callback is owed its answer now.
+        // stalled callback is owed its answer now. It has to come before the
+        // wait below, because a callback parked in a stall window is one that
+        // would otherwise never settle.
         self.client.stop_reconnecting();
-        let unmounted = unmount(&self.mountpoint);
+        let unmounted = self.unmount_when_settled();
         // Then the required order: the connection fails what it still owes, and
         // the session loop is joined before the runtime those replies ran on is
         // released.
@@ -511,6 +593,49 @@ impl Mount {
         };
         self.runtime.take();
         joined
+    }
+
+    /// Unmounts, once the callbacks the kernel is owed a reply for have been
+    /// answered.
+    ///
+    /// A request the kernel is waiting on is work the guest asked for and is
+    /// entitled to the answer to, and — while whoever asked is still inside the
+    /// call — a reference the kernel counts against the mountpoint. Both halves
+    /// of it are waited for: the callbacks this adapter is holding
+    /// ([`InFlight`]) and what the kernel says it has queued behind them
+    /// ([`KernelQueue`]), which is the half a filesystem cannot see for itself.
+    /// The unmount is then retried while either is still settling, because the
+    /// caller a reply has just reached takes a moment to leave the mount behind
+    /// it.
+    ///
+    /// It is bounded twice over. [`SETTLE_PATIENCE`] bounds the wait for work
+    /// that is outstanding, so a server that never answers cannot keep this
+    /// process alive; [`SETTLE_TAIL`] bounds the retry once nothing is, which is
+    /// the tail of a caller unwinding out of the mount. A mountpoint genuinely
+    /// held by a guest — the `EBUSY` the contract keeps — is refused, reported
+    /// and left in place a tenth of a second later, which is the whole of what
+    /// this costs it.
+    fn unmount_when_settled(&self) -> io::Result<()> {
+        let started = Instant::now();
+        let (deadline, tail) = (started + SETTLE_PATIENCE, started + SETTLE_TAIL);
+        loop {
+            // The callbacks this adapter is holding, and then the requests the
+            // kernel has queued behind them: the second is what the first
+            // cannot see, and the unmount has to be clear of both.
+            self.inflight.settle(deadline);
+            self.queue.settle(deadline);
+            let unmounted = unmount(&self.mountpoint);
+            let busy = matches!(
+                &unmounted,
+                Err(error) if error.raw_os_error() == Some(Errno::BUSY.raw_os_error())
+            );
+            let owes = !self.inflight.is_settled() || self.queue.is_waiting();
+            let now = Instant::now();
+            if !busy || now >= deadline || (!owes && now >= tail) {
+                return unmounted;
+            }
+            std::thread::sleep(SETTLE_STEP);
+        }
     }
 
     /// Watches for the two termination signals, reporting the first one.
@@ -603,6 +728,93 @@ impl Drop for Mount {
                 %error,
                 "the mount could not be unmounted and is still in place"
             );
+        }
+    }
+}
+
+/// What the kernel is still waiting for from one mount's connection.
+///
+/// The adapter can only count the callbacks it has been handed, and that is not
+/// all of what a mount owes: a request the kernel has queued and no dispatch
+/// loop has picked up yet is invisible to it. The window is short — a fraction
+/// of a millisecond, measured — and both ends of it hurt. An unmount inside it
+/// is refused `EBUSY`, because the kernel holds the mountpoint for the request
+/// it is waiting on; an unmount just before it leaves the answer that follows
+/// with nowhere to go, which is an error in the log of a teardown that
+/// otherwise went perfectly.
+///
+/// The kernel publishes the number itself, per connection, in `fusectl`:
+/// `waiting` is how many replies it is still owed. Reading it is a courtesy and
+/// not a requirement — where `fusectl` is not mounted there is nothing to read,
+/// and the teardown keeps the adapter's own count alone and behaves exactly as
+/// it did before.
+#[derive(Debug)]
+struct KernelQueue {
+    /// The connection's `waiting` file, where this kernel publishes one.
+    waiting: Option<PathBuf>,
+}
+
+impl KernelQueue {
+    /// The connection serving a mountpoint, found without asking the mount
+    /// anything.
+    ///
+    /// A FUSE mount carries an anonymous device and `fusectl` names each
+    /// connection's directory after that device's minor, so the lookup is the
+    /// mountpoint's own line in `/proc/self/mountinfo`: `id parent major:minor
+    /// root mountpoint …`, whose mountpoint field is the path with the only
+    /// four characters that file escapes written in octal. Matching the escaped
+    /// spelling of the path this mount was given is therefore the whole of it —
+    /// and it costs no operation on the mount, which a `stat` of the mountpoint
+    /// would, on a server that may not be answering.
+    ///
+    /// Done once, at mount time. A teardown never asks.
+    fn of(mountpoint: &Path) -> Self {
+        let escaped = mountpoint
+            .display()
+            .to_string()
+            .replace('\\', "\\134")
+            .replace(' ', "\\040")
+            .replace('\t', "\\011")
+            .replace('\n', "\\012");
+        let waiting = std::fs::read_to_string("/proc/self/mountinfo")
+            .ok()
+            .and_then(|mountinfo| {
+                mountinfo
+                    .lines()
+                    .filter(|line| line.split(' ').nth(4) == Some(escaped.as_str()))
+                    .filter_map(|line| line.split(' ').nth(2))
+                    .filter_map(|device| device.split(':').nth(1))
+                    .next_back()
+                    .map(|connection| {
+                        PathBuf::from(format!("/sys/fs/fuse/connections/{connection}/waiting"))
+                    })
+            })
+            .filter(|waiting| waiting.exists());
+        Self { waiting }
+    }
+
+    /// Whether the kernel is waiting for anything from this mount right now.
+    ///
+    /// A kernel that does not publish the number answers `false`, because an
+    /// unknown is not a reason to keep waiting.
+    fn is_waiting(&self) -> bool {
+        self.waiting().is_some_and(|waiting| waiting > 0)
+    }
+
+    /// How many replies the kernel is still waiting for, where it says.
+    fn waiting(&self) -> Option<usize> {
+        let waiting = self.waiting.as_ref()?;
+        std::fs::read_to_string(waiting).ok()?.trim().parse().ok()
+    }
+
+    /// Waits until the kernel is waiting for nothing, or until the deadline
+    /// passes, and answers whether it was waiting for anything at all.
+    fn settle(&self, deadline: Instant) {
+        while self.is_waiting() {
+            if Instant::now() >= deadline {
+                return;
+            }
+            std::thread::sleep(SETTLE_POLL);
         }
     }
 }
@@ -751,6 +963,26 @@ mod tests {
         assert_eq!(
             asked.config().mount_options,
             MountOptions::default().config().mount_options
+        );
+    }
+
+    /// A path that is not a mountpoint has no connection, and asking about one
+    /// answers nothing instead of guessing — which is also what a machine
+    /// without `fusectl` gets, and the case the teardown falls back from.
+    #[test]
+    fn a_path_that_is_not_a_mount_has_no_connection_to_ask() {
+        let queue = KernelQueue::of(Path::new("/proc/self"));
+        assert!(queue.waiting.is_none());
+        assert_eq!(queue.waiting(), None);
+        assert!(
+            !queue.is_waiting(),
+            "an unknown is not something to wait on"
+        );
+        let started = Instant::now();
+        queue.settle(Instant::now() + Duration::from_secs(30));
+        assert!(
+            started.elapsed() < Duration::from_secs(1),
+            "nothing to wait for, so nothing is waited for"
         );
     }
 
