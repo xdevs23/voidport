@@ -4554,6 +4554,17 @@ Sequencing (amended 2026-08-15): **v2 does not start until it is
 opened deliberately** — no v2 research, design or code before then
 (amended 2026-08-17: the kernel-client preparations above are the
 deliberate, bounded exception; everything else stays gated).
+**v2 opened 2026-08-18**, with 1.0.0 released and serving its own
+development tree. The kernel module is greenlit for implementation
+against its authority document, whose quality and survival bars
+(recorded there the same day) bind all v2 work: in-tree Rust
+kernel code as the floor, a level above it as the aim, and
+survival bounded only by the host's resources — a run where the
+system yields before the hardware does is a failed run. The
+shared-memory data plane and write streaming proceed as design
+work within the recorded shape; the scale-out topology and the
+authentication types are settled in design conversations before
+their foundations are built.
 Until then the work is v1: the field-defect and post-v1 increments
 (descriptor budget, subscription, direct-io, xattr/mknod, hardening
 tail) land on v1 foundations, each built not to foreclose the v2

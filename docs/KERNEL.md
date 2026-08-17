@@ -28,6 +28,37 @@ of patched. Where this document cannot decide something without an
 experiment, it names the experiment, and each
 implementation phase gates on the experiments before it.
 
+## The quality and survival bars (decided 2026-08-18)
+
+Implementation is open. The bar is set explicitly: the in-tree
+Rust code of the pinned kernel is the floor, the asahi GPU driver
+is the external reference, and this module aims a level above
+both. The shapes that reach that level are the recorded
+architecture law's — hollow-lattice structure, asynchronous and
+event-driven design where the problem is a stream of events,
+actor-shaped ownership where state wants exactly one owner — and
+when a new requirement does not slot in, the structure is
+refactored until it does. Calling a requirement too hard or too
+involved is not an outcome this project recognizes; shipping v1
+is the standing proof of what the process can build.
+
+Survival is an acceptance criterion, not an aspiration: the
+module withstands everything thrown at it short of memory
+corruption or broken hardware, and attempts best-effort survival
+even then. The host's resources are the only limit — a test run
+where voidport yields before the hardware does is a failed run,
+and the ring-2 torture and fault arms encode exactly that
+criterion.
+
+Maintainer approval is checked, not assumed. The C file passes
+the kernel tree's own checkpatch and coding style; the Rust
+passes the kernel tree's rustfmt and clippy configuration; and
+every kernel increment's review includes an upstream-maintainer
+pass — a reviewer judging the change as a subsystem maintainer
+would, returning "would this survive list review" as a named
+verdict. These checks live beside the module and run with its
+ladder.
+
 Evidence classes used throughout: **measured** (a probe ran and its
 result is stated), **compile-proven** (it builds and links; it has
 never executed), **proven by source** (read in the named kernel
