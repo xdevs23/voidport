@@ -3063,7 +3063,157 @@ contradicted sentence is replaced.)
 9. Both gates pass with the new suites executing, and the README,
    man page and PERFORMANCE.md carry the flag and the numbers.
 
-## Write-ahead (PAUSED 2026-08-17, the same day it was written — the spec review measured three of its premises false; a decision on its future is pending, and the text below is kept as the record of the shape that was refuted)
+## Write streaming (normative for the write-streaming increment; contract written 2026-08-17, superseding the paused write-ahead recorded below — the decided reframe: the server writes into the host page cache faster than any wire carries, and the host kernel owns correctness behind it, so the wire is the bottleneck and the client's one job is to keep it saturated; order lives on the wire)
+
+- **Scope: direct-io mounts.** A cached mount already streams through
+  the guest page cache. Handles opened `O_SYNC`/`O_DSYNC`/`O_DIRECT`
+  are excluded: every such write confirms server-side before the
+  guest proceeds, unchanged.
+- **Early acknowledgment**: the client answers the kernel's write
+  once the frame is queued on the connection — the guest's write
+  returns at wire speed the way a local write returns at page-cache
+  speed, and durability is the barrier's job, exactly as local
+  semantics have it. No data is retained client-side: the transport
+  owns the bytes once queued, and there is no replay — the
+  resilience posture is unchanged, a reconnect fails whatever was
+  outstanding and poisons those handles.
+- **The window is a counter**, not a buffer: unconfirmed writes per
+  handle, bounded in count and bytes (the bounds measured before
+  they are pinned, stated at their constants). A full window makes
+  the next write wait — backpressure, never an error. The counter
+  bounds the failure blast radius and the barrier drain time.
+- **Order is the wire's.** Frames leave in submission order on one
+  ordered stream, and the server applies same-handle requests in
+  arrival order — a per-handle serialization at the apply site,
+  cheap because the apply is a page-cache copy; cross-handle
+  concurrency is untouched. Read-after-write, append, and
+  overlapping writes on one handle are then correct by
+  construction; cross-handle and cross-mount races are exactly what
+  they are locally.
+- **Node-scoped operations drain first**: a getattr on a node with
+  unconfirmed writes, and any setattr touching it, wait for those
+  confirmations — size and times read as the guest just wrote them,
+  and a truncate cannot pass writes in flight. This is the one
+  place the engine holds a non-barrier operation, and it holds it
+  for the handle's own unconfirmed tail only.
+- **Barriers drain**: fsync, fdatasync, flush and release complete
+  only after every outstanding confirmation for the handle arrives,
+  then act as today. A failed server write poisons its handle; the
+  poisoning errno answers the next write or barrier on that handle
+  exactly once. A guest that never syncs still learns at close.
+  Teardown joins the accounting: a live server is drained before
+  the unmount; a dead one already poisoned the handles.
+- **Memory-map writeback rides the same path**: a page flushed by
+  the guest kernel is a write like any other, early-acked and
+  counted, and the invalidation contract of readahead is kept by
+  invalidating after confirmation, not after acknowledgment.
+- **Parallel direct writes**: the mount also announces the
+  parallel-direct-writes capability, so an application using
+  asynchronous I/O issues concurrent writes on one file instead of
+  serializing under the guest kernel's per-file direct-write lock.
+  With per-handle apply order on the server this is safe by the
+  same construction.
+- **The server side gains one rule** — the per-handle arrival-order
+  apply — and nothing else changes on the wire: same frames, same
+  replies, replies still confirm in completion order across
+  handles.
+
+### Acceptance criteria — write-streaming increment
+
+1. Sequential write throughput on a direct-io mount reaches a
+   stated fraction of the transport's measured bulk ceiling in a
+   paired A/B (engine off is today's behavior); the performance
+   report carries the numbers per transport.
+2. Order is pinned by test: same-handle write-then-read returns the
+   new bytes; append through one handle interleaves nothing;
+   overlapping same-handle writes end with the later bytes; a
+   getattr after a write reports the written size without an
+   intervening fsync.
+3. Durability barriers hold under fault injection: a server killed
+   mid-stream surfaces the failure at the next barrier on every
+   affected handle, exactly once per handle; an fsync that returned
+   success is proven durable in the backing file; teardown with a
+   live server drains before unmounting.
+4. Excluded modes are proven excluded: O_SYNC and O_DIRECT handles
+   confirm each write before the next departs (opcode census), and
+   cached mounts are byte-identical to today.
+5. The window bounds are measured and stated; a full window
+   backpressures without error; the counter joins the
+   signalled-teardown settle accounting.
+6. The torture harness's append and churn classes run green against
+   the engine with restarts active, and the crash-consistency
+   assertions still hold.
+7. Both gates pass with the new suites executing; the performance
+   report carries the A/B.
+
+## Privileged bits (normative for the privileged-bits increment; contract written 2026-08-17)
+
+The guest should see a filesystem as close to a real one as
+possible: setuid and setgid work, persist, and strip exactly as
+local semantics demand — while the host-side backing file never
+carries a privileged bit the server's own user set. The two truths
+are reconciled by recording.
+
+- **Recording**: the privileged bits a guest sets live in a
+  voidport-owned extended attribute on the backing file, never in
+  the host mode. Presentation ORs the recorded bits into the mode
+  the guest sees; a host file that genuinely carries the bits
+  presents them as-is. The recording attribute is the server's
+  own: it is invisible to the guest's xattr surface — never listed,
+  never readable, never writable through the mount — and the xattr
+  rules cannot expose it.
+- **Setting**: a chmod that adds privileged bits succeeds by
+  recording them; the host mode receives only what the host permits
+  the server's user, as mode changes do today. The recorded truth
+  survives restart and remount because it lives on the file.
+- **Stripping follows the kernel's own delegation**: on a direct-io
+  mount the kernel marks the write that must clear the bits, the
+  client forwards that mark on the wire — the write request's
+  flags field, zero until now, gains its first meaning — and the
+  server clears the recorded bits (and whatever host bits it may).
+  On a cached mount the kernel strips through its own path today
+  and keeps doing so; the recorded bits follow the mode change it
+  sends. This closes the recorded defect: bits surviving a
+  direct-io write that strips them locally. An elder server
+  ignores the unknown flag and strips nothing — a mixed-version
+  pair is fail-open for stripping until both sides update; stated,
+  not hidden, like every version-skew posture in this document.
+- **The server can refuse the feature entirely**: a per-namespace
+  switch disables privileged bits — presentation masks them
+  (recorded and host-real alike) and a chmod attempting to set
+  them refuses loudly. The default is enabled: the recorded
+  mechanism touches nothing on the host beyond one attribute.
+- **The client can opt a mount out**: a mount option masks
+  privileged bits on that mount and refuses setting them, the
+  mount-side analog of the classic nosuid stance.
+- **Enforcement is the guest kernel's**, in its own trust domain:
+  the server presents bits, the guest decides what exec does with
+  them — the posture THREAT-MODEL states for every presented
+  attribute.
+
+### Acceptance criteria — privileged-bits increment
+
+1. A guest chmod adding setuid or setgid succeeds, the bits present
+   through every mount of the namespace, survive server restart and
+   remount, and the backing file's host mode never gains them.
+2. Stripping matches local semantics in a paired comparison on both
+   mount modes: a write by a caller without the file-capability
+   privilege clears the bits (recorded or host-real), truncate
+   clears them the way the local filesystem does, and the direct-io
+   defect case is the regression test.
+3. The recording attribute is invisible through the mount: not in
+   xattr listings, unreadable, unwritable, regardless of xattr
+   rules.
+4. The disabled namespace refuses: setting privileged bits fails
+   loudly, presentation masks recorded and host-real bits alike.
+   The mount option does the same client-side.
+5. The wire flag is covered: golden vectors carry the new write
+   flag, an elder server ignores it (interop test), and the
+   version-skew posture is documented.
+6. Both gates pass with the new suites executing; THREAT-MODEL
+   carries the enforcement posture.
+
+## Write-ahead (PAUSED 2026-08-17, the same day it was written — the spec review measured three of its premises false; superseded by the write-streaming contract above; the text below is kept as the record of the shape that was refuted)
 
 The review's measured findings, summarized (full probes kept out of
 tree): the capability probe this section proposed removing does not
