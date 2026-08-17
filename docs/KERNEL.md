@@ -7,9 +7,10 @@ one enumeration with a live probe, and rebuilt the compile probes
 against the newest kernel — every correction is folded in below,
 and the review's probes are part of this document's evidence.
 Amended the same day after the follow-up review, which verified the
-closures and found four residual contradictions — the coherence
-carry-over, the write-path wording, the unnamed kernel attribute,
-and the shared core's license — all folded in below. This document
+closures and returned fifteen findings, four of them contradictions
+of decided contracts — the coherence carry-over, the write-path
+wording, the unnamed kernel attribute, and the shared core's
+license — all fifteen folded in below. This document
 decides the design and implements nothing: implementation begins
 when it is opened, separately.
 
@@ -86,9 +87,9 @@ io_uring evaluation stays retired by the recorded decision.
    registration structures resolve through the bindings,
    **compile-proven by the review**; every registration and
    super-block symbol the client needs is a plain export in both
-   probed kernels, **proven by source**). What the bindings cannot express — static
-   inline helpers and macros, which the generator cannot call — is
-   the true C surface, enumerated below. This layer owns the one
+   probed kernels, **proven by source**). What the bindings cannot
+   express — static inline helpers and macros, which the generator
+   cannot call — is the true C surface, enumerated below. This layer owns the one
    auditable unsafe boundary.
 3. **The C helper file — one, enumerated, logic-free.** The
    surfaces that genuinely need C on the probed kernels: the
@@ -176,9 +177,12 @@ acceptable.** The data path sits behind one provider boundary in
 the kernel-Rust layer: the interim provider fills pages from the
 wire and writes through them to the wire — writethrough, no
 writeback cache, per the decided coherence contract, with fsync
-and flush passing through as in v1; the v2 provider maps the
-shared-memory window
-so the same page cache pages ARE host memory — the DAX shape, which
+and flush passing through as in v1, and memory-map writeback
+riding the same path: dirty pages a shared mapping produces reach
+the wire through the provider's page-writing hook, ported in the
+full-operation phase with the rest of the write set; the v2
+provider maps the shared-memory window so the same page cache
+pages ARE host memory — the DAX shape, which
 removes the duplication the interim accepts. Nothing above the
 boundary changes when the provider does. That boundary is the
 criterion-3 answer: the successor data plane slots in as a provider
@@ -194,8 +198,8 @@ page would stay stale indefinitely, which the decided contract
 forbids. Directory entry revalidation is the module's own
 (the machinery FUSE supplied for free is rebuilt: a revalidation
 hook honoring the entry lifetime, with the stale-answer retry
-behavior of the kernel's path walk proven by a ring-2 experiment
-named in phase 3). Readahead needs no port: the page cache's own
+behavior of the kernel's path walk **open** until the path-walk
+retry experiment in phase 3 proves it). Readahead needs no port: the page cache's own
 readahead drives the read path, and the measurement phase compares
 it against the userspace engine before anything more is built.
 
@@ -224,8 +228,8 @@ initial namespace (the standard bar for a network filesystem
 module); the mount is visible guest-wide like any mount — the
 userspace client's allow-other flag was a FUSE artifact and has no
 analog here — THREAT-MODEL is owed a line for this when
-implementation opens; per-request
-credentials are the calling task's at call time, matching the
+implementation opens; per-request credentials are the calling
+task's at call time, matching the
 request head's semantics; permission checking stays exactly v1's
 default-permissions model — the guest kernel checks against
 presented attributes, the server enforces its own rules regardless.
@@ -284,8 +288,8 @@ output nix provides, as a flake output. **The kernel attribute is
 pinned singular and named**: the flake tracks `linuxPackages_latest`
 on nixpkgs unstable — the newest released kernel, release
 candidates excluded (every kernel the pin can select already
-carries Rust on this architecture, so a Rust gate would select
-nothing) — and the rule that makes ring 3 sound is stated: **the
+carries Rust on this architecture, so gating on Rust support would
+exclude nothing) — and the rule that makes ring 3 sound is stated: **the
 module is only ever loaded on the kernel it was built against**,
 so ring 3 is available only while the development machine boots
 that exact derivation; otherwise ring 2 is the only loading ring,
@@ -335,7 +339,7 @@ missing:
    ever boots a guest. The torture harness gains a kernel-mount
    arm in the same ring.
 3. **The development machine**, where loading is sanctioned, under
-   the built-equals-booted rule — fast iteration, with the KVM
+   the built-equals-loaded rule — fast iteration, with the KVM
    ring as the place anything dangerous goes instead.
 4. **The debug arm**: ring 2 runs its suite additionally against a
    debug kernel — address and undefined-behavior sanitizers, lock
@@ -425,7 +429,7 @@ Each phase gates the next; none is started by this document.
    measured classes are never conflated — checkable by reading,
    and the review that enforced it is part of the record.
 2. Every open question is named with the experiment that settles
-   it — except an open marked as a product decision, which is
+   it — except a question marked a product decision, which is
    settled by decision and carries no experiment — and every
    phase's unknowns are listed in that phase or an earlier one.
 3. The v2 data plane slots in at the named provider boundary
