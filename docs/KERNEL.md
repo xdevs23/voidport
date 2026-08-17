@@ -315,29 +315,45 @@ experiment.
 ## Build integration and version policy
 
 The module builds out of tree with kbuild against the kernel dev
-output nix provides, as a flake output. **The kernel attribute is
-pinned singular and named**: the flake tracks `linuxPackages_latest`
-on nixpkgs unstable — the newest released kernel, release
-candidates excluded (every kernel the pin can select already
-carries Rust on this architecture, so gating on Rust support would
-exclude nothing) — and the rule that makes ring 3 sound is stated: **the
-module is only ever loaded on the kernel it was built against**,
-so ring 3 is available only while the development machine boots
-that exact derivation; otherwise ring 2 is the only loading ring,
-and the ladder checks the equality instead of assuming it. The
-review measured both mismatch scales this rule exists for: the
-running kernel one patch level behind the flake's default set, and
-a full major version behind the named pin.
+output nix provides, as a flake output. **The supported kernels
+are a named set of three** (decided 2026-08-18, superseding the
+single pin): the latest longterm release, the current stable
+release, and mainline — tracked through their nixpkgs unstable
+attributes (at this writing 6.18.44, 7.1.8, and the 7.2 release
+candidates). Every member already carries Rust on this
+architecture. The rule that makes loading sound is unchanged and
+now holds per member: **the module is only ever loaded on the
+kernel it was built against**; ring 3 is available only while the
+development machine boots one of the set's exact derivations,
+otherwise ring 2 is the only loading ring, and the ladder checks
+the equality instead of assuming it. The review measured both
+mismatch scales this rule exists for: the running kernel one
+patch level behind one member, and a full major version behind
+another.
 
-Chase-newest comes with its protocol: every kernel bump runs the
-revalidation ladder — crate compile, helper compile, the frame
-round-trip probe in a KVM guest, then the module suite — and a bump
-that breaks the module is fixed forward promptly or the flake pins
-the previous kernel until it is (a pinned fallback must still meet
-the wire crate's rustc floor, which is newer than the kernel's
-own — stated above). The ladder's build rungs are derivations; its
-guest rungs are not (next section), so the ladder is a gate script
-over both, run by the same entry point as the other gates.
+Version drift across the set is an architecture obligation, not
+a porting chore. The kernel-Rust API is unstable between releases
+— the connect-call signature drift the review found is the
+recorded example — so every difference the set exposes is
+absorbed in **one compatibility surface** beside the C helpers,
+one place that answers what this kernel offers; a capability an
+older member lacks degrades by structure, decided and recorded
+per capability, never by conditionals scattered through the
+layers. Supporting the whole set from one tree is deliberately
+part of the architecture test: a version difference that cannot
+be absorbed at the compatibility surface is a finding against
+the shape, not a reason for a special case.
+
+Chase-newest comes with its protocol, per set member: every
+kernel bump runs the revalidation ladder — crate compile, helper
+compile, the frame round-trip probe in a KVM guest, then the
+module suite — and a bump that breaks the module is fixed forward
+promptly or the flake pins that member's previous kernel until it
+is (a pinned fallback must still meet the wire crate's rustc
+floor, which is newer than the kernel's own — stated above). The
+ladder's build rungs are derivations; its guest rungs are not
+(next section), so the ladder is a gate script over both, run by
+the same entry point as the other gates.
 
 ## Testing architecture
 
@@ -376,13 +392,16 @@ missing:
    debug kernel — address and undefined-behavior sanitizers, lock
    dependency validation, sleep-in-atomic checks, leak detection —
    on every ladder run, because hand-written unsafe against kernel
-   internals is exactly what those tools exist for. The pin stays
-   singular in **source**: one kernel, two configurations. The
-   production configuration is the cached upstream build; the
-   debug configuration enables facilities the production kernel
-   ships disabled, so it is built locally once per kernel bump and
-   cached across ladder runs, with the module built once per
-   configuration under the built-equals-loaded rule.
+   internals is exactly what those tools exist for. Each set
+   member stays singular in **source**: one kernel, two
+   configurations. The production configuration is the cached
+   upstream build; the debug configuration enables facilities the
+   production kernel ships disabled, so it is built locally once
+   per kernel bump and cached across ladder runs, with the module
+   built once per configuration under the built-equals-loaded
+   rule. The full matrix is three members by two configurations;
+   the ladder runs the debug configuration on the member that
+   changed and cycles the rest.
 
 ## Layout, licensing, evidence durability
 
@@ -426,8 +445,9 @@ Each phase gates the next; none is started by this document.
 1. **Frame over vsock, executed**: the probe module exchanges one
    real frame with the v1 server at runtime — in a minimal probe
    guest first (the full ring-2 harness comes later), then ring 3.
-   Converts the transport from compile-proven to measured; no
-   precedent exists.
+   Runs on the stable member of the kernel set first; the other
+   members join the ladder with the phase-3 harness. Converts the
+   transport from compile-proven to measured; no precedent exists.
 2. **The shared core extraction**: the session logic leaves the
    userspace client for the no_std core crate, with the fixed-
    capacity replay design and the permissive license entry owed to
