@@ -3069,6 +3069,26 @@ contradicted sentence is replaced.)
   the guest page cache. Handles opened `O_SYNC`/`O_DSYNC`/`O_DIRECT`
   are excluded: every such write confirms server-side before the
   guest proceeds, unchanged.
+- **The caching model, stated as decided** (clarified 2026-08-17): a
+  mount's direct-io setting is guest-side only — it exists to keep
+  the guest from holding a page cache so the HOST's page cache is
+  the one cache in the system. The server's backing I/O rides that
+  host cache as any local program's would, which is precisely why
+  the server outruns the wire and the host kernel owns coherence
+  and writeback behind it. A guest handle's `O_DIRECT` does not
+  reach the backing file today; that is presentation, and the
+  posture below is what changes it.
+- **Host-side direct I/O is its own namespace setting**, three
+  postures: the default rides the host cache as above;
+  **passthrough** opens the backing file with `O_DIRECT` exactly
+  when the guest handle asked for it, alignment demands and all —
+  an unaligned request answers the same error the local filesystem
+  gives; **always** opens every backing file uncached, for the
+  operator who wants no host caching at all. Under "always" the
+  storage, not the wire, may become the bound — streaming stays
+  correct (the window, order and barriers are unchanged), the
+  throughput expectation moves, and the performance report says so
+  where it is measured.
 - **Early acknowledgment**: the client answers the kernel's write
   once the frame is queued on the connection — the guest's write
   returns at wire speed the way a local write returns at page-cache
