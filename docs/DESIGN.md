@@ -3063,6 +3063,90 @@ contradicted sentence is replaced.)
 9. Both gates pass with the new suites executing, and the README,
    man page and PERFORMANCE.md carry the flag and the numbers.
 
+## Write-ahead (normative for the write-ahead increment; contract written 2026-08-17)
+
+Reads got their streaming engine; writes still pay every round trip
+alone. The decided direction: the same streaming idea as readahead,
+with the client the one streaming the data. Two round trips per
+guest write today — the kernel's security-capability probe and the
+write itself — become, in the common case, a fraction of one.
+
+- **Scope: direct-io mounts**, exactly like readahead — a cached
+  mount already has kernel writeback, and doubling buffers there
+  buys nothing. Handles opened `O_SYNC`/`O_DSYNC` or `O_DIRECT` are
+  excluded: every such write confirms server-side before the guest
+  proceeds, unchanged.
+- **The window**: the client acknowledges a kernel WRITE once the
+  frame is on the wire and the data copied into a bounded in-flight
+  window, and streams further writes without waiting for server
+  confirmations. Bounds mirror readahead's shape: per-handle bytes
+  and a per-mount total, both measured before the numbers are
+  pinned, the window's memory being the price and the bound. A full
+  window makes the next write wait — backpressure, never an error.
+- **Ordering is range-scoped**: two in-flight writes on one handle
+  with overlapping ranges are forbidden — the second waits for the
+  first's confirmation. Non-overlapping positional writes commute
+  on the backing filesystem, and the server's concurrent dispatch
+  may apply them in any order; overlap is the one case where order
+  is meaning, so overlap is the one case that serializes.
+- **Barriers drain**: `fsync`/`fdatasync`, `flush`, and `release`
+  complete only after every outstanding confirmation for the handle
+  has arrived (then act as they do today). A mount teardown drains
+  every handle — the signalled-teardown settle already counts what
+  the kernel is owed, and the window joins that accounting.
+- **Errors surface at the next operation**: a failed server write
+  poisons its handle; the poisoning errno answers the next write,
+  fsync, flush or release on that handle, exactly once, then the
+  handle behaves per its state. Nothing is silently dropped, and a
+  guest that never syncs still learns at close.
+- **Reconnect does not replay**: a degraded connection fails the
+  outstanding window (the handles poison with the transport errno);
+  healing restores the mount, not unconfirmed writes. This is the
+  readahead posture — the engine never changes what the wire
+  promises, it changes when the client waits.
+- **The capability probe goes**: the mount negotiates the FUSE
+  handle-killpriv capability, so the kernel stops probing
+  `security.capability` before every write; the server owns the
+  stripping — a write or truncate through a handle whose inode
+  carries setuid/setgid bits (or file capabilities) clears them the
+  way the local filesystem would, on its own backing path. One
+  guest write is then one wire message.
+- **Server side is untouched** beyond the stripping: writes apply
+  exactly as they arrive, one pwrite each, replies confirm in
+  completion order. The engine, like readahead's, lives in the
+  client.
+
+### Acceptance criteria — write-ahead increment
+
+1. Sequential write throughput on a direct-io mount improves by a
+   measured, stated factor in a paired A/B (engine off = today's
+   behavior); the field baseline is 172 MB/s and the fixed
+   ~116 us/write cost is the target.
+2. A wire opcode census shows one message per guest write — no
+   capability probe — and the killpriv stripping is proven end to
+   end: a setuid file written through the mount by a non-owner
+   loses its bits, and file capabilities are cleared, matching the
+   local filesystem's behavior on the same sequence.
+3. Durability barriers hold under fault injection: a server killed
+   mid-stream surfaces the failure at the next barrier on every
+   affected handle; an fsync that returned success is proven
+   durable (the data is in the backing file); a close after failed
+   writes reports the poisoning errno exactly once.
+4. Overlap ordering is pinned: concurrent overlapping writes on one
+   handle serialize (a test proves the final bytes are the second
+   write's), and non-overlapping writes pipeline (the census proves
+   more than one in flight).
+5. O_SYNC and O_DIRECT handles bypass the engine (census: each
+   write confirmed before the next departs); cached mounts are
+   byte-identical to today.
+6. The window bounds are measured and stated in the doc comment
+   (per-handle and per-mount), a full window backpressures without
+   error, and mount teardown drains every window — the torture
+   harness's append and churn classes run green against the engine
+   with restarts active.
+7. Both gates pass with the new suites executing; the performance
+   report carries the A/B.
+
 ## Vsock transport (normative for the vsock increment; decided 2026-08-15)
 
 Prioritised 2026-08-15 for host-RAM reduction, alongside everything
@@ -3941,8 +4025,28 @@ process, one host, tokio + blocking-pool host I/O, FUSE data path):
   all of v1 the normative state is `auth = "none"` with the transport
   as the trust model, exactly as THREAT-MODEL.md states it.
 
+Kernel-client preparations (decided 2026-08-17, research and
+feasibility probes only — module development starts when v1 is fully
+done): the client should ideally be **a real filesystem in the
+kernel**, writing the missing Rust VFS layer on what the kernel
+already provides where needed; its file-data path is the v2
+shared-memory window, not the userspace network-fs caching library;
+the kernel version policy is **chase newest** (whatever nixpkgs
+unstable carries, re-validated per bump — the running dev kernel is
+already built with Rust support); upstreaming is not pursued now but
+nothing may foreclose it; the module lives in this repository under
+a kernel/ directory with GPL-2.0 licensing (forced by the kernel's
+Rust runtime exports regardless of preference, compatible with the
+recorded license split); testing runs in dedicated KVM guests, and
+loading probe modules on the development machine is sanctioned.
+Compile-level feasibility is proven: the wire crate builds unmodified
+as a kernel crate, and kernel-owned vsock is reachable through plain
+exported symbols.
+
 Sequencing (amended 2026-08-15): **v2 does not start until it is
-opened deliberately** — no v2 research, design or code before then.
+opened deliberately** — no v2 research, design or code before then
+(amended 2026-08-17: the kernel-client preparations above are the
+deliberate, bounded exception; everything else stays gated).
 Until then the work is v1: the field-defect and post-v1 increments
 (descriptor budget, subscription, direct-io, xattr/mknod, hardening
 tail) land on v1 foundations, each built not to foreclose the v2
@@ -3969,7 +4073,12 @@ design settles.
    otherwise leaves open (see docs/THREAT-MODEL.md); and FUSE-over-
    io_uring (kernel 6.14+) must be evaluated before any kernel-module
    work, since it may close most of the per-op overhead gap that
-   motivates one. Added 2026-08-13 from the increment-6 spec review: a
+   motivates one (gate retired 2026-08-17 as overtaken: the kernel
+   client is decided v2 direction on its own merits, the round-trip
+   attribution shows the dominant cost is scheduling that a ring only
+   partly addresses, and the userspace FUSE library's ring support is
+   unestablished — the evaluation would gate nothing that is still
+   open). Added 2026-08-13 from the increment-6 spec review: a
    wire `FileLock` lock-namespace (lk_flags) field, prerequisite for
    routing guest flock(2) to the server without conflating it with
    record locks (also blocked on fuser exposing lk_flags). Added
