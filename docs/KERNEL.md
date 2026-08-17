@@ -25,7 +25,7 @@ Everything here is designed robustly from the start: a hazard is
 fixed through architecture, never through imperative code layered
 on top, and a shape that accumulates guards is reconsidered instead
 of patched. Where this document cannot decide something without an
-experiment, it names the experiment instead of a guess, and each
+experiment, it names the experiment, and each
 implementation phase gates on the experiments before it.
 
 Evidence classes used throughout: **measured** (a probe ran and its

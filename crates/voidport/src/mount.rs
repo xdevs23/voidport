@@ -980,8 +980,8 @@ mod tests {
     }
 
     /// A path that is not a mountpoint has no connection, and asking about one
-    /// answers nothing instead of a guess — which is also what a machine
-    /// without `fusectl` gets, and the case the teardown falls back from.
+    /// answers nothing — which is also what a machine without `fusectl` gets,
+    /// and the case the teardown falls back from.
     #[test]
     fn a_path_that_is_not_a_mount_has_no_connection_to_ask() {
         let queue = KernelQueue::of(Path::new("/proc/self"));
