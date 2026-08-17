@@ -71,7 +71,11 @@
           # slow network mount, and a `path:.` flake reference copies the whole
           # tree (gitignore does not filter it) into the nix store.
           shellHook = ''
-            export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$HOME/.cache/voidport-target}"
+            # Keyed by checkout path: two checkouts (a worktree beside the main
+            # tree, above all) building different revisions into one target dir
+            # poison each other's rlibs, and the failures surface as phantom
+            # compile errors in files neither tree touched.
+            export CARGO_TARGET_DIR="''${CARGO_TARGET_DIR:-$HOME/.cache/voidport-target/$(pwd -P | md5sum | cut -c1-12)}"
             # Bound compile parallelism: several builds may run concurrently,
             # and unbounded rustc job counts multiply into memory spikes.
             export CARGO_BUILD_JOBS="''${CARGO_BUILD_JOBS:-8}"

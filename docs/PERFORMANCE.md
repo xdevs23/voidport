@@ -1347,6 +1347,32 @@ for small projects whose hot files are re-read constantly, where
 the cache repays its bounded cost with native-speed re-reads.
 
 
+## 2026-08-17 — what the attribution bought: four landings
+
+The attribution section below ranked the safe reductions; all four
+landed the same day, each proven by paired interleaved A/B on the
+rig (pre arm built from the unchanged source, same session):
+
+- **Serve replies from the blocking closure** — the per-request
+  outer task and its join are gone (~5 us of server CPU per wire
+  round trip): create+close 336.6 to 308.8 us, write 4 KiB 150.8 to
+  143.1, getattr 59.6 to 57.4. The full-queue case falls back to a
+  task so a stalled peer can never park the shared blocking pool.
+- **Run-ahead bound for uncapped connections** (64, measured — 1024
+  measured worse on the 16-client ceiling): the forget-flood drain
+  transient fell from +36.8% RSS over plateau to +1.3-2.8%, peak
+  threads from the 512-pool ceiling to 171-388, post-drain RSS from
+  124 to 49 MiB, walk and 16-client aggregate at parity.
+- **One allocation per reply, no per-mutation dup, repeat-lookup
+  stat reuse** (inode-keyed nodes only): lookup -5.9%, unlink -4.6%,
+  create -4.0%, getattr -3.4%, readdirplus -4.4% per entry.
+- **Signalled teardown settles what the kernel is owed** (a
+  correctness landing found by the same measurements): the teardown
+  race reproduced five of five with a frozen server and five in
+  fifty-four full-suite runs, and zero of 288 after.
+
+Raw records for every arm kept out of tree.
+
 ## 2026-08-17 — the round trip dissected, and what each guest op pays
 
 A full attribution pass on the current stack (release builds, unix
