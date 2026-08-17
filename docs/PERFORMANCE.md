@@ -1347,6 +1347,45 @@ for small projects whose hot files are re-read constantly, where
 the cache repays its bounded cost with native-speed re-reads.
 
 
+## 2026-08-17 — the round trip dissected, and what each guest op pays
+
+A full attribution pass on the current stack (release builds, unix
+socket, tmpfs backing, single client; one vsock confirmation arm).
+This updates the earlier ~40 us/op attribution: the wire round trip
+is 50-56 us on unix, 83.9 us on vsock, and the dominant component is
+scheduling, not I/O or serialization.
+
+One getattr round trip, 50 us wall, 62 us CPU across both processes:
+scheduling/wakeup/futex/runtime 64.3%, syscall entry/exit 7%,
+socket 6%, allocation 4%, operation code 4%, framing 3%, the host
+filesystem syscall itself 2%. About ten voluntary context switches
+per round trip, five on each side; zero involuntary.
+
+What each guest operation costs in wire round trips (measured by
+opcode census on the live socket): create+close 5 (lookup, getattr,
+create, flush, release); unlink 3 plus a fire-and-forget forget;
+open+close 3; every write 2 — the guest kernel precedes each write
+with a security.capability getxattr probe FUSE cannot suppress
+without the handle-killpriv negotiation, so the fixed cost of a
+guest write is ~116 us of which the two round trips are 101-112;
+readdirplus on 1000 entries 6. Bulk-loop taxes are guest-cache
+effects: each unlink dirties the parent's attributes, so the next
+iteration re-fetches them (a permanent one-round-trip tax on serial
+unlink loops), and rm -rf avoids the lookup round trip because
+readdirplus primed the entries.
+
+The FORGET-flood drain transient is attributed and bounded: with no
+configured in-flight cap the read loop spawns one task per FORGET
+frame as fast as they arrive and the blocking pool runs to its
+512-thread ceiling — at 200k names the transient is +35% RSS over
+plateau and 546 threads. An internal run-ahead bound of 64 measured
+the transient down to +1.9% and peak threads to 245, at parity
+throughput on both the single-walk and the 16-client ceiling (a
+bound of 1024 measured 19% WORSE on the 16-client ceiling than no
+bound — the value is load-bearing, measured, not chosen round).
+
+Raw records and harness scripts kept out of tree.
+
 ## 2026-08-17 — per-entry cost re-measured on the current stack
 
 The entry-cost and reclaim numbers above predate the descriptor
@@ -1394,11 +1433,16 @@ behavior was pinned by test): synthesized directories answer all-zero
 statfs, host-backed nodes pass the backing filesystem's counts
 through — a mount rooted on a synthesized directory therefore shows
 zero inodes at the mountpoint while a host-backed subpath reports
-real numbers. Bulk unlink runs ~3.4x slower than bulk create (3 600
-against 12 200 per second through the mount) — the mutation path is
-round-trip-bound, the same shape as the write-throughput number in
-the field section below. The client also logged a spurious unmount
-warning after every successful unmount; fixed since.
+real numbers. (Refined 2026-08-17 by controlled measurement: the
+3.4x unlink-vs-create figure this note first carried compared a
+serial rm -rf against a 16-worker parallel create and does not
+survive a same-shape comparison — bulk unlink is in fact 1.35-1.5x
+FASTER than bulk create through the mount, because create+close is
+five wire round trips and unlink is three plus a fire-and-forget;
+the attribution section below carries the full census. The mutation
+path is round-trip-bound either way.) The client also logged a
+spurious unmount warning after every successful unmount; fixed
+since.
 
 ## 2026-08-16 — readahead in the field, post-integration
 
