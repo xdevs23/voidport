@@ -118,20 +118,31 @@ io_uring evaluation stays retired by the recorded decision.
    registration structures resolve through the bindings,
    **compile-proven by the review**; every registration and
    super-block symbol the client needs is a plain export in both
-   probed kernels, **proven by source**). What the bindings cannot
-   express — static inline helpers and macros, which the generator
-   cannot call — is the true C surface, enumerated below. This layer owns the one
+   probed kernels, **proven by source**). Where the kernel offers
+   no Rust abstraction for something the client needs, **building
+   that abstraction is part of this work** (decided 2026-08-18):
+   a safe layer over the raw bindings, written to the kernel
+   tree's own abstraction conventions so it could be sent upstream
+   on its own — the same philosophy the asahi driver proved out.
+   Only what even such a layer cannot reach — static inline
+   helpers and macros, which the generator cannot call — is the
+   true C surface, enumerated below. This layer owns the one
    auditable unsafe boundary.
-3. **The C helper file — one, enumerated, logic-free.** The
-   surfaces that genuinely need C on the probed kernels: the
-   static-inline VFS helpers the registration path uses (the
-   review's probe names the class; the exact list is a phase-3
-   deliverable pinned by its gate), and the five kernel-socket
-   calls (**compile-proven**, with the newest-kernel signature
-   drift already found and fixed one-line in the probes). A helper
-   that starts deciding things moves up a layer. When the upstream
-   VFS or socket abstraction series merge, the corresponding
-   helpers retire by swap.
+3. **The C helper file — one, enumerated, logic-free, aiming at
+   zero** (sharpened 2026-08-18: C is held to the absolute
+   minimum, and none at all is the preferred outcome). A surface
+   is C only while neither the bindings crate nor the kernel-Rust
+   layer can express it, and each helper records why it cannot
+   move up. The surfaces that currently qualify on the probed
+   kernels: the static-inline VFS helpers the registration path
+   uses (the review's probe names the class; the exact list is a
+   phase-3 deliverable pinned by its gate), and the five
+   kernel-socket calls (**compile-proven**, with the newest-kernel
+   signature drift already found and fixed one-line in the
+   probes). A helper that starts deciding things moves up a layer.
+   When the upstream VFS or socket abstraction series merge, the
+   corresponding helpers retire by swap — the file's destination
+   is empty.
 
 ## The wire crate under kbuild — compile-proven ground
 
