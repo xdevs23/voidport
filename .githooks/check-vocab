@@ -8,6 +8,9 @@
 #
 # Rules, deliberately blunt:
 #   * whole words, any casing; "rather than" is the one banned as a phrase; (vocab-ok: the rule states its own list)
+#   * a word boundary is any non-alphanumeric character, so an identifier
+#     hides nothing: a banned word joined by underscores in a test name is
+#     the same word;
 #   * only ADDED lines are judged — the staged diff at commit time, and every
 #     tracked line under `--all`, because this project publishes a fresh root
 #     and the whole tree therefore counts as newly written;
@@ -20,7 +23,13 @@
 # the whole tree under `--all` (which is what `./check` runs).
 set -euo pipefail
 
-words='rather than|worth|leg|lane|doctrine|caveat|twist|ruling|ruled|seat|belt-and-suspenders|wrinkle|guessing' # vocab-ok: the list itself
+words='rather[ _]than|worth|leg|lane|doctrine|caveat|twist|ruling|ruled|seat|belt-and-suspenders|wrinkle|guessing' # vocab-ok: the list itself
+
+# The words with their boundaries: anything that is not a letter or a digit
+# separates words, which is what lets a snake_case identifier be judged as
+# the words it joins. `grep -w` cannot say this — an underscore is a word
+# character to it — so the boundary is spelled out.
+bounded="(^|[^[:alnum:]])($words)([^[:alnum:]]|\$)"
 
 refuse() {
   echo "vocab: refusing. These words are banned in tracked content." >&2
@@ -39,7 +48,9 @@ judge() {
     line=${rest%%:*}
     text=${rest#*:}
     case $text in *vocab-ok*) continue ;; esac
-    hits=$(printf '%s\n' "$text" | grep -owiE "$words" | sort -fu | paste -sd' ' -) || true
+    hits=$(printf '%s\n' "$text" | grep -oiE "$bounded" \
+      | sed -E 's/^[^[:alnum:]]+//; s/[^[:alnum:]]+$//' \
+      | sort -fu | paste -sd' ' -) || true
     [ -z "$hits" ] && continue
     echo "vocab: $file:$line: $hits" >&2
     bad=1
@@ -74,13 +85,13 @@ staged() {
 if [ "${1:-}" = "--all" ]; then
   # `git grep` prefilters with the same expression, so only candidate lines
   # are judged one at a time — the whole tree costs one pass.
-  candidates=$(git grep -InwiE "$words" -- . || true)
+  candidates=$(git grep -IniE "$bounded" -- . || true)
   printf '%s\n' "$candidates" | judge || refuse
 else
   # Same shape for the staged diff: one `grep` prefilters the reconstructed
   # lines, so judging only ever sees candidates. The prefix `file:line:` is in
   # the grepped text and can only widen the candidate set, never narrow it —
   # `judge` looks at the text alone and drops whatever the path pulled in.
-  candidates=$(staged | grep -wiE "$words" || true)
+  candidates=$(staged | grep -iE "$bounded" || true)
   printf '%s\n' "$candidates" | judge || refuse
 fi

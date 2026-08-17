@@ -694,7 +694,7 @@ mod tests {
     /// The whole point of the identity record: after eviction, a file replaced
     /// at the same path must not be served through the old node.
     #[test]
-    fn a_replaced_entry_answers_stale_rather_than_serving_the_impostor() {
+    fn a_replaced_entry_answers_stale_instead_of_serving_the_impostor() {
         let scratch = Scratch::new("pin-identity");
         let namespace = namespace_grafting(scratch.path());
         let budget = DescriptorBudget::new(1);

@@ -1312,7 +1312,7 @@ mod tests {
     /// A block older than the mount's attr TTL is dropped instead of served:
     /// the mechanism the coherence bound rests on.
     #[test]
-    fn a_block_older_than_the_attr_ttl_is_dropped_rather_than_served() {
+    fn a_block_older_than_the_attr_ttl_is_dropped_not_served() {
         let engine = Readahead::new(DEFAULT_POOL_BYTES, Duration::from_millis(30));
         engine.activate(true);
         engine.advance(1, 10, 0, CHUNK_BYTES);

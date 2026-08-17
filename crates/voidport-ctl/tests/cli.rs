@@ -451,7 +451,7 @@ fn a_command_line_the_cli_can_reject_never_reaches_the_server() {
 }
 
 #[test]
-fn a_missing_server_is_reported_rather_than_hung() {
+fn a_missing_server_is_reported_not_hung() {
     let directory = TempDir::new("no-server");
     let output = std::process::Command::new(env!("CARGO_BIN_EXE_voidport-ctl"))
         .arg("--socket")

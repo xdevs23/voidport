@@ -1141,7 +1141,7 @@ fn an_untouched_mode_buffer_follows_the_server_and_a_touched_one_does_not() {
 }
 
 #[test]
-fn an_operation_needing_a_selection_says_so_instead_of_guessing() {
+fn an_operation_needing_a_selection_says_so() {
     let mut model = model();
     model.screen = Screen::Namespaces;
     assert!(press(&mut model, KeyCode::Char('d')).is_empty());

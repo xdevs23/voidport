@@ -697,7 +697,7 @@ fn a_metadata_operation_stays_responsive_under_saturated_prefetch() {
 /// gap would answer a read on the *new* session out of the *old* one's memory,
 /// and every byte here is checked against its offset.
 #[test]
-fn a_reconnect_drops_the_pool_and_the_reader_behaves_as_ruled() {
+fn a_reconnect_drops_the_pool_and_the_reader_behaves_as_decided() {
     if !preflight() {
         return;
     }

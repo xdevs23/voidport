@@ -320,7 +320,7 @@ mod tests {
     }
 
     #[test]
-    fn a_file_that_cannot_be_read_is_reported_rather_than_raised() {
+    fn a_file_that_cannot_be_read_is_reported_not_raised() {
         let scratch = Scratch::new("missing");
         let path = scratch.join("elsewhere.log");
 

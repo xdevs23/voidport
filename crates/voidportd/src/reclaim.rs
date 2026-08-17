@@ -69,7 +69,7 @@ const ARENAS: libc::c_int = 2;
 /// justifies a trim.
 const FLOOR: usize = 4096;
 
-/// How long the reclaimer waits after the first trim-worthy drop before
+/// How long the reclaimer waits after the first drop that qualifies for a trim before
 /// trimming.
 ///
 /// A guest drain is a cascade: 800 000 nodes fall to one over several seconds,
@@ -140,7 +140,7 @@ impl Ledger {
             .unwrap_or(0)
             .saturating_sub(count);
         let peak = self.peak.load(Ordering::Relaxed);
-        if !worth_trimming(live, peak) {
+        if !trim_due(live, peak) {
             return false;
         }
         // Whoever wins this owes the one trim, and resets the peak that decides
@@ -182,7 +182,7 @@ pub fn released(count: usize) {
 /// Whether a table that peaked at `peak` entries and now holds `live` has
 /// freed enough to justify a trim: half of the peak, and at least [`FLOOR`]
 /// entries of it.
-const fn worth_trimming(live: usize, peak: usize) -> bool {
+const fn trim_due(live: usize, peak: usize) -> bool {
     peak >= live.saturating_add(FLOOR) && live <= peak / 2
 }
 
@@ -288,31 +288,31 @@ mod tests {
     /// Churn is free: a table that keeps its working set never crosses the
     /// trigger, however much it looks up and forgets.
     #[test]
-    fn a_table_that_holds_its_working_set_is_never_worth_trimming() {
+    fn a_table_that_holds_its_working_set_is_never_trimmed() {
         for live in [1_000_000, 500_001, 100_000] {
-            assert!(!worth_trimming(live, live));
-            assert!(!worth_trimming(live, live + FLOOR - 1));
+            assert!(!trim_due(live, live));
+            assert!(!trim_due(live, live + FLOOR - 1));
         }
         // A million entries down to half a million plus one is not a halving.
-        assert!(!worth_trimming(500_001, 1_000_000));
+        assert!(!trim_due(500_001, 1_000_000));
     }
 
     /// A drain justifies a trim: half the peak gone, and enough of it to pay
     /// for the syscall.
     #[test]
-    fn a_drained_table_is_worth_trimming() {
-        assert!(worth_trimming(500_000, 1_000_000));
-        assert!(worth_trimming(1, 800_809));
-        assert!(worth_trimming(0, FLOOR));
+    fn a_drained_table_is_due_a_trim() {
+        assert!(trim_due(500_000, 1_000_000));
+        assert!(trim_due(1, 800_809));
+        assert!(trim_due(0, FLOOR));
     }
 
     /// Small tables are not: an empty one that never held [`FLOOR`] entries has
     /// under 6 MiB behind it at the measured per-entry cost.
     #[test]
-    fn a_small_table_is_not_worth_trimming_however_completely_it_drains() {
-        assert!(!worth_trimming(0, FLOOR - 1));
-        assert!(!worth_trimming(0, 0));
-        assert!(!worth_trimming(16, 32));
+    fn a_small_table_is_never_trimmed_however_completely_it_drains() {
+        assert!(!trim_due(0, FLOOR - 1));
+        assert!(!trim_due(0, 0));
+        assert!(!trim_due(16, 32));
     }
 
     /// A drain rings once, not once per forget: the peak follows the live count

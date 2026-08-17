@@ -376,7 +376,7 @@ mod tests {
     }
 
     #[test]
-    fn a_rate_over_a_zero_window_is_zero_rather_than_infinite() {
+    fn a_rate_over_a_zero_window_is_zero_not_infinite() {
         assert!((per_second(10.0, 0.0)).abs() < f64::EPSILON);
         assert!((per_second(10.0, 2.0) - 5.0).abs() < f64::EPSILON);
     }

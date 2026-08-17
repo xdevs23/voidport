@@ -280,7 +280,7 @@ fn a_walk_past_the_retired_defaults_succeeds_with_no_caps_configured() {
 }
 
 #[test]
-fn the_in_flight_cap_pauses_reads_rather_than_failing_requests() {
+fn the_in_flight_cap_pauses_reads_instead_of_failing_requests() {
     let fixture = Fixture::start_with("inflight", "[server.limits]\nmax_inflight = 1\n");
 
     // One session holds a lock the other will block on.
@@ -466,7 +466,7 @@ fn a_cap_the_server_would_have_to_raise_refuses_startup() {
 }
 
 #[test]
-fn readdirplus_surfaces_a_node_cap_failure_rather_than_truncating_the_listing() {
+fn readdirplus_surfaces_a_node_cap_failure_instead_of_truncating_the_listing() {
     // Room for the mount root and exactly one entry: `/tree` has two, so the
     // second one readdirplus admits hits the node cap.
     let fixture = Fixture::start_with("readdir-node-cap", "[server.limits]\nmax_nodes = 2\n");

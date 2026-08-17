@@ -271,7 +271,7 @@ mod tests {
     }
 
     #[test]
-    fn loading_a_missing_file_is_an_error_rather_than_an_invented_document() {
+    fn loading_a_missing_file_is_an_error_not_an_invented_document() {
         let error =
             load_document(Path::new("/nonexistent/voidport/state.toml")).expect_err("no such file");
         assert!(matches!(error, LoadError::Io { .. }));

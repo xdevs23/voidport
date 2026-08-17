@@ -403,7 +403,7 @@ fn removing_the_last_listener_leaves_a_control_socket_only_server() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn a_duplicate_add_is_refused_as_a_duplicate_rather_than_as_a_bind_failure() {
+fn a_duplicate_add_is_refused_as_a_duplicate_not_as_a_bind_failure() {
     let case = Case::tcp("listener-duplicate");
     let mut client = case.control();
     let path = case.directory.join("once.sock");

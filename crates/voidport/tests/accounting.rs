@@ -415,7 +415,7 @@ fn a_one_entry_at_a_time_walk_counts_every_entry_exactly_once() {
 /// deliberately: the listing is fetched, the host then grows every file, and
 /// the walk resumes after the timeout has passed.
 #[test]
-fn surplus_older_than_the_attr_ttl_is_refetched_rather_than_served_stale() {
+fn surplus_older_than_the_attr_ttl_is_refetched_not_served_stale() {
     let fixture = fixture("stale-surplus");
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()

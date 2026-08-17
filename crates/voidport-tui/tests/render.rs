@@ -353,7 +353,7 @@ fn the_logs_screen_shows_the_tail_it_holds_and_names_the_file() {
 
 /// The honest placeholder: a log file this process cannot read is *named*.
 #[test]
-fn a_log_file_that_cannot_be_read_is_named_rather_than_worked_around() {
+fn a_log_file_that_cannot_be_read_is_named_not_worked_around() {
     let mut model = model();
     with_server(&mut model);
     model.screen = Screen::Logs;
