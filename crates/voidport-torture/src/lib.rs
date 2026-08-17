@@ -40,7 +40,9 @@
 //! * [`resource`] — what the server is holding, sampled from `/proc` and the
 //!   control socket;
 //! * [`mounts`] — the mounts themselves, and the leak probes the teardown ends
-//!   with.
+//!   with;
+//! * [`server`] — the server process the run owns, for the class whose whole
+//!   operation is taking it away and proving everything came back.
 #![deny(missing_docs)]
 
 pub mod invariant;
@@ -48,11 +50,13 @@ pub mod metrics;
 pub mod mounts;
 pub mod resource;
 pub mod run;
+pub mod server;
 pub mod wire;
 pub mod workload;
 
-pub use invariant::{Ceilings, Violation};
+pub use invariant::{Ceilings, Outage, Violation};
 pub use metrics::Class;
-pub use resource::Probe;
+pub use resource::{Probe, ServerPid};
 pub use run::{Plan, Report, run};
+pub use server::{Restarts, Stop, Supervisor};
 pub use workload::Seed;

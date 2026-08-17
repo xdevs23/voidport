@@ -46,9 +46,34 @@
 //!    exercise is looking for.
 //! 7. **The shutdown is clean**, which is checked once at the end: no mount,
 //!    no loop device and no worker left behind.
+//! 8. **What the harness itself proves, it files.** Three classes assert
+//!    contracts no counter can see — a mount that healed after a restart, a
+//!    name that stopped resolving when its rule landed, a session that kept
+//!    serving after its listener was removed — and file a violation the moment
+//!    they see otherwise. Those go through [`Findings`], and the run collects
+//!    them beside the watcher's own.
+//!
+//! One deliberate exemption runs through all of this: the [`Outage`] windows in
+//! which the harness *itself* took the server away. Inside them the mounts are
+//! contractually allowed to stall and then answer `EIO`, so what those windows
+//! carry is not judged on throughput, latency or transport errnos.
+//!
+//! The exemption is scoped to the stretch of the run an outage actually
+//! covered, and to nothing else. A judged window is ten seconds of *clean*
+//! time, stitched together out of the stretches between the observations no
+//! outage overlapped; the stretches an outage did overlap contribute neither
+//! their counts nor their time. Standing a whole ten-second window down because
+//! an outage touched it would look equivalent and is not: at any restart
+//! cadence shorter than the window — which every heavy run has — every window
+//! is touched, and all three checks would be switched off for the whole run
+//! without a word. The per-class watchdog, the resource bounds and every
+//! worker-filed finding stay armed throughout, outage or not, which is where a
+//! restart that wedged something would show.
 
 use std::collections::VecDeque;
 use std::fmt;
+use std::sync::Mutex;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use serde::Serialize;
@@ -150,6 +175,38 @@ pub enum Violation {
         /// How many did not join.
         count: usize,
     },
+    /// A mount did not serve again after the server came back, which is the
+    /// reconnect contract's healing failing to happen.
+    MountUnhealed {
+        /// The mountpoint that never answered.
+        mountpoint: String,
+        /// How long it was given, in milliseconds.
+        patience_ms: u64,
+        /// What it answered instead.
+        detail: String,
+    },
+    /// The state file was not what the last persisted mutation left, after the
+    /// server was stopped without warning.
+    CrashInconsistent {
+        /// How the restart arm stopped the server: `graceful` or `hard`.
+        stop: &'static str,
+        /// What was found instead.
+        detail: String,
+    },
+    /// A class proved one of the contracts it drives wrong.
+    ///
+    /// This is where the assertions a counter cannot make are reported: a
+    /// hidden name that still resolved, an owner the ownership policy does not
+    /// allow, a session that stopped serving when its listener was removed, a
+    /// control mutation the server refused under load.
+    Contract {
+        /// The class that proved it.
+        class: Class,
+        /// What it did, and what it saw.
+        detail: String,
+        /// When it saw it.
+        elapsed_ms: u64,
+    },
 }
 
 impl fmt::Display for Violation {
@@ -222,7 +279,157 @@ impl fmt::Display for Violation {
             Self::UnfinishedWorkers { count } => {
                 write!(f, "{count} workers never finished")
             }
+            Self::MountUnhealed {
+                mountpoint,
+                patience_ms,
+                detail,
+            } => write!(
+                f,
+                "{mountpoint} did not serve again within {patience_ms} ms of the server \
+                 coming back: {detail}"
+            ),
+            Self::CrashInconsistent { stop, detail } => write!(
+                f,
+                "after a {stop} stop the state file was not what the last persisted \
+                 mutation left: {detail}"
+            ),
+            Self::Contract {
+                class,
+                detail,
+                elapsed_ms,
+            } => write!(
+                f,
+                "{}: {detail}, at {elapsed_ms} ms into the run",
+                class.name()
+            ),
         }
+    }
+}
+
+/// The windows in which the harness itself took the server away.
+///
+/// A restart is the one thing the load generator does that the server is
+/// *allowed* to answer badly for: the reconnect contract says a mount stalls
+/// for its window and then answers `EIO` until the server is back. Suppressing
+/// those windows by a timer would be a hole; this is not a timer. An outage
+/// opens when the restart arm is about to signal and closes only when it has
+/// proven every mount serving again, so what the checks stand down for is
+/// exactly the interval the harness knows it caused, and the healing that ends
+/// it is itself asserted.
+#[derive(Debug, Default)]
+pub struct Outage {
+    /// How many outages are open. More than one at a time cannot happen — the
+    /// restart class is a single worker — but the counter is what makes
+    /// "currently away" a question with an answer.
+    open: AtomicU64,
+    /// Every outage as the interval it occupied, `[open_ms, close_ms]`, with
+    /// the one still open ending at [`u64::MAX`].
+    ///
+    /// The intervals and not a single "last closed" mark, because what the
+    /// checks ask is whether an outage covered *this* stretch of the run, and
+    /// one mark can only answer that about the most recent one.
+    windows: Mutex<VecDeque<(u64, u64)>>,
+    /// How many outages have closed. A worker that took the server's answer
+    /// before the restart and compares it after reads this to know whether the
+    /// two answers are even about the same server lifetime.
+    generation: AtomicU64,
+}
+
+/// How many outage intervals are kept.
+///
+/// The checks only ever ask about the last few seconds of a run, so this is
+/// generous by orders of magnitude; it exists so an hours-long soak's record
+/// cannot grow with its restart count.
+const REMEMBERED_OUTAGES: usize = 64;
+
+impl Outage {
+    /// Opens an outage at `elapsed_ms`: from here the server is deliberately
+    /// unavailable.
+    pub fn open(&self, elapsed_ms: u64) {
+        let mut windows = self
+            .windows
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        if windows.len() == REMEMBERED_OUTAGES {
+            windows.pop_front();
+        }
+        windows.push_back((elapsed_ms, u64::MAX));
+        self.open.fetch_add(1, Ordering::SeqCst);
+    }
+
+    /// Closes it, `elapsed_ms` into the run.
+    pub fn close(&self, elapsed_ms: u64) {
+        if let Some(window) = self
+            .windows
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .back_mut()
+        {
+            window.1 = elapsed_ms;
+        }
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        self.open.fetch_sub(1, Ordering::SeqCst);
+    }
+
+    /// How many outages have closed so far.
+    #[must_use]
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::SeqCst)
+    }
+
+    /// Whether the server is deliberately away right now.
+    #[must_use]
+    pub fn open_now(&self) -> bool {
+        self.open.load(Ordering::SeqCst) > 0
+    }
+
+    /// Whether an outage covered any part of `[from_ms, to_ms]`.
+    #[must_use]
+    pub fn overlaps(&self, from_ms: u64, to_ms: u64) -> bool {
+        self.windows
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .iter()
+            .any(|(opened, closed)| *opened <= to_ms && *closed >= from_ms)
+    }
+}
+
+/// Where a worker files a violation it proved itself.
+///
+/// The watcher's invariants are read off counters, which is why they can be
+/// checked once a second from one thread. These cannot: only the worker that
+/// added a hidden rule knows the name it is about, and only the arm that
+/// restarted the server knows which mounts owed it a recovery. So a worker
+/// files what it proved, loudly and at once, and the run collects it beside
+/// everything the watcher found.
+#[derive(Debug, Default)]
+pub struct Findings {
+    filed: Mutex<Vec<Violation>>,
+}
+
+impl Findings {
+    /// Files one violation, and says so on stderr immediately.
+    pub fn file(&self, violation: Violation) {
+        eprintln!("!!! voidport-torture: {violation}");
+        self.filed
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
+            .push(violation);
+    }
+
+    /// Takes everything filed since the last call.
+    ///
+    /// Draining, not copying: the run logs each violation exactly once, and it
+    /// drains repeatedly while the load is on so a soak's log carries a finding
+    /// at the second it happened.
+    #[must_use]
+    pub fn drain(&self) -> Vec<Violation> {
+        std::mem::take(
+            &mut *self
+                .filed
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner()),
+        )
     }
 }
 
@@ -320,19 +527,80 @@ impl Ceilings {
     }
 }
 
+/// What a judged window holds: the counts of the stretches no outage covered.
+#[derive(Debug, Default)]
+struct WindowCounts {
+    /// Per class, the operations and their latencies.
+    classes: Vec<(Class, ClassSnapshot)>,
+    /// Per class, the transport errnos met.
+    errnos: Vec<(Class, [u64; TRANSPORT_ERRNOS.len()])>,
+    /// How much clean time they add up to.
+    clean_ms: u64,
+}
+
+impl WindowCounts {
+    /// Adds one clean stretch: what every class did in it, and how long it was.
+    fn add(
+        &mut self,
+        classes: &[(Class, ClassSnapshot)],
+        errnos: &[(Class, [u64; TRANSPORT_ERRNOS.len()])],
+        clean_ms: u64,
+    ) {
+        for (class, counts) in classes {
+            match self
+                .classes
+                .iter_mut()
+                .find(|(candidate, _)| candidate == class)
+            {
+                Some((_, held)) => *held = held.plus(counts),
+                None => self.classes.push((*class, *counts)),
+            }
+        }
+        for (class, met) in errnos {
+            match self
+                .errnos
+                .iter_mut()
+                .find(|(candidate, _)| candidate == class)
+            {
+                Some((_, held)) => {
+                    for (index, count) in met.iter().enumerate() {
+                        held[index] = held[index].saturating_add(*count);
+                    }
+                }
+                None => self.errnos.push((*class, *met)),
+            }
+        }
+        self.clean_ms = self.clean_ms.saturating_add(clean_ms);
+    }
+
+    /// Starts an empty window.
+    fn clear(&mut self) {
+        self.classes.clear();
+        self.errnos.clear();
+        self.clean_ms = 0;
+    }
+}
+
 /// The continuous check, driven one observation at a time.
 #[derive(Debug)]
 pub struct Watch {
     ceilings: Ceilings,
     classes: Vec<Class>,
-    /// The class counters as of the last window boundary.
-    window_start: Vec<(Class, ClassSnapshot)>,
-    /// The transport-errno counts as of the last window boundary.
-    window_errnos: Vec<(Class, [u64; TRANSPORT_ERRNOS.len()])>,
-    /// When that boundary was.
-    window_started_ms: u64,
-    /// The aggregate completion count over time, for the sliding window.
-    completions: VecDeque<(u64, u64)>,
+    /// The class counters as of the last observation.
+    last_counts: Vec<(Class, ClassSnapshot)>,
+    /// The transport-errno counts as of the same observation.
+    last_errnos: Vec<(Class, [u64; TRANSPORT_ERRNOS.len()])>,
+    /// When that observation was taken.
+    last_observed_ms: u64,
+    /// What the clean stretches since the last judged window have added up to.
+    window: WindowCounts,
+    /// Clean milliseconds since the run started, which is the clock the
+    /// window-based checks run on.
+    clean_ms: u64,
+    /// That clock as of the last time the aggregate completion count moved,
+    /// and the count it moved to.
+    progress_ms: u64,
+    completed: u64,
 }
 
 impl Watch {
@@ -342,10 +610,13 @@ impl Watch {
         Self {
             ceilings,
             classes: classes.to_vec(),
-            window_start: metrics.snapshot(),
-            window_errnos: transport_errnos(classes, metrics),
-            window_started_ms: 0,
-            completions: VecDeque::new(),
+            last_counts: metrics.snapshot(),
+            last_errnos: transport_errnos(classes, metrics),
+            last_observed_ms: 0,
+            window: WindowCounts::default(),
+            clean_ms: 0,
+            progress_ms: 0,
+            completed: 0,
         }
     }
 
@@ -354,91 +625,94 @@ impl Watch {
     /// Called once a second by the sampler; the window-based checks fire only
     /// when a window has actually elapsed, so the cost of observing is a few
     /// atomic loads.
+    ///
+    /// `outage` is what the restart arm has done to the server, and it is
+    /// scoped to the stretch it covered and no further. The stretch between two
+    /// observations that an outage overlapped contributes nothing — not its
+    /// latencies, not its transport errnos, not its time — and every other
+    /// stretch contributes exactly as it would in a run that never restarted.
+    /// A window is therefore ten seconds *of clean time*, stitched across as
+    /// many outages as it takes; the alternative, standing a whole window down
+    /// because an outage touched it, silently switches these three checks off
+    /// altogether at any cadence that restarts more often than the window is
+    /// long.
     #[must_use]
     pub fn observe(
         &mut self,
         elapsed: Duration,
         metrics: &Metrics,
         sample: &Sample,
+        outage: &Outage,
     ) -> Vec<Violation> {
         let elapsed_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
         let mut violations = Vec::new();
         let snapshot = metrics.snapshot();
+        let errnos = transport_errnos(&self.classes, metrics);
+        let created = created_names(&snapshot);
         let total: u64 = snapshot.iter().map(|(_, class)| class.completed).sum();
-        self.completions.push_back((elapsed_ms, total));
+
+        let clean = !outage.overlaps(self.last_observed_ms, elapsed_ms);
+        let stretch_ms = elapsed_ms.saturating_sub(self.last_observed_ms);
+        if clean {
+            self.clean_ms = self.clean_ms.saturating_add(stretch_ms);
+            self.window.add(
+                &deltas(&snapshot, &self.last_counts),
+                &errno_deltas(&errnos, &self.last_errnos),
+                stretch_ms,
+            );
+        }
+        if total > self.completed {
+            self.completed = total;
+            self.progress_ms = self.clean_ms;
+        }
+        self.last_counts = snapshot;
+        self.last_errnos = errnos;
+        self.last_observed_ms = elapsed_ms;
 
         if elapsed < self.ceilings.grace {
             // The mounts are still coming up and the working set is still
             // being written; nothing here is meaningful yet.
-            self.reset_window(elapsed_ms, snapshot, metrics);
+            self.window.clear();
             return violations;
         }
 
-        violations.extend(self.throughput(elapsed_ms, total));
+        violations.extend(self.throughput(elapsed_ms));
         violations.extend(self.progress(elapsed_ms, metrics));
-        violations.extend(self.resources(elapsed_ms, sample, created_names(&snapshot)));
-        if elapsed_ms.saturating_sub(self.window_started_ms)
+        violations.extend(self.resources(elapsed_ms, sample, created));
+        if self.window.clean_ms
             >= u64::try_from(self.ceilings.window.as_millis()).unwrap_or(u64::MAX)
         {
-            violations.extend(self.latencies(elapsed_ms, &snapshot));
-            violations.extend(self.transport(elapsed_ms, metrics));
-            self.reset_window(elapsed_ms, snapshot, metrics);
+            violations.extend(self.latencies(elapsed_ms));
+            violations.extend(self.transport(elapsed_ms));
+            self.window.clear();
         }
         violations
     }
 
-    /// Starts a new window from the counts as they stand.
-    fn reset_window(
-        &mut self,
-        elapsed_ms: u64,
-        snapshot: Vec<(Class, ClassSnapshot)>,
-        metrics: &Metrics,
-    ) {
-        self.window_start = snapshot;
-        self.window_errnos = transport_errnos(&self.classes, metrics);
-        self.window_started_ms = elapsed_ms;
-    }
-
     /// Invariant 1: something completed over the trailing window.
     ///
-    /// The observation kept at the front is the *newest* one that is already a
-    /// whole window old — never merely the newest one older than the window —
-    /// because the sample that opens the window is the one the count is
-    /// compared against, and discarding it would make a gap in the
-    /// observations look like a healthy window.
-    fn throughput(&mut self, elapsed_ms: u64, total: u64) -> Option<Violation> {
+    /// Measured on the clean clock, so the window is ten seconds in which the
+    /// server was there to answer. A completion is progress whenever it
+    /// happened, outage or not — work completing is work completing — and what
+    /// is forbidden is a whole clean window in which nothing did.
+    fn throughput(&self, elapsed_ms: u64) -> Option<Violation> {
         let window_ms = u64::try_from(self.ceilings.window.as_millis()).unwrap_or(u64::MAX);
-        while self
-            .completions
-            .get(1)
-            .is_some_and(|(at, _)| elapsed_ms.saturating_sub(*at) >= window_ms)
-        {
-            self.completions.pop_front();
-        }
-        let (at, earlier) = *self.completions.front()?;
-        if elapsed_ms.saturating_sub(at) < window_ms || total > earlier {
-            return None;
-        }
-        Some(Violation::ThroughputCollapse {
-            window_ms,
-            elapsed_ms,
-        })
+        (self.clean_ms.saturating_sub(self.progress_ms) >= window_ms).then_some(
+            Violation::ThroughputCollapse {
+                window_ms,
+                elapsed_ms,
+            },
+        )
     }
 
     /// Invariant 2: every class's p99 is under its ceiling.
-    fn latencies(&self, elapsed_ms: u64, snapshot: &[(Class, ClassSnapshot)]) -> Vec<Violation> {
+    fn latencies(&self, elapsed_ms: u64) -> Vec<Violation> {
         let mut violations = Vec::new();
-        for (class, counts) in snapshot {
+        for (class, counts) in &self.window.classes {
             if !self.classes.contains(class) {
                 continue;
             }
-            let started = self
-                .window_start
-                .iter()
-                .find(|(candidate, _)| candidate == class)
-                .map(|(_, counts)| *counts)
-                .unwrap_or_default();
-            let Some(p99) = counts.since(&started).quantile(0.99) else {
+            let Some(p99) = counts.quantile(0.99) else {
                 continue;
             };
             let ceiling = class.latency_ceiling();
@@ -520,18 +794,16 @@ impl Watch {
     /// a mount is unmounted is that operation working. Every other class runs
     /// over a mount that stays up for the whole run, so a transport errno there
     /// means what this check is looking for.
-    fn transport(&self, elapsed_ms: u64, metrics: &Metrics) -> Vec<Violation> {
-        let now = transport_errnos(&self.classes, metrics);
+    fn transport(&self, elapsed_ms: u64) -> Vec<Violation> {
         let mut violations = Vec::new();
-        for (class, counts) in now.iter().filter(|(class, _)| *class != Class::Remount) {
-            let before = self
-                .window_errnos
-                .iter()
-                .find(|(candidate, _)| candidate == class)
-                .map(|(_, counts)| *counts)
-                .unwrap_or_default();
+        for (class, counts) in self
+            .window
+            .errnos
+            .iter()
+            .filter(|(class, _)| *class != Class::Remount)
+        {
             for (index, (_, name)) in TRANSPORT_ERRNOS.iter().enumerate() {
-                let count = counts[index].saturating_sub(before[index]);
+                let count = counts[index];
                 if count > 0 {
                     violations.push(Violation::Transport {
                         class: *class,
@@ -546,14 +818,54 @@ impl Watch {
     }
 }
 
+/// What every class did between two observations.
+fn deltas(
+    now: &[(Class, ClassSnapshot)],
+    before: &[(Class, ClassSnapshot)],
+) -> Vec<(Class, ClassSnapshot)> {
+    now.iter()
+        .map(|(class, counts)| {
+            let earlier = before
+                .iter()
+                .find(|(candidate, _)| candidate == class)
+                .map_or_else(ClassSnapshot::default, |(_, counts)| *counts);
+            (*class, counts.since(&earlier))
+        })
+        .collect()
+}
+
+/// The same for the transport errnos.
+fn errno_deltas(
+    now: &[(Class, [u64; TRANSPORT_ERRNOS.len()])],
+    before: &[(Class, [u64; TRANSPORT_ERRNOS.len()])],
+) -> Vec<(Class, [u64; TRANSPORT_ERRNOS.len()])> {
+    now.iter()
+        .map(|(class, counts)| {
+            let earlier = before
+                .iter()
+                .find(|(candidate, _)| candidate == class)
+                .map_or([0; TRANSPORT_ERRNOS.len()], |(_, counts)| *counts);
+            (
+                *class,
+                std::array::from_fn(|index| counts[index].saturating_sub(earlier[index])),
+            )
+        })
+        .collect()
+}
+
 /// How many names the run has created so far.
 ///
-/// Only the two classes that make new names count: everything else works over
+/// Only the classes that make new names count: everything else works over
 /// names the working set already holds, whose nodes the base bound covers.
 fn created_names(snapshot: &[(Class, ClassSnapshot)]) -> u64 {
     snapshot
         .iter()
-        .filter(|(class, _)| matches!(class, Class::Churn | Class::Rename))
+        .filter(|(class, _)| {
+            matches!(
+                class,
+                Class::Churn | Class::Rename | Class::Special | Class::Rules
+            )
+        })
         .map(|(_, counts)| counts.completed)
         .sum()
 }
@@ -641,7 +953,12 @@ mod tests {
         for second in 0..15 {
             assert!(
                 watch
-                    .observe(Duration::from_secs(second), &metrics, &sample())
+                    .observe(
+                        Duration::from_secs(second),
+                        &metrics,
+                        &sample(),
+                        &Outage::default()
+                    )
                     .is_empty(),
                 "second {second} judged the warmup"
             );
@@ -662,11 +979,21 @@ mod tests {
                 None,
                 Duration::from_secs(second),
             );
-            let found = watch.observe(Duration::from_secs(second), &metrics, &sample());
+            let found = watch.observe(
+                Duration::from_secs(second),
+                &metrics,
+                &sample(),
+                &Outage::default(),
+            );
             assert!(found.is_empty(), "second {second}: {found:?}");
         }
         // And then stops. The aggregate window notices first...
-        let found = watch.observe(Duration::from_secs(60), &metrics, &sample());
+        let found = watch.observe(
+            Duration::from_secs(60),
+            &metrics,
+            &sample(),
+            &Outage::default(),
+        );
         assert!(
             found
                 .iter()
@@ -674,7 +1001,12 @@ mod tests {
             "{found:?}"
         );
         // ...and the class watchdog notices once its own patience runs out.
-        let found = watch.observe(Duration::from_secs(200), &metrics, &sample());
+        let found = watch.observe(
+            Duration::from_secs(200),
+            &metrics,
+            &sample(),
+            &Outage::default(),
+        );
         assert!(
             found
                 .iter()
@@ -692,14 +1024,24 @@ mod tests {
         let walk = metrics.class(Class::Walk);
         for second in 0..16 {
             walk.record(Duration::from_millis(1), None, Duration::from_secs(second));
-            let _ = watch.observe(Duration::from_secs(second), &metrics, &sample());
+            let _ = watch.observe(
+                Duration::from_secs(second),
+                &metrics,
+                &sample(),
+                &Outage::default(),
+            );
         }
         // Walk's ceiling is two seconds; a window of ten-second operations is
         // over it however generous it is.
         for _ in 0..100 {
             walk.record(Duration::from_secs(10), None, Duration::from_secs(20));
         }
-        let found = watch.observe(Duration::from_secs(30), &metrics, &sample());
+        let found = watch.observe(
+            Duration::from_secs(30),
+            &metrics,
+            &sample(),
+            &Outage::default(),
+        );
         assert!(
             found.iter().any(|violation| matches!(
                 violation,
@@ -731,7 +1073,12 @@ mod tests {
             node_descriptors: Some(1_000),
             node_descriptor_budget: Some(100),
         };
-        let found = watch.observe(Duration::from_secs(20), &metrics, &leaking);
+        let found = watch.observe(
+            Duration::from_secs(20),
+            &metrics,
+            &leaking,
+            &Outage::default(),
+        );
         let quantities: Vec<&str> = found
             .iter()
             .filter_map(|violation| match violation {
@@ -795,7 +1142,7 @@ mod tests {
         };
         assert!(
             watch
-                .observe(Duration::from_secs(20), &metrics, &full)
+                .observe(Duration::from_secs(20), &metrics, &full, &Outage::default())
                 .is_empty(),
             "a cache filled exactly to its budget is the cache working"
         );
@@ -804,7 +1151,7 @@ mod tests {
             node_descriptors: Some(65),
             ..full
         };
-        let found = watch.observe(Duration::from_secs(21), &metrics, &over);
+        let found = watch.observe(Duration::from_secs(21), &metrics, &over, &Outage::default());
         assert!(
             found.iter().any(|violation| matches!(
                 violation,
@@ -831,18 +1178,33 @@ mod tests {
                 Some(2),
                 Duration::from_secs(second),
             );
-            let _ = watch.observe(Duration::from_secs(second), &metrics, &sample());
+            let _ = watch.observe(
+                Duration::from_secs(second),
+                &metrics,
+                &sample(),
+                &Outage::default(),
+            );
         }
         assert!(
             watch
-                .observe(Duration::from_secs(30), &metrics, &sample())
+                .observe(
+                    Duration::from_secs(30),
+                    &metrics,
+                    &sample(),
+                    &Outage::default()
+                )
                 .iter()
                 .all(|violation| !matches!(violation, Violation::Transport { .. })),
             "a racing ENOENT is not a violation"
         );
 
         churn.record(Duration::from_millis(1), Some(5), Duration::from_secs(40));
-        let found = watch.observe(Duration::from_secs(45), &metrics, &sample());
+        let found = watch.observe(
+            Duration::from_secs(45),
+            &metrics,
+            &sample(),
+            &Outage::default(),
+        );
         assert!(
             found.iter().any(|violation| matches!(
                 violation,
@@ -897,6 +1259,166 @@ mod tests {
         assert_eq!(quantities, ["sessions", "nodes", "handles", "fds"]);
     }
 
+    /// An outage is remembered as the interval it covered, so the record
+    /// answers about any stretch of the run and not only about the last one.
+    #[test]
+    fn an_outage_is_remembered_as_the_interval_it_covered() {
+        let outage = Outage::default();
+        outage.open(1_000);
+        outage.close(2_000);
+        outage.open(9_000);
+        outage.close(9_500);
+        assert_eq!(outage.generation(), 2);
+
+        assert!(outage.overlaps(1_500, 1_800), "inside the first");
+        assert!(outage.overlaps(0, 20_000), "spanning both");
+        assert!(outage.overlaps(9_400, 12_000), "half of the second");
+        assert!(
+            !outage.overlaps(3_000, 8_000),
+            "between them, which a record of the last close alone could not say"
+        );
+        assert!(!outage.overlaps(9_600, 10_000), "after both");
+
+        // One that has not closed covers everything from where it opened.
+        outage.open(11_000);
+        assert!(outage.open_now());
+        assert!(outage.overlaps(50_000, 60_000));
+    }
+
+    /// The stretch of a run an outage covered is not judged on the three things
+    /// the reconnect contract permits there — and the clean stretches around it
+    /// are, in the same ten-second window.
+    ///
+    /// The window is ten seconds of clean time, so it closes whatever the
+    /// restart cadence is; what the outage costs it is the stretch the outage
+    /// covered, and the count in the violation is what proves the two were told
+    /// apart.
+    #[test]
+    fn only_the_stretch_an_outage_covered_is_exempt() {
+        let metrics = Metrics::default();
+        let outage = Outage::default();
+        let mut watch = Watch::new(ceilings(), &[Class::Churn], &metrics);
+        let churn = metrics.class(Class::Churn);
+        for second in 0..16 {
+            churn.record(Duration::from_millis(1), None, Duration::from_secs(second));
+            let _ = watch.observe(Duration::from_secs(second), &metrics, &sample(), &outage);
+        }
+
+        // The server is taken away and comes back between two observations,
+        // and what the mounts answered while it was gone is the reconnect
+        // contract's: a stalled operation, ending in EIO.
+        outage.open(16_200);
+        churn.record(
+            Duration::from_secs(30),
+            Some(5),
+            Duration::from_millis(16_500),
+        );
+        outage.close(16_800);
+        assert_eq!(outage.generation(), 1);
+
+        // Nothing is judged on that stretch, and the clean seconds around it
+        // keep filling the same window.
+        for second in 17..=25 {
+            let found = watch.observe(Duration::from_secs(second), &metrics, &sample(), &outage);
+            assert!(found.is_empty(), "second {second}: {found:?}");
+        }
+
+        // One clean second later the window is ten seconds of clean time, and
+        // it is judged. One EIO is reported, not two: the one the outage
+        // carried never entered the window.
+        churn.record(Duration::from_secs(30), Some(5), Duration::from_secs(26));
+        let found = watch.observe(Duration::from_secs(26), &metrics, &sample(), &outage);
+        assert!(
+            found.iter().any(|violation| matches!(
+                violation,
+                Violation::Transport {
+                    class: Class::Churn,
+                    errno: "EIO",
+                    count: 1,
+                    ..
+                }
+            )),
+            "{found:?}"
+        );
+        assert!(
+            found
+                .iter()
+                .any(|violation| matches!(violation, Violation::Latency { .. })),
+            "{found:?}"
+        );
+    }
+
+    /// A run that restarts more often than a window is long is still judged.
+    ///
+    /// This is the shape the whole-window exemption switched off in silence: at
+    /// a heavy intensity every ten-second stretch of the run has an outage in
+    /// it, so a check that stood a whole window down for one would stand down
+    /// for the entire run and report nothing whatever the server did.
+    #[test]
+    fn a_run_that_restarts_faster_than_its_window_is_still_judged() {
+        let metrics = Metrics::default();
+        let outage = Outage::default();
+        let mut watch = Watch::new(ceilings(), &[Class::Churn], &metrics);
+        let churn = metrics.class(Class::Churn);
+
+        let mut found = Vec::new();
+        for second in 0..60u64 {
+            // A restart every five seconds, each away for well under a second.
+            if second.is_multiple_of(5) {
+                outage.open(second * 1_000 + 100);
+                outage.close(second * 1_000 + 400);
+            }
+            churn.record(Duration::from_secs(30), None, Duration::from_secs(second));
+            found.extend(watch.observe(Duration::from_secs(second), &metrics, &sample(), &outage));
+        }
+        assert!(
+            found
+                .iter()
+                .any(|violation| matches!(violation, Violation::Latency { .. })),
+            "a run whose every window holds an outage is judged on its clean \
+             seconds: {found:?}"
+        );
+    }
+
+    /// A class that has gone quiet is reported whatever the restart arm has
+    /// been doing: an outage lasts seconds and the watchdog waits minutes, so
+    /// exempting the watchdog would exempt a real deadlock.
+    #[test]
+    fn the_progress_watchdog_is_not_exempted_by_an_outage() {
+        let metrics = Metrics::default();
+        let outage = Outage::default();
+        let mut watch = Watch::new(ceilings(), &[Class::Walk], &metrics);
+        metrics
+            .class(Class::Walk)
+            .record(Duration::from_millis(1), None, Duration::from_secs(1));
+        outage.open(1_000);
+        let found = watch.observe(Duration::from_secs(200), &metrics, &sample(), &outage);
+        assert!(
+            found
+                .iter()
+                .any(|violation| matches!(violation, Violation::NoProgress { .. })),
+            "{found:?}"
+        );
+    }
+
+    /// What a worker files is collected, once, in the order it was filed.
+    #[test]
+    fn findings_are_drained_and_not_repeated() {
+        let findings = Findings::default();
+        assert!(findings.drain().is_empty());
+
+        findings.file(Violation::UnfinishedWorkers { count: 1 });
+        findings.file(Violation::UnfinishedWorkers { count: 2 });
+        assert_eq!(
+            findings.drain(),
+            [
+                Violation::UnfinishedWorkers { count: 1 },
+                Violation::UnfinishedWorkers { count: 2 }
+            ]
+        );
+        assert!(findings.drain().is_empty());
+    }
+
     /// The cycling class takes transports down for a living, so the kernel
     /// telling it the channel is gone is not a defect.
     #[test]
@@ -906,12 +1428,22 @@ mod tests {
         let remount = metrics.class(Class::Remount);
         for second in 0..16 {
             remount.record(Duration::from_millis(1), None, Duration::from_secs(second));
-            let _ = watch.observe(Duration::from_secs(second), &metrics, &sample());
+            let _ = watch.observe(
+                Duration::from_secs(second),
+                &metrics,
+                &sample(),
+                &Outage::default(),
+            );
         }
         remount.record(Duration::from_millis(1), Some(19), Duration::from_secs(20));
         assert!(
             watch
-                .observe(Duration::from_secs(30), &metrics, &sample())
+                .observe(
+                    Duration::from_secs(30),
+                    &metrics,
+                    &sample(),
+                    &Outage::default()
+                )
                 .iter()
                 .all(|violation| !matches!(violation, Violation::Transport { .. })),
             "an unmounted channel is not a broken one"

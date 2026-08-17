@@ -27,8 +27,49 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU32, Ordering};
 
 use voidport_control::{Client, Reply, Request, Response};
+
+/// The server process the sampler watches.
+///
+/// A run that restarts the server watches a **different process** after every
+/// restart, and the sampler runs on its own thread throughout, so the pid is a
+/// shared cell instead of a number copied into the probe once. Zero means there
+/// is no server right now: a sample taken during a restart reports nothing,
+/// which is honest, where a stale pid would report either a corpse or whatever
+/// process reused the number.
+#[derive(Clone, Debug, Default)]
+pub struct ServerPid(Arc<AtomicU32>);
+
+impl ServerPid {
+    /// A cell naming a process that is running now.
+    #[must_use]
+    pub fn new(pid: u32) -> Self {
+        Self(Arc::new(AtomicU32::new(pid)))
+    }
+
+    /// Names the process the sampler is to watch from now on.
+    pub fn set(&self, pid: u32) {
+        self.0.store(pid, Ordering::Relaxed);
+    }
+
+    /// Says that no server is running: the process quantities stop being
+    /// sampled until [`Self::set`] names the next one.
+    pub fn clear(&self) {
+        self.0.store(0, Ordering::Relaxed);
+    }
+
+    /// The process to watch, or `None` while there is none.
+    #[must_use]
+    pub fn get(&self) -> Option<u32> {
+        match self.0.load(Ordering::Relaxed) {
+            0 => None,
+            pid => Some(pid),
+        }
+    }
+}
 
 /// One sample of what the server holds.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, serde::Serialize)]
@@ -59,7 +100,7 @@ pub struct Sample {
 pub struct Probe {
     /// The server process, if the harness was told which it is. Absent means
     /// the process-level quantities are simply not sampled.
-    pub pid: Option<u32>,
+    pub pid: Option<ServerPid>,
     /// The server's control socket, for the session view.
     pub control_socket: Option<PathBuf>,
 }
@@ -68,7 +109,11 @@ impl Probe {
     /// Takes one sample.
     #[must_use]
     pub fn sample(&self, elapsed_ms: u64) -> Sample {
-        let process = self.pid.map(|pid| PathBuf::from(format!("/proc/{pid}")));
+        let process = self
+            .pid
+            .as_ref()
+            .and_then(ServerPid::get)
+            .map(|pid| PathBuf::from(format!("/proc/{pid}")));
         let (sessions, nodes, handles) = self.sessions().unwrap_or((None, None, None));
         let (node_descriptors, node_descriptor_budget) =
             self.descriptor_cache().unwrap_or((None, None));
@@ -153,7 +198,7 @@ mod tests {
     #[test]
     fn a_probe_reads_the_process_it_is_pointed_at() {
         let probe = Probe {
-            pid: Some(std::process::id()),
+            pid: Some(ServerPid::new(std::process::id())),
             control_socket: None,
         };
         let sample = probe.sample(1234);
@@ -177,5 +222,28 @@ mod tests {
         assert_eq!(sample, Sample::default());
         assert_eq!(descriptors(Path::new("/proc/nonexistent-pid")), None);
         assert_eq!(status(Path::new("/proc/nonexistent-pid"), "VmRSS:"), None);
+    }
+
+    /// A restart replaces the process the sampler watches, and the gap between
+    /// the two is sampled as nothing at all.
+    #[test]
+    fn a_cleared_pid_samples_no_process_quantities() {
+        let pid = ServerPid::new(std::process::id());
+        let probe = Probe {
+            pid: Some(pid.clone()),
+            control_socket: None,
+        };
+        assert!(probe.sample(0).fds.is_some());
+
+        pid.clear();
+        assert_eq!(pid.get(), None);
+        let during = probe.sample(1);
+        assert_eq!(
+            (during.fds, during.threads, during.rss_kib),
+            (None, None, None)
+        );
+
+        pid.set(std::process::id());
+        assert!(probe.sample(2).fds.is_some());
     }
 }

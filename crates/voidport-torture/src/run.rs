@@ -24,10 +24,11 @@ use std::time::{Duration, Instant};
 
 use serde::Serialize;
 
-use crate::invariant::{Ceilings, Violation, Watch};
+use crate::invariant::{Ceilings, Findings, Outage, Violation, Watch};
 use crate::metrics::{Class, ClassSnapshot, Metrics};
 use crate::mounts::{Fleet, TortureMount, loop_devices_under, mounted_under};
 use crate::resource::{Probe, Sample};
+use crate::server::{Restarts, Supervisor};
 use crate::workload::{self, Seed, Site, State};
 
 /// How often the watcher samples.
@@ -49,11 +50,36 @@ const SETTLE_PATIENCE: Duration = Duration::from_secs(20);
 /// path.
 const FAILURE_PAUSE: Duration = Duration::from_millis(1);
 
+/// How long the restart arm leaves between restarts at intensity one.
+///
+/// Divided by the intensity like every other class's rate, and floored, so a
+/// heavy run restarts the server every few seconds and a light one every
+/// minute.
+const RESTART_CADENCE: Duration = Duration::from_secs(60);
+
+/// The most the intensity divides that cadence by.
+const RESTART_SCALING: u32 = 6;
+
+/// The shortest cadence any run restarts at.
+const RESTART_FLOOR: Duration = Duration::from_secs(5);
+
+/// How much of a run may pass before its first restart.
+///
+/// A short run — the suite's smoke variant — would otherwise never reach its
+/// first restart at all, so the cadence is also capped at a quarter of the
+/// duration: every run that drives the class restarts several times.
+const RESTART_SHARE: u32 = 4;
+
 /// What to run.
 #[derive(Clone, Debug)]
 pub struct Plan {
-    /// The voidport URL every mount is made from.
-    pub url: String,
+    /// The voidport URLs the mounts are made from, dealt out in order.
+    ///
+    /// More than one puts the run's mounts on more than one transport at once,
+    /// against the same server: the same load, arriving over a unix socket and
+    /// over vsock, is a different thing to serve than the same load arriving
+    /// twice over one.
+    pub urls: Vec<String>,
     /// Where mountpoints and the run's own files live. Created if absent.
     pub work_dir: PathBuf,
     /// How long to keep the load on.
@@ -70,6 +96,20 @@ pub struct Plan {
     pub log: Option<PathBuf>,
     /// How large the working set is.
     pub seed: Seed,
+    /// The server the run owns, for the class whose operation is a restart.
+    ///
+    /// It must already be **started**, and started before anything was mounted:
+    /// see [`Supervisor`] for the kernel behaviour that makes that ordering
+    /// load-bearing. A plan without one cannot drive the restart class.
+    pub server: Option<Arc<Supervisor>>,
+}
+
+/// How often a run of this shape restarts the server.
+fn restart_interval(intensity: u64, duration: Duration) -> Duration {
+    let scaling = u32::try_from(intensity.clamp(1, u64::from(RESTART_SCALING))).unwrap_or(1);
+    (RESTART_CADENCE / scaling)
+        .min(duration / RESTART_SHARE)
+        .max(RESTART_FLOOR)
 }
 
 /// One class's account of the run.
@@ -114,6 +154,8 @@ pub struct Report {
     pub violations: Vec<Violation>,
     /// The bounds the run was held to, as computed for its shape.
     pub bounds: Bounds,
+    /// How many times the run took the server away, and how.
+    pub restarts: Restarts,
 }
 
 /// The bounds a run was held to, as reported.
@@ -176,6 +218,11 @@ impl Report {
         }
         let _ = writeln!(
             out,
+            "restarts: {} graceful, {} hard, {} of the hard ones inside a control mutation",
+            self.restarts.graceful, self.restarts.hard, self.restarts.inside_mutation
+        );
+        let _ = writeln!(
+            out,
             "bounds: fds<={} node_fds<={} threads<={} nodes<={} handles<={} rss<={} KiB",
             self.bounds.fds,
             self.bounds.node_descriptors,
@@ -231,7 +278,7 @@ impl Report {
 enum LogLine<'a> {
     /// The run's shape, written first.
     Plan {
-        url: &'a str,
+        urls: &'a [String],
         duration_ms: u64,
         intensity: u64,
         mounts: u64,
@@ -298,17 +345,35 @@ pub fn run(plan: &Plan) -> anyhow::Result<Report> {
     anyhow::ensure!(plan.intensity > 0, "intensity must be at least one worker");
     anyhow::ensure!(plan.mounts > 0, "a run needs at least one mount");
     anyhow::ensure!(!plan.classes.is_empty(), "a run needs at least one class");
+    anyhow::ensure!(
+        !plan.classes.contains(&Class::Restart) || plan.server.is_some(),
+        "the restart class restarts a server the run owns; start one for the plan"
+    );
+    anyhow::ensure!(
+        !plan
+            .classes
+            .iter()
+            .any(|class| matches!(class, Class::Rules | Class::Listeners | Class::Restart))
+            || plan.probe.control_socket.is_some(),
+        "the rules and listeners classes mutate the server's own state, and the \
+         restart class kills it inside a mutation of its own; \
+         give the plan its control socket"
+    );
 
     std::fs::create_dir_all(&plan.work_dir)?;
     let log = Log::open(plan.log.as_ref())?;
-    let fleet = Fleet::new(&plan.url, &plan.work_dir)?;
+    let fleet = Fleet::new(&plan.urls, &plan.work_dir)?;
 
     let mounts: Vec<TortureMount> = (0..plan.mounts)
-        .map(|index| fleet.mount(&format!("base-{index}")))
+        .map(|index| fleet.mount(&format!("base-{index}"), fleet.url(index)))
         .collect::<anyhow::Result<_>>()?;
     plan.seed.build(mounts[0].root())?;
 
-    let workers = plan.intensity * plan.classes.len() as u64;
+    let workers: u64 = plan
+        .classes
+        .iter()
+        .map(|class| class.workers(plan.intensity))
+        .sum();
     let baseline = plan.probe.sample(0);
     let ceilings = Ceilings::for_run(&baseline, plan.seed.entries(), plan.mounts, workers);
     let bounds = Bounds {
@@ -320,7 +385,7 @@ pub fn run(plan: &Plan) -> anyhow::Result<Report> {
         rss_kib: ceilings.rss_kib,
     };
     log.write(&LogLine::Plan {
-        url: &plan.url,
+        urls: &plan.urls,
         duration_ms: u64::try_from(plan.duration.as_millis()).unwrap_or(u64::MAX),
         intensity: plan.intensity,
         mounts: plan.mounts,
@@ -333,23 +398,35 @@ pub fn run(plan: &Plan) -> anyhow::Result<Report> {
     let finished = Arc::new(AtomicUsize::new(0));
     let violations: Arc<Mutex<Vec<Violation>>> = Arc::new(Mutex::new(Vec::new()));
     let samples: Arc<Mutex<Vec<Sample>>> = Arc::new(Mutex::new(Vec::new()));
+    let findings = Findings::default();
+    let outage = Outage::default();
+    let restart_interval = restart_interval(plan.intensity, plan.duration);
     let started = Instant::now();
 
     std::thread::scope(|scope| {
         for class in &plan.classes {
-            for index in 0..plan.intensity {
+            for index in 0..class.workers(plan.intensity) {
                 let (metrics, stop, finished) = (
                     Arc::clone(&metrics),
                     Arc::clone(&stop),
                     Arc::clone(&finished),
                 );
                 let (class, mounts, fleet, seed) = (*class, &mounts, &fleet, plan.seed);
+                let (server, control) =
+                    (plan.server.as_deref(), plan.probe.control_socket.as_deref());
+                let (findings, outage) = (&findings, &outage);
                 scope.spawn(move || {
                     let site = Site {
                         mounts,
                         fleet,
                         index,
                         seed,
+                        server,
+                        control,
+                        findings,
+                        outage,
+                        started,
+                        restart_interval,
                     };
                     let mut state = State::for_class(class);
                     while !stop.load(Ordering::Relaxed) {
@@ -377,6 +454,7 @@ pub fn run(plan: &Plan) -> anyhow::Result<Report> {
             let (metrics, stop) = (Arc::clone(&metrics), Arc::clone(&stop));
             let (violations, samples) = (Arc::clone(&violations), Arc::clone(&samples));
             let (probe, classes, log) = (plan.probe.clone(), plan.classes.clone(), &log);
+            let (findings, outage) = (&findings, &outage);
             scope.spawn(move || {
                 let mut watch = Watch::new(ceilings, &classes, &metrics);
                 while !stop.load(Ordering::Relaxed) {
@@ -389,10 +467,20 @@ pub fn run(plan: &Plan) -> anyhow::Result<Report> {
                         .lock()
                         .unwrap_or_else(|poison| poison.into_inner())
                         .push(sample);
-                    for violation in watch.observe(elapsed, &metrics, &sample) {
-                        // Loud, immediately, and on stderr: a run of hours must
-                        // report a defect when it happens, not when it ends.
-                        eprintln!("!!! voidport-torture: {violation}");
+                    // The watcher's own findings and the workers' own, in one
+                    // place: a worker has already said its piece on stderr, and
+                    // this is where both kinds reach the log and the report.
+                    let found = watch
+                        .observe(elapsed, &metrics, &sample, outage)
+                        .into_iter()
+                        .inspect(|violation| {
+                            // Loud, immediately, and on stderr: a run of hours
+                            // must report a defect when it happens, not when it
+                            // ends.
+                            eprintln!("!!! voidport-torture: {violation}");
+                        })
+                        .chain(findings.drain());
+                    for violation in found {
                         log.write(&LogLine::Violation(violation.clone()));
                         violations
                             .lock()
@@ -437,6 +525,12 @@ pub fn run(plan: &Plan) -> anyhow::Result<Report> {
         .lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .clone();
+    // Anything a worker filed after the watcher's last pass — the last restart's
+    // healing among them — belongs in the report as much as the rest.
+    for violation in findings.drain() {
+        log.write(&LogLine::Violation(violation.clone()));
+        violations.push(violation);
+    }
     for path in mounted_under(&plan.work_dir) {
         let violation = Violation::LeakedMount { path };
         eprintln!("!!! voidport-torture: {violation}");
@@ -457,6 +551,11 @@ pub fn run(plan: &Plan) -> anyhow::Result<Report> {
         violations.push(violation);
     }
 
+    let restarts = plan
+        .server
+        .as_ref()
+        .map(|server| server.restarts())
+        .unwrap_or_default();
     let report = Report {
         duration_ms: u64::try_from(ran.as_millis()).unwrap_or(u64::MAX),
         intensity: plan.intensity,
@@ -464,7 +563,7 @@ pub fn run(plan: &Plan) -> anyhow::Result<Report> {
         classes: plan
             .classes
             .iter()
-            .map(|class| class_report(*class, plan.intensity, &metrics, ran))
+            .map(|class| class_report(*class, class.workers(plan.intensity), &metrics, ran))
             .collect(),
         samples: samples
             .lock()
@@ -472,6 +571,7 @@ pub fn run(plan: &Plan) -> anyhow::Result<Report> {
             .clone(),
         violations,
         bounds,
+        restarts,
     };
     log.write(&LogLine::Report(&report));
     Ok(report)
@@ -541,4 +641,60 @@ fn max_bucket_ms(counts: &ClassSnapshot) -> u64 {
         .iter()
         .rposition(|count| *count > 0)
         .map_or(0, |index| (1u64 << index.min(63)) / 1000)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::invariant::Ceilings;
+
+    /// The restart cadence a run of a given shape gets.
+    ///
+    /// Three properties at once, and each of them is why the formula has the
+    /// term it has: intensity shortens it, a short run gets several restarts
+    /// anyway, and no run restarts faster than the floor.
+    #[test]
+    fn the_restart_cadence_scales_and_stays_inside_its_bounds() {
+        let hour = Duration::from_secs(3600);
+        assert_eq!(restart_interval(1, hour), RESTART_CADENCE);
+        assert_eq!(restart_interval(2, hour), RESTART_CADENCE / 2);
+        assert_eq!(
+            restart_interval(600, hour),
+            RESTART_CADENCE / RESTART_SCALING
+        );
+
+        // A short run restarts several times inside itself, or the class would
+        // be listed in the report having done nothing.
+        let smoke = Duration::from_secs(90);
+        assert_eq!(restart_interval(1, smoke), smoke / RESTART_SHARE);
+        assert!(smoke.as_secs_f64() / restart_interval(1, smoke).as_secs_f64() >= 3.0);
+
+        // And nothing restarts faster than the floor, whatever it is asked.
+        assert_eq!(restart_interval(600, Duration::from_secs(1)), RESTART_FLOOR);
+    }
+
+    /// A restart's own patience budget stays inside the progress watchdog.
+    ///
+    /// The cadence does not enter into this: the restart arm completes an
+    /// operation every slice while it waits, so the only interval in which it
+    /// completes nothing is a restart itself — the stop, the start and the
+    /// healing. If those three could outlast the watchdog, a run would report
+    /// the restart arm as deadlocked for doing exactly what it was told.
+    ///
+    /// The mount count does not enter into it either, and that is a property of
+    /// the healing and not an oversight here: every mount is waited out at the
+    /// same time as every other, so the term is one patience at two mounts and
+    /// one patience at twenty. The test that holds the healing to that shape is
+    /// beside the healing itself.
+    #[test]
+    fn a_restarts_own_patience_stays_inside_the_progress_watchdog() {
+        let watchdog = Ceilings::for_run(&Sample::default(), 0, 1, 1).watchdog;
+        assert!(
+            crate::server::PATIENCE * 2 + crate::workload::HEAL_PATIENCE < watchdog,
+            "a restart may take {:?} + {:?} + {:?}, against a {watchdog:?} watchdog",
+            crate::server::PATIENCE,
+            crate::server::PATIENCE,
+            crate::workload::HEAL_PATIENCE
+        );
+    }
 }

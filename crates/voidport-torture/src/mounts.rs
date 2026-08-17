@@ -28,6 +28,7 @@ const UNMOUNT_PATIENCE: Duration = Duration::from_secs(30);
 pub struct TortureMount {
     mount: Option<Mount>,
     mountpoint: PathBuf,
+    url: MountUrl,
 }
 
 impl TortureMount {
@@ -35,6 +36,28 @@ impl TortureMount {
     #[must_use]
     pub fn root(&self) -> &Path {
         &self.mountpoint
+    }
+
+    /// The URL this mount was made from.
+    ///
+    /// Carried, not recomputed: it is the one source for everything a worker
+    /// needs to name the *same* namespace its mount is a view of — the
+    /// namespace a rule is keyed by, the subpath in front of a rule's path, the
+    /// endpoint a second session dials.
+    #[must_use]
+    pub fn url(&self) -> &MountUrl {
+        &self.url
+    }
+
+    /// A mount handle that holds no mount, for the tests that only ask which
+    /// URL a mount was made from.
+    #[cfg(test)]
+    pub(crate) fn unmounted(mountpoint: PathBuf, url: MountUrl) -> Self {
+        Self {
+            mount: None,
+            mountpoint,
+            url,
+        }
     }
 
     /// Unmounts, waiting out a mountpoint that is still settling.
@@ -81,46 +104,67 @@ impl Drop for TortureMount {
 }
 
 /// Where new mounts come from.
+///
+/// A fleet holds **every** URL the run was given, not one, because a run is
+/// allowed to put its mounts on different transports at once — the same server,
+/// reached over a unix socket and over vsock, under the same load. Mounts are
+/// dealt out over the URLs in order, so a two-URL run with two mounts puts one
+/// on each.
 #[derive(Debug)]
 pub struct Fleet {
-    url: MountUrl,
+    urls: Vec<MountUrl>,
     root: PathBuf,
     sequence: AtomicU64,
 }
 
 impl Fleet {
-    /// A fleet mounting `url` on fresh mountpoints under `root`.
+    /// A fleet mounting `urls` on fresh mountpoints under `root`.
     ///
     /// # Errors
     ///
-    /// Returns the URL's own parse error.
-    pub fn new(url: &str, root: &Path) -> anyhow::Result<Self> {
+    /// Returns a URL's own parse error, or the fact that none was given.
+    pub fn new(urls: &[String], root: &Path) -> anyhow::Result<Self> {
+        anyhow::ensure!(!urls.is_empty(), "a run needs at least one URL to mount");
         Ok(Self {
-            url: MountUrl::parse(url)?,
+            urls: urls
+                .iter()
+                .map(|url| MountUrl::parse(url))
+                .collect::<Result<_, _>>()?,
             root: root.to_path_buf(),
             sequence: AtomicU64::new(0),
         })
     }
 
-    /// The URL every mount of this fleet is made from.
+    /// The URL a mount of this index is made from.
     #[must_use]
-    pub fn url(&self) -> &MountUrl {
-        &self.url
+    pub fn url(&self, index: u64) -> &MountUrl {
+        &self.urls[index as usize % self.urls.len()]
     }
 
-    /// Mounts on a fresh mountpoint.
+    /// Every URL the run mounts, in the order they were given.
+    #[must_use]
+    pub fn urls(&self) -> &[MountUrl] {
+        &self.urls
+    }
+
+    /// Mounts on a fresh mountpoint, over the URL it is handed.
+    ///
+    /// The URL is the caller's, not an index into the fleet's, so that the
+    /// mount and everything else a worker derives from that URL cannot come
+    /// apart: what a mount was made from is what the mount then carries.
     ///
     /// # Errors
     ///
     /// Returns the failure to create the mountpoint or to mount on it.
-    pub fn mount(&self, label: &str) -> anyhow::Result<TortureMount> {
+    pub fn mount(&self, label: &str, url: &MountUrl) -> anyhow::Result<TortureMount> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let mountpoint = self.root.join(format!("mnt-{label}-{sequence}"));
         std::fs::create_dir_all(&mountpoint)?;
-        let mount = Mount::new(&self.url, &mountpoint, &MountOptions::default())?;
+        let mount = Mount::new(url, &mountpoint, &MountOptions::default())?;
         Ok(TortureMount {
             mount: Some(mount),
             mountpoint,
+            url: url.clone(),
         })
     }
 }
@@ -175,6 +219,23 @@ mod tests {
         let quiet = Path::new("/proc/self/fd/nothing-is-mounted-here");
         assert!(mounted_under(quiet).is_empty());
         assert!(loop_devices_under(quiet).is_empty());
+    }
+
+    /// Mounts are dealt out over the URLs the run named, so a run over two
+    /// transports really puts a mount on each.
+    #[test]
+    fn a_fleet_deals_its_mounts_over_every_url_it_was_given() {
+        let urls = [
+            "voidport://127.0.0.1:9000/@work".to_owned(),
+            "voidport+vsock://1:9001/@work".to_owned(),
+        ];
+        let fleet = Fleet::new(&urls, Path::new("/tmp")).expect("two parseable URLs");
+        assert_eq!(fleet.urls().len(), 2);
+        assert_eq!(fleet.url(0), &fleet.urls()[0]);
+        assert_eq!(fleet.url(1), &fleet.urls()[1]);
+        assert_eq!(fleet.url(2), &fleet.urls()[0]);
+
+        assert!(Fleet::new(&[], Path::new("/tmp")).is_err());
     }
 
     /// And the mount table probe really does read the table: the root

@@ -43,11 +43,23 @@ pub enum Class {
     Remount,
     /// Multi-mount contention: the same files, through different mounts.
     Contend,
+    /// Server restarts under the whole load, graceful and hard by turns, each
+    /// followed by the reconnect contract's healing and a state-file check.
+    Restart,
+    /// Special-file churn: FIFOs, socket files and symbolic links made, read,
+    /// owner-checked and removed through the mounts.
+    Special,
+    /// Control-plane policy churn: rules added, re-moded and removed, and
+    /// attribute rules toggled, on the namespace the load is using.
+    Rules,
+    /// Listener churn: data-plane listeners added and removed under load, with
+    /// the sessions already on them proven to keep serving.
+    Listeners,
 }
 
 impl Class {
     /// Every class, in the order a report lists them.
-    pub const ALL: [Self; 10] = [
+    pub const ALL: [Self; 14] = [
         Self::Walk,
         Self::List,
         Self::Churn,
@@ -58,6 +70,10 @@ impl Class {
         Self::OpenClose,
         Self::Remount,
         Self::Contend,
+        Self::Restart,
+        Self::Special,
+        Self::Rules,
+        Self::Listeners,
     ];
 
     /// The name the command line and the report spell it with.
@@ -74,6 +90,24 @@ impl Class {
             Self::OpenClose => "open-close",
             Self::Remount => "remount",
             Self::Contend => "contend",
+            Self::Restart => "restart",
+            Self::Special => "special",
+            Self::Rules => "rules",
+            Self::Listeners => "listeners",
+        }
+    }
+
+    /// How many workers drive this class at a given intensity.
+    ///
+    /// Every class scales with the intensity except the one that owns the
+    /// server process: two restart arms would signal the same server at once,
+    /// so the restart class is always exactly one worker and scales its
+    /// **cadence** instead — which is what intensity means for a controller.
+    #[must_use]
+    pub fn workers(self, intensity: u64) -> u64 {
+        match self {
+            Self::Restart => 1,
+            _ => intensity,
         }
     }
 
@@ -97,13 +131,24 @@ impl Class {
     /// conformant, and *stalled*, which is a defect. A lock acquisition is
     /// allowed the most by far, because waiting for another owner to let go is
     /// the operation working correctly.
+    ///
+    /// The four control classes are allowed what their operation contains: a
+    /// rule change is followed by a bounded poll for the policy to bind, a
+    /// listener cycle by a handshake on a fresh endpoint, and a restart by a
+    /// whole stop, start and heal of every mount.
     #[must_use]
     pub fn latency_ceiling(self) -> Duration {
         Duration::from_millis(match self {
             Self::Walk | Self::Xattr | Self::OpenClose => 2_000,
-            Self::List | Self::Churn | Self::Append | Self::Rename | Self::Contend => 5_000,
-            Self::Remount => 30_000,
+            Self::List
+            | Self::Churn
+            | Self::Append
+            | Self::Rename
+            | Self::Contend
+            | Self::Special => 5_000,
+            Self::Remount | Self::Rules | Self::Listeners => 30_000,
             Self::Locks => 60_000,
+            Self::Restart => 120_000,
         })
     }
 }
@@ -154,6 +199,22 @@ impl ClassSnapshot {
             failed: self.failed.saturating_sub(earlier.failed),
             buckets: std::array::from_fn(|index| {
                 self.buckets[index].saturating_sub(earlier.buckets[index])
+            }),
+        }
+    }
+
+    /// The two sets of counts added together.
+    ///
+    /// A judged window is stitched out of the stretches of the run an outage
+    /// did not cover, so what it holds is a sum of deltas and not one
+    /// difference. Adding histograms is exact: a bucket is a count.
+    #[must_use]
+    pub fn plus(&self, other: &Self) -> Self {
+        Self {
+            completed: self.completed.saturating_add(other.completed),
+            failed: self.failed.saturating_add(other.failed),
+            buckets: std::array::from_fn(|index| {
+                self.buckets[index].saturating_add(other.buckets[index])
             }),
         }
     }
@@ -264,7 +325,7 @@ impl ClassMetrics {
 /// Every class's counters.
 #[derive(Debug, Default)]
 pub struct Metrics {
-    classes: [ClassMetrics; 10],
+    classes: [ClassMetrics; Class::ALL.len()],
 }
 
 impl Metrics {
@@ -297,6 +358,17 @@ mod tests {
             assert_eq!(Class::parse(class.name()), Ok(class));
         }
         assert!(Class::parse("nonesuch").is_err());
+    }
+
+    /// Intensity is workers everywhere but the arm that owns the server
+    /// process, which is one worker at every intensity because a second one
+    /// would be signalling the same server.
+    #[test]
+    fn intensity_is_workers_except_for_the_arm_that_owns_the_server() {
+        for class in Class::ALL {
+            let expected = if class == Class::Restart { 1 } else { 7 };
+            assert_eq!(class.workers(7), expected, "{}", class.name());
+        }
     }
 
     #[test]

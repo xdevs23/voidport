@@ -2367,6 +2367,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_json",
+ "toml",
  "voidport",
  "voidport-control",
  "voidport-proto",
