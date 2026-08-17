@@ -3063,7 +3063,29 @@ contradicted sentence is replaced.)
 9. Both gates pass with the new suites executing, and the README,
    man page and PERFORMANCE.md carry the flag and the numbers.
 
-## Write-ahead (normative for the write-ahead increment; contract written 2026-08-17)
+## Write-ahead (PAUSED 2026-08-17, the same day it was written — the spec review measured three of its premises false; a decision on its future is pending, and the text below is kept as the record of the shape that was refuted)
+
+The review's measured findings, summarized (full probes kept out of
+tree): the capability probe this section proposed removing does not
+exist on direct-io mounts — the two round trips per write were a
+page-cached census, while the 172 MB/s field figure is direct-io and
+already pays one; negotiating the killpriv capability would turn OFF
+the kernel-side stripping that works today, and the replacement
+signals (the setattr kill bit, the open kill flag) have no surface
+in the FUSE library this client uses — the same library-blocked
+class as the parked interrupt item; and the pipelining half breaks
+guarantees this document holds elsewhere (append atomicity,
+read-after-write on a cache-less mount, the readahead invalidation
+contract, mmap writeback, teardown settle accounting), each needing
+design work the v2 shared-memory data plane makes moot.
+
+The review also surfaced a real defect in the shipped tree, recorded
+as its own correctness item: on a direct-io mount the kernel
+delegates setuid/setgid stripping to the filesystem through a write
+flag, and both the client and the server ignore it — privileged bits
+survive a write that strips them locally and on a cached mount.
+
+### The refuted text (kept for the record)
 
 Reads got their streaming engine; writes still pay every round trip
 alone. The decided direction: the same streaming idea as readahead,
