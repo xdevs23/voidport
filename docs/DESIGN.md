@@ -3283,7 +3283,7 @@ answers that refusal.
 7. Both gates pass with the new suites executing; the performance
    report carries the A/B.
 
-## Recorded metadata (normative pattern; decided 2026-08-17 — one design for everything of this kind)
+## Recorded metadata (normative pattern; decided 2026-08-17 — one design for everything of this kind; first instance PROVEN 2026-08-17 by the privileged-bits landing, its measurement arms recorded as owed in that increment's criteria)
 
 Whenever the guest expects a real filesystem to hold something the
 host backing cannot represent — because the server's user lacks the
