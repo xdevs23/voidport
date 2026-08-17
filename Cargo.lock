@@ -2279,7 +2279,7 @@ checksum = "0b928f33d975fc6ad9f86c8f283853ad26bdd5b10b7f1542aa2fa15e2289105a"
 
 [[package]]
 name = "voidport"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2304,7 +2304,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-bench"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2315,7 +2315,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-control"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "rustix",
  "serde",
@@ -2325,7 +2325,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-ctl"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2344,14 +2344,14 @@ dependencies = [
 
 [[package]]
 name = "voidport-proto"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "zerocopy",
 ]
 
 [[package]]
 name = "voidport-pty"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "libc",
  "portable-pty",
@@ -2360,7 +2360,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-torture"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -2378,7 +2378,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-tui"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -2391,7 +2391,7 @@ dependencies = [
 
 [[package]]
 name = "voidportd"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "anyhow",
  "clap",
