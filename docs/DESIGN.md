@@ -3063,7 +3063,62 @@ contradicted sentence is replaced.)
 9. Both gates pass with the new suites executing, and the README,
    man page and PERFORMANCE.md carry the flag and the numbers.
 
-## Write streaming (normative for the write-streaming increment; contract written 2026-08-17, superseding the paused write-ahead recorded below — the decided reframe: the server writes into the host page cache faster than any wire carries, and the host kernel owns correctness behind it, so the wire is the bottleneck and the client's one job is to keep it saturated; order lives on the wire)
+## Write-path decisions (2026-08-17): what ships in v1, what parks, and the law that decided it
+
+The write-streaming contract below went through its own probing spec
+review the day it was written, and the review measured the picture
+per transport: on vsock — the deployment transport — the server's
+page-cache apply (~2.1 GB/s) does outrun the wire (~1.1 GB/s) and
+streaming would pay; on local unix and TCP the wire (6.4-7 GB/s)
+outruns the apply and the premise inverts. It also established two
+kernel facts that make early acknowledgment unsafe without guards:
+a stat racing an unconfirmed write regresses the inode size and can
+fault mapped pages, and an mmap page fault inside the
+acknowledgment-to-confirmation window caches pre-write bytes with
+nothing left to invalidate them. Sound fixes exist — absolute
+node-scoped drains, client-side invalidation at confirmation,
+sequence-stamped per-handle apply queues — but each is a guard
+bolted onto an architecture that fights them.
+
+**The standing design law (decided 2026-08-17)**: hazards of this
+kind are fixed through architecture, never through imperative code
+layered on top. When a shape accumulates guards, the architecture is
+reconsidered instead — whatever better shape that means. Applied
+here: **write streaming parks to v2**, whose shared-memory data
+plane gives the throughput structurally — the guest writes host
+memory, the host kernel owns every coherence question this contract
+was accumulating guards for — and vsock, the one transport where
+client streaming pays, is exactly what that data plane replaces.
+
+**What ships in v1 from this work**, each its own small increment:
+
+- **The stripping-defect fix**: on a direct-io mount the kernel
+  marks every write that must clear privileged bits and delegates
+  the clearing; the client forwards the mark (the write request's
+  reserved flags field gains its first meaning, an elder server
+  ignores it — fail-open for stripping under version skew, stated)
+  and the server clears what the mark demands. Verified against the
+  kernel and the FUSE library: the mark needs no capability
+  negotiation and the library carries its surface. This lands with
+  the privileged-bits increment, whose recording it also strips.
+- **Parallel direct writes, honestly scoped**: the open reply
+  announces the capability so applications using asynchronous I/O
+  overlap in-place writes on one file. The kernel still serializes
+  append, size-extending, and ever-mmap'd files under its exclusive
+  lock — the announcement helps in-place overwrites only, and its
+  criterion says so.
+- **Host-side direct I/O postures** (the caching model stated as
+  decided): a mount's direct-io setting is guest-side presentation —
+  it exists to keep the guest from holding a page cache so the
+  host's cache is the one cache; the server's backing I/O rides
+  that cache. Reaching the storage uncached becomes a per-namespace
+  setting with three postures: the cached default; passthrough,
+  where a guest handle's O_DIRECT opens the backing file O_DIRECT
+  with its alignment demands surfacing as the local filesystem
+  gives them; and always, every backing open uncached, under which
+  the bound moves from the wire to the storage.
+
+## The parked write-streaming contract (2026-08-17, parked the same day by the design law above — kept as the record, with its review findings noted in place)
 
 - **Scope: direct-io mounts.** A cached mount already streams through
   the guest page cache. Handles opened `O_SYNC`/`O_DSYNC`/`O_DIRECT`
@@ -4257,6 +4312,13 @@ process, one host, tokio + blocking-pool host I/O, FUSE data path):
   tail to a v2 prerequisite, with vsock for the co-located case. For
   all of v1 the normative state is `auth = "none"` with the transport
   as the trust model, exactly as THREAT-MODEL.md states it.
+
+The design law above all for the kernel work (decided 2026-08-17):
+everything is designed robustly from the start — a hazard is fixed
+through architecture, never through imperative code layered on top,
+and a shape that accumulates guards is reconsidered instead of
+patched, whatever better shape that means: graph-based, event
+driven, asynchronous, actor-shaped, or something else entirely.
 
 Kernel-client preparations (decided 2026-08-17, research and
 feasibility probes only — module development starts when v1 is fully
