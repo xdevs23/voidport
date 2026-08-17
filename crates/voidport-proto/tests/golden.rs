@@ -1262,3 +1262,59 @@ fn payload_can_be_filled_in_place() {
     let response = frame.response::<ReadResponse>().unwrap().success().unwrap();
     assert_eq!(response.data(), b"data");
 }
+
+/// The one flag `write_flags` carries, pinned by its bytes.
+///
+/// The field has been must-be-zero-on-send / ignore-unknown-on-receive from day
+/// one, so acquiring a flag is additive: the zero value is byte-identical to
+/// every frame ever sent, and a peer that does not know the bit ignores it and
+/// strips nothing. The vector below is what a server must keep reading as "the
+/// guest kernel asked for a suid-kill", so the bit cannot be renumbered
+/// silently.
+#[test]
+fn the_write_privileged_strip_flag_is_pinned_to_its_bit() {
+    use voidport_proto::ops::file::write_flags;
+
+    assert_eq!(write_flags::PRIVILEGED_STRIP, 1);
+    golden_message(
+        &WriteRequest {
+            handle: U64::new(V[0]),
+            offset: U64::new(V[1]),
+            data_len: U32::new(W[0]),
+            flags: U32::ZERO,
+            write_flags: U32::new(write_flags::PRIVILEGED_STRIP),
+            reserved: U32::ZERO,
+        },
+        values::WRITE,
+        &bytes![
+            VB[0],
+            VB[1],
+            WB[0],
+            [0, 0, 0, 0],
+            [1, 0, 0, 0],
+            [0, 0, 0, 0]
+        ],
+    );
+
+    // An elder peer's frame — the field zero — is what it always was, which is
+    // what makes the addition additive.
+    golden_message(
+        &WriteRequest {
+            handle: U64::new(V[0]),
+            offset: U64::new(V[1]),
+            data_len: U32::new(W[0]),
+            flags: U32::ZERO,
+            write_flags: U32::ZERO,
+            reserved: U32::ZERO,
+        },
+        values::WRITE,
+        &bytes![
+            VB[0],
+            VB[1],
+            WB[0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0]
+        ],
+    );
+}

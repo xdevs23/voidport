@@ -40,6 +40,7 @@ use crate::data::listener::{DataListeners, ListenerError};
 use crate::data::pin::{DESCRIPTOR_RESERVE, DescriptorLimit};
 use crate::data::server::DataPlane;
 use crate::launch::LaunchSummary;
+use crate::records::RecordHome;
 use crate::seed::{Seed, SeedError};
 use crate::state::{
     Environment, InstanceLock, LoadError, LoadedState, LockError, PersistError, StateDocument,
@@ -266,12 +267,34 @@ impl Daemon {
             shutdown.await;
             let _ = stop.send(true);
         };
+        let records = Arc::clone(&service);
         let control = crate::control::serve(socket, service, stopped(control_stop));
         let data = data.serve(stopped(data_stop));
 
         let (control, (), ()) = tokio::join!(control, data, signal);
+        flush_records(&records);
         control
         // `_lock` is dropped here: the state file is free for the next daemon.
+    }
+}
+
+/// Writes every namespace's owed record sidecar.
+///
+/// Placed exactly here: **after both planes stop** — so nothing can record,
+/// strip or relocate while the writes are taken, and every store is settled
+/// once — and **before the instance lock drops**, so no second daemon can be
+/// writing the same sidecars. The debounce window is what makes this necessary:
+/// a mutation in the last quarter-second before shutdown is owed to the file
+/// and has not been taken yet.
+fn flush_records(service: &Service) {
+    for store in service.snapshot().registry.stores() {
+        if let Err(source) = store.flush() {
+            tracing::warn!(
+                namespace = store.name().as_str(),
+                %source,
+                "the recorded metadata of a namespace could not be written at shutdown"
+            );
+        }
     }
 }
 
@@ -306,7 +329,11 @@ fn apply_seed(
         );
         return Ok(loaded);
     }
-    let registry = validate(&document, environment)?;
+    let registry = validate(
+        &document,
+        environment,
+        &RecordHome::for_state_file(state_file),
+    )?;
     match persist(&document, state_file) {
         Ok(()) => {}
         // The rename is the commit point: the file already holds the seed, so

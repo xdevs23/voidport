@@ -19,6 +19,7 @@ use std::time::Duration;
 
 use support::{Fixture, eventually};
 use voidport::client::{Caller, Client};
+use voidport::fuse::attr::Privileged;
 use voidport::fuse::dir::{
     Directories, DirectoryEntry, DirectoryRead, DirectorySink, read_directory, release_directory,
 };
@@ -194,6 +195,7 @@ fn a_plain_directory_read_gives_every_counted_lookup_back() {
                 caller,
                 at(root, handle, 0),
                 HELD,
+                Privileged::Present,
                 &mut sink,
             )
             .await
@@ -240,6 +242,7 @@ fn entries_a_full_buffer_refuses_are_given_back() {
             caller,
             at(root, handle, 0),
             HELD,
+            Privileged::Present,
             &mut sink,
         )
         .await
@@ -292,6 +295,7 @@ fn two_reads_of_one_handle_at_once_give_every_surplus_back() {
                 caller,
                 at(root, handle, 0),
                 HELD,
+                Privileged::Present,
                 &mut first
             ),
             read_directory(
@@ -300,6 +304,7 @@ fn two_reads_of_one_handle_at_once_give_every_surplus_back() {
                 caller,
                 at(root, handle, 0),
                 HELD,
+                Privileged::Present,
                 &mut second
             ),
         );
@@ -357,6 +362,7 @@ fn a_one_entry_at_a_time_walk_counts_every_entry_exactly_once() {
                     caller,
                     at(root, handle, cookie),
                     HELD,
+                    Privileged::Present,
                     &mut sink,
                 )
                 .await
@@ -440,6 +446,7 @@ fn surplus_older_than_the_attr_ttl_is_refetched_rather_than_served_stale() {
             caller,
             at(root, handle, 0),
             BRIEF,
+            Privileged::Present,
             &mut first,
         )
         .await
@@ -465,6 +472,7 @@ fn surplus_older_than_the_attr_ttl_is_refetched_rather_than_served_stale() {
                 caller,
                 at(root, handle, cookie),
                 BRIEF,
+                Privileged::Present,
                 &mut sink,
             )
             .await
@@ -541,6 +549,7 @@ fn surplus_within_the_attr_ttl_is_served_without_a_wire_fetch() {
             caller,
             at(root, handle, 0),
             HELD,
+            Privileged::Present,
             &mut first,
         )
         .await
@@ -557,6 +566,7 @@ fn surplus_within_the_attr_ttl_is_served_without_a_wire_fetch() {
             caller,
             at(root, handle, first.resume),
             HELD,
+            Privileged::Present,
             &mut second,
         )
         .await
@@ -578,6 +588,7 @@ fn surplus_within_the_attr_ttl_is_served_without_a_wire_fetch() {
             caller,
             at(root, handle, 0),
             BRIEF,
+            Privileged::Present,
             &mut first,
         )
         .await
@@ -596,6 +607,7 @@ fn surplus_within_the_attr_ttl_is_served_without_a_wire_fetch() {
                 caller,
                 at(root, handle, first.resume),
                 BRIEF,
+                Privileged::Present,
                 &mut third,
             )
             .await

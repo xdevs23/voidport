@@ -21,6 +21,7 @@ use super::Environment;
 use super::build::{NamespaceError, build_namespace};
 use super::document::StateDocument;
 use super::limits::LimitsError;
+use crate::records::{RecordError, RecordHome};
 use crate::registry::Registry;
 
 /// A state file, loaded and built.
@@ -40,7 +41,7 @@ pub struct LoadedState {
 /// namespace and rule at fault.
 pub fn load(path: &Path, environment: &Environment) -> Result<LoadedState, LoadError> {
     let document = load_document(path)?;
-    let registry = validate(&document, environment)?;
+    let registry = validate(&document, environment, &RecordHome::for_state_file(path))?;
     Ok(LoadedState { document, registry })
 }
 
@@ -69,11 +70,18 @@ pub fn load_document(path: &Path) -> Result<StateDocument, LoadError> {
 /// # Errors
 ///
 /// Returns [`LoadError::ServerSettings`] for a cap the server cannot honour,
-/// [`LoadError::DuplicateNamespace`] if a name repeats, and
-/// [`LoadError::Namespace`] for the first namespace the engine rejects.
+/// [`LoadError::DuplicateNamespace`] if a name repeats,
+/// [`LoadError::Namespace`] for the first namespace the engine rejects, and
+/// [`LoadError::Records`] for a record sidecar that cannot be read.
+///
+/// `home` is where each namespace's record sidecar lives. Building the registry
+/// is where a store is opened, and it is opened **once per name**: this runs at
+/// startup and at a seeded launch, never on the mutation path, which carries
+/// the stores it already has.
 pub fn validate(
     document: &StateDocument,
     environment: &Environment,
+    home: &RecordHome,
 ) -> Result<Registry, LoadError> {
     document
         .server
@@ -89,7 +97,12 @@ pub fn validate(
                 namespace: spec.name.clone(),
                 source,
             })?;
-        registry.insert(namespace);
+        registry
+            .insert(namespace, home)
+            .map_err(|source| LoadError::Records {
+                namespace: spec.name.clone(),
+                source,
+            })?;
     }
     Ok(registry)
 }
@@ -139,6 +152,15 @@ pub enum LoadError {
         #[source]
         source: NamespaceError,
     },
+    /// A namespace's recorded metadata cannot be read.
+    #[error("namespace \"{namespace}\": {source}")]
+    Records {
+        /// The namespace at fault.
+        namespace: NamespaceName,
+        /// Why its sidecar could not be read.
+        #[source]
+        source: RecordError,
+    },
 }
 
 #[cfg(test)]
@@ -149,6 +171,13 @@ mod tests {
 
     fn environment() -> Environment {
         Environment::new(1000, 100, "/srv/state")
+    }
+
+    /// Sidecars beside a state file this test module owns.
+    fn home() -> RecordHome {
+        RecordHome::for_state_file(
+            &std::env::temp_dir().join(format!("voidport-load-{}.toml", std::process::id())),
+        )
     }
 
     fn document(text: &str) -> StateDocument {
@@ -174,8 +203,12 @@ mod tests {
             name = "scratch"
             "#,
         );
-        let registry =
-            validate(&document, &Environment::new(1000, 100, scratch.path())).expect("valid");
+        let registry = validate(
+            &document,
+            &Environment::new(1000, 100, scratch.path()),
+            &RecordHome::for_state_file(&scratch.join("state.toml")),
+        )
+        .expect("valid");
         assert_eq!(registry.len(), 2);
         let names: Vec<&str> = registry
             .iter()
@@ -202,7 +235,7 @@ mod tests {
             mode = "ro"
             "#,
         );
-        let error = validate(&document, &environment()).expect_err("dead configuration");
+        let error = validate(&document, &environment(), &home()).expect_err("dead configuration");
         let rendered = render(&error);
         assert!(rendered.contains("\"project\""), "{rendered}");
         assert!(rendered.contains("/a/secret/key"), "{rendered}");
@@ -217,7 +250,7 @@ mod tests {
             max_inflight = 0
             "#,
         );
-        let error = validate(&document, &environment()).expect_err("zero is not a cap");
+        let error = validate(&document, &environment(), &home()).expect_err("zero is not a cap");
         assert!(matches!(error, LoadError::ServerSettings { .. }));
         assert!(error.to_string().contains("max_inflight"), "{error}");
     }
@@ -232,7 +265,7 @@ mod tests {
             name = "project"
             "#,
         );
-        let error = validate(&document, &environment()).expect_err("duplicate");
+        let error = validate(&document, &environment(), &home()).expect_err("duplicate");
         assert!(matches!(error, LoadError::DuplicateNamespace { .. }));
         assert!(error.to_string().contains("\"project\""), "{error}");
     }

@@ -208,6 +208,7 @@ mod tests {
             .expect("valid ownership"),
             table,
             crate::rules::XattrRules::default(),
+            true,
             grafts,
         )
     }

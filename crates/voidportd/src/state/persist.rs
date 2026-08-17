@@ -110,7 +110,16 @@ pub fn create_if_missing(path: &Path) -> Result<bool, PersistError> {
 }
 
 /// Steps 2 through 6, with the temporary file's cleanup left to the caller.
-fn write_and_rename(
+///
+/// Shared, because the state file is not the only document the server owns:
+/// each namespace's record sidecar is written with the very same sequence, and
+/// a second copy of it would be a second chance to drop the directory flush.
+///
+/// # Errors
+///
+/// Returns a [`PersistError`] naming the step that failed and which side of the
+/// commit point it was on.
+pub(crate) fn write_and_rename(
     temporary: &Path,
     path: &Path,
     directory: &Path,

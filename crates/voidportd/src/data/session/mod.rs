@@ -60,8 +60,10 @@ use crate::host::attr::HostAttr;
 use crate::host::open::pin_relative_no_symlinks;
 use crate::host::{FileKind, SynthesizedTimes};
 use crate::namespace::Namespace;
+use crate::records::RecordStore;
 use crate::rules::NamespacePath;
 
+pub use attr::PrivilegedView;
 pub use resolve::{ParentDir, Site};
 
 /// Where a session came from, for the operator's session list.
@@ -122,6 +124,16 @@ pub struct Session {
     /// The snapshot the handshake resolved, kept only for after the namespace
     /// is deleted.
     tombstone: Arc<Namespace>,
+    /// The namespace's record store, captured at handshake beside the
+    /// namespace resolution.
+    ///
+    /// Captured and not looked up per operation, because the two have different
+    /// lifetimes on purpose: the namespace snapshot is republished on every
+    /// control mutation, while the store is one instance per name. A namespace
+    /// deleted underneath this mount takes the *registry entry*, not the store
+    /// a session still serving is recording through — it retires instead, and
+    /// stops taking writes.
+    records: Arc<RecordStore>,
     ino: Arc<InoAllocator>,
     /// The timestamps this session's synthesized directories present, captured
     /// once when the server started. Copied, not re-read, so the
@@ -172,11 +184,16 @@ impl Session {
     /// * `ENOTDIR` — it names something that is not a directory;
     /// * `ELOOP` — a component of it is a symlink;
     /// * any other host errno from pinning the mount root.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a mount is built from the server-global sources and the policy it resolved; every one of them is named here on purpose"
+    )]
     pub fn mount(
         id: u64,
         peer: Peer,
         registries: Registries,
         namespace: Arc<Namespace>,
+        records: Arc<RecordStore>,
         subpath: NamespacePath,
         identity: Identity,
         limits: Limits,
@@ -210,7 +227,17 @@ impl Session {
                 let root_ino = ino.host(host.host_identity());
                 // The mount root must be presentable: a root the ownership
                 // policy hides is a namespace the guest cannot see into.
-                host.present(root_ino, *mode, namespace.ownership())
+                // The mount root presents its recorded bits like any other
+                // host-backed node: it is a file of the namespace, not a
+                // fixture of the mount.
+                let privileged = if namespace.privileged_bits() {
+                    crate::records::Privileged::Recorded(
+                        records.records().bits(&host.node_identity()),
+                    )
+                } else {
+                    crate::records::Privileged::Masked
+                };
+                host.present(root_ino, *mode, namespace.ownership(), privileged)
                     .ok_or(Errno::NOENT)?;
                 // The mount root is a cache slot like any other: it has no
                 // ancestor inside the namespace, so it re-pins by descending
@@ -242,6 +269,7 @@ impl Session {
             namespaces,
             peers,
             tombstone: namespace,
+            records,
             ino,
             synthesized_times,
             budget,

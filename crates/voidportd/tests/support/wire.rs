@@ -396,15 +396,31 @@ impl WireClient {
 
     /// Writes file data.
     pub fn write(&mut self, handle: u64, offset: u64, data: &[u8]) -> Result<u32, i32> {
+        self.write_marked(0, handle, offset, data, 0)
+    }
+
+    /// Writes file data carrying the guest kernel's write flags, and naming the
+    /// node the handle belongs to.
+    ///
+    /// The node id matters here and nowhere else in this client: the strip a
+    /// marked write asks for is applied to the node the request head names.
+    pub fn write_marked(
+        &mut self,
+        node: u64,
+        handle: u64,
+        offset: u64,
+        data: &[u8],
+        write_flags: u32,
+    ) -> Result<u32, i32> {
         let body = WriteRequest {
             handle: U64::new(handle),
             offset: U64::new(offset),
             data_len: U32::new(data.len() as u32),
             flags: U32::ZERO,
-            write_flags: U32::ZERO,
+            write_flags: U32::new(write_flags),
             reserved: U32::ZERO,
         };
-        self.call::<_, WriteResponse, _>(0, &body, data, |body, _| body.written.get())
+        self.call::<_, WriteResponse, _>(node, &body, data, |body, _| body.written.get())
     }
 
     /// Releases a handle.

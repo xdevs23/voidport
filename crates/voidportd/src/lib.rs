@@ -23,6 +23,9 @@
 //!   descent, presented attributes, xattrs, OFD locks.
 //! * [`data`] — the data plane: listeners, sessions, node and handle tables,
 //!   and the wire operations served over them.
+//! * [`records`] — recorded metadata: the guest truth the host backing cannot
+//!   hold, split between an identity-keyed table in memory and a revalidating
+//!   sidecar on disk. The privileged mode bits are its first instance.
 //! * [`reclaim`] — what a drained node table gives back: the allocator settings
 //!   and the debounced trim that turn "the guest forgot it" into "the host got
 //!   the memory back".
@@ -50,6 +53,7 @@ pub mod launch;
 pub mod lockfile;
 pub mod namespace;
 pub mod reclaim;
+pub mod records;
 pub mod registry;
 pub mod rules;
 pub mod seed;

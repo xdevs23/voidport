@@ -240,6 +240,17 @@ pub struct MountOptions {
     /// exec-from-mount and SQLite's WAL — is excluded in every configuration.
     /// See [`DataCaching::resolve`](crate::fuse::DataCaching::resolve).
     pub direct_io: bool,
+    /// Whether this mount shows privileged mode bits (setuid, setgid).
+    ///
+    /// On by default. Off, every attribute this mount presents has them masked
+    /// and a chmod that would set one is refused — the client-side half of the
+    /// two switches recorded metadata always has, and stronger than the classic
+    /// `nosuid`, which honors nothing but still shows the bits.
+    ///
+    /// Opting one mount out never destroys recorded truth: a chmod through such
+    /// a mount carries the bits the server holds back to it unchanged, so
+    /// mounts that do present them are unaffected.
+    pub privileged_bits: bool,
     /// The ceiling, in bytes, of the readahead pool this mount may hold.
     ///
     /// A ceiling and not an allocation: an idle mount holds nothing, and the
@@ -264,6 +275,7 @@ impl Default for MountOptions {
             reconnect_stall: DEFAULT_RECONNECT_STALL,
             auto_unmount: true,
             direct_io: false,
+            privileged_bits: true,
             readahead: DEFAULT_POOL_BYTES,
         }
     }
@@ -444,6 +456,7 @@ impl Mount {
             options.attr_timeout,
             options.entry_timeout,
             options.direct_io,
+            crate::fuse::attr::Privileged::of(!options.privileged_bits),
             Arc::clone(&readahead),
             Arc::clone(&inflight),
         );

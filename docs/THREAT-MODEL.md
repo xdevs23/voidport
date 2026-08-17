@@ -39,6 +39,20 @@ dated, not an accident. The enforcement mechanisms referenced live in
 - **Server-side share-mode enforcement.** ro and hidden are enforced at the
   server on every write-class operation, regardless of anything the client
   displays or requests. Presented permission bits are presentation.
+- **Presented attributes are the guest kernel's to act on.** The server
+  presents; the guest kernel, in its own trust domain, decides what its
+  processes may do with what it was told. That holds for the privileged mode
+  bits as it holds for every other presented attribute: setuid and setgid the
+  server *records* — because its own host backing must never carry a
+  privileged bit an unprivileged process set — are presented to every mount of
+  the namespace, and what exec does with them is the guest's decision, bounded
+  by the guest's own `nosuid` and by whatever the guest kernel enforces. One
+  line follows from the recording and is stated here so nobody has to
+  discover it: a
+  record presents its bits even where the host backing sits on a mount whose
+  own kernel ignores them, because the bits were never the host file's. Two
+  switches mask them instead — the per-namespace server switch and the client's
+  own `--no-privileged-bits`, which is stronger than the classic `nosuid`.
 - **Identity mapping.** Guest-supplied uids/gids are never applied raw:
   maps must be injective, reverse mapping is bounded by the server's actual
   privilege (an unprivileged server cannot chown arbitrarily; the

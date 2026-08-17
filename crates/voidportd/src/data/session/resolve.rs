@@ -16,7 +16,7 @@ use std::sync::Arc;
 
 use rustix::io::Errno;
 
-use super::{Resolved, Session};
+use super::{PrivilegedView, Resolved, Session};
 use crate::data::handle::ListingEntry;
 use crate::data::node::{Interned, Node, NodeBacking, NodeKey};
 use crate::data::pin::{NodePin, Pinned};
@@ -40,9 +40,10 @@ impl Session {
     /// errno from pinning or stat.
     pub fn lookup(&self, parent: &Node, name: &Name) -> Result<Resolved, Errno> {
         let namespace = self.namespace();
+        let privileged = self.privileged(&namespace);
         let parent = self.parent_dir(&namespace, parent)?;
         let resolution = namespace.rules().resolve(&parent.context, name);
-        self.admit(&namespace, &parent, name, &resolution)
+        self.admit(&namespace, &privileged, &parent, name, &resolution)
     }
 
     /// The **live** policy context of a directory node, and the descriptor its
@@ -97,6 +98,7 @@ impl Session {
     pub fn admit(
         &self,
         namespace: &Namespace,
+        privileged: &PrivilegedView,
         parent: &ParentDir,
         name: &Name,
         resolution: &Resolution,
@@ -107,7 +109,15 @@ impl Session {
             Resolution::SynthesizedDir => self.admit_synthesized(namespace, path),
             Resolution::HostBacked { backing, mode } => {
                 let (fd, recipe) = self.pin(namespace, parent, name, backing)?;
-                self.admit_pinned_in(namespace, path, fd, recipe, backing.clone(), *mode)
+                self.admit_pinned_in(
+                    namespace,
+                    privileged,
+                    path,
+                    fd,
+                    recipe,
+                    backing.clone(),
+                    *mode,
+                )
             }
         }
     }
@@ -145,6 +155,7 @@ impl Session {
     pub fn admit_listed(
         &self,
         namespace: &Namespace,
+        privileged: &PrivilegedView,
         parent: &ParentDir,
         entry: &ListingEntry,
     ) -> Result<Resolved, Errno> {
@@ -179,7 +190,7 @@ impl Session {
             // put something else under that name — which is the same rule a
             // repeated lookup follows. The lookup `revisit` just counted is
             // what keeps that node alive while the stat runs unlocked.
-            let attr = self.counted_attr(namespace, &node)?;
+            let attr = self.counted_attr(namespace, privileged, &node)?;
             return Ok(Resolved {
                 kind: node.kind(),
                 node,
@@ -188,7 +199,15 @@ impl Session {
         }
         let (fd, recipe) = self.pin(namespace, parent, &entry.name, backing)?;
         let path = parent.context.path().child(&entry.name);
-        self.admit_pinned_in(namespace, path, fd, recipe, backing.clone(), *mode)
+        self.admit_pinned_in(
+            namespace,
+            privileged,
+            path,
+            fd,
+            recipe,
+            backing.clone(),
+            *mode,
+        )
     }
 
     /// Interns a synthesized directory and answers with its fixed attributes.
@@ -234,7 +253,9 @@ impl Session {
         backing: HostBacking,
         mode: EffectiveMode,
     ) -> Result<Resolved, Errno> {
-        self.admit_pinned_in(&self.namespace(), path, fd, recipe, backing, mode)
+        let namespace = self.namespace();
+        let privileged = self.privileged(&namespace);
+        self.admit_pinned_in(&namespace, &privileged, path, fd, recipe, backing, mode)
     }
 
     /// [`Self::admit_pinned`], against a snapshot the caller already took.
@@ -248,9 +269,14 @@ impl Session {
     /// same reason: admitting a slot may evict another, and closing the evicted
     /// descriptor is a host syscall. A slot whose node turns out to exist
     /// already is given straight back when the unused pin is dropped.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the snapshots the caller took and the pinned entry it made are passed in, not re-resolved: that is the point of this arm"
+    )]
     fn admit_pinned_in(
         &self,
         namespace: &Namespace,
+        privileged: &PrivilegedView,
         path: NamespacePath,
         fd: OwnedFd,
         recipe: HostBacking,
@@ -263,15 +289,15 @@ impl Session {
         // The ownership filter runs on what was just pinned: an entry whose
         // owner the policy hides does not exist, whatever the session may
         // already hold under that name.
+        let found = host.node_identity();
         let fresh = host
-            .present(ino, mode, namespace.ownership())
+            .present(ino, mode, namespace.ownership(), privileged.of(&found))
             .ok_or(Errno::NOENT)?;
         let kind = identity.kind;
         let key = NodeKey::of(&path, identity, mode);
         // Which key shape this entry took decides whether a node the table
         // already holds for it can be answered from the stat above; see below.
         let keyed_by_inode = matches!(key, NodeKey::Inode { .. });
-        let found = host.node_identity();
         let pin = self.budget.pin(Pinned {
             fd,
             path: path.clone(),
@@ -322,7 +348,10 @@ impl Session {
                     // computed. It re-stats.
                     (fresh, kind)
                 } else {
-                    (self.counted_attr(namespace, &node)?, node.kind())
+                    (
+                        self.counted_attr(namespace, privileged, &node)?,
+                        node.kind(),
+                    )
                 }
             }
         };

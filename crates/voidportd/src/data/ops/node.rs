@@ -20,6 +20,7 @@ use super::{Context, OpResult, name_of};
 use crate::data::node::{GENERATION, Node};
 use crate::data::session::{Resolved, Session};
 use crate::host::open::proc_path;
+use crate::records::PrivilegedBits;
 
 /// The entry reply a resolved node produces.
 ///
@@ -98,8 +99,23 @@ pub fn setattr(context: &Context<'_>, request: Request<'_, SetattrRequest>) -> O
     let path = proc_path(fd.as_fd());
 
     if valid & setattr_valid::MODE != 0 {
-        let mode = Mode::from_bits_truncate(body.mode.get());
+        let delivered = body.mode.get();
+        let privileged = session.privileged(&namespace);
+        // Disabled, the namespace shows no privileged bits and refuses to take
+        // any: a guest that cannot see them must not be able to set them.
+        if privileged.is_masked() && !PrivilegedBits::of(delivered).is_empty() {
+            return Err(Errno::PERM);
+        }
+        // The host mode never carries a privileged bit this server set — the
+        // one shared masking rule, the same one every create goes through.
+        let mode = Mode::from_bits_truncate(crate::records::host_mode(delivered));
         rustix::fs::chmodat(CWD, path.as_str(), mode, AtFlags::empty())?;
+        // The host took the change, so the record takes the delivered bits as
+        // its new value: present record, absent delete. A masked presentation
+        // does neither.
+        if let (Some(identity), Some(recipe)) = (node.identity(), node.host_recipe()) {
+            session.record_delivered_mode(&privileged, identity, &recipe, delivered);
+        }
     }
     if valid & (setattr_valid::UID | setattr_valid::GID) != 0 {
         // One snapshot for both halves of the chown, so a mutation landing

@@ -65,6 +65,10 @@ pub enum Command {
     /// writes ride the host page cache.
     #[command(subcommand)]
     DirectIo(DirectIoCommand),
+    /// Privileged mode bits (setuid, setgid): whether a namespace records and
+    /// presents them.
+    #[command(subcommand)]
+    PrivilegedBits(PrivilegedBitsCommand),
     /// Auth mode operations.
     #[command(subcommand)]
     Auth(AuthCommand),
@@ -311,6 +315,29 @@ pub enum DirectIoCommand {
         /// The posture.
         #[arg(long, value_enum)]
         posture: DirectIoArg,
+    },
+}
+
+/// `voidport-ctl privileged-bits …`
+#[derive(Debug, Subcommand)]
+pub enum PrivilegedBitsCommand {
+    /// Record and present setuid and setgid on this namespace.
+    ///
+    /// The default. The server's own host backing never carries the bits — it
+    /// records them and merges them into what a guest is shown — and what they
+    /// mean is the guest kernel's decision, in its own trust domain.
+    Enable {
+        /// The namespace.
+        namespace: String,
+    },
+    /// Mask setuid and setgid on this namespace.
+    ///
+    /// Recorded and host-real bits alike stop being shown, and a chmod that
+    /// would set one is refused. Recorded truth is kept, not discarded:
+    /// enabling the switch again presents it.
+    Disable {
+        /// The namespace.
+        namespace: String,
     },
 }
 
@@ -589,6 +616,9 @@ impl Command {
                     direct_io: (*direct_io).into(),
                     auth: (*auth).into(),
                     ownership: ownership.to_spec(false)?,
+                    // A create takes the default; the switch has an
+                    // operation of its own.
+                    privileged_bits: true,
                     rules: Vec::new(),
                     xattr: Vec::new(),
                 },
@@ -669,6 +699,18 @@ impl Command {
                 namespace: namespace_name(namespace)?,
                 posture: (*posture).into(),
             },
+            Self::PrivilegedBits(PrivilegedBitsCommand::Enable { namespace }) => {
+                Request::PrivilegedBitsSet {
+                    namespace: namespace_name(namespace)?,
+                    enabled: true,
+                }
+            }
+            Self::PrivilegedBits(PrivilegedBitsCommand::Disable { namespace }) => {
+                Request::PrivilegedBitsSet {
+                    namespace: namespace_name(namespace)?,
+                    enabled: false,
+                }
+            }
             Self::Auth(AuthCommand::Set { namespace, mode }) => Request::AuthSet {
                 namespace: namespace_name(namespace)?,
                 mode: (*mode).into(),
@@ -746,6 +788,7 @@ mod tests {
                 "--posture",
                 "passthrough",
             ],
+            &["voidport-ctl", "privileged-bits", "enable", "p"],
             &["voidport-ctl", "auth", "set", "p", "--mode", "none"],
             &["voidport-ctl", "session", "list"],
             &[
@@ -768,6 +811,24 @@ mod tests {
             })
             .collect();
         assert_eq!(operations, voidport_control::OPERATIONS);
+    }
+
+    /// The two spellings of the one switch: `enable` and `disable` are the same
+    /// operation carrying opposite values, which is why only one of them
+    /// appears in the coverage list above.
+    #[test]
+    fn the_privileged_bits_commands_are_one_operation_with_two_values() {
+        for (command, enabled) in [("enable", true), ("disable", false)] {
+            let request = parse(&["voidport-ctl", "privileged-bits", command, "p"])
+                .command
+                .to_request()
+                .expect("valid request");
+            assert_eq!(request.operation(), "privileged-bits-set");
+            let voidport_control::Request::PrivilegedBitsSet { enabled: sent, .. } = request else {
+                panic!("{command} does not set the switch");
+            };
+            assert_eq!(sent, enabled);
+        }
     }
 
     /// Each transport builds the listener the state file would hold, and

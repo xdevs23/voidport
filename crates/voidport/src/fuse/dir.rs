@@ -54,7 +54,7 @@ use fuser::{Errno, FileAttr, FileType};
 use voidport_proto::ops::dir::ReaddirplusResponse;
 
 use crate::client::{Caller, Client, DirEntry};
-use crate::fuse::attr::{dirent_kind, entry_attr};
+use crate::fuse::attr::{Privileged, dirent_kind, entry_attr};
 use crate::fuse::errno;
 
 /// The most entry-stream bytes one wire readdirplus asks for.
@@ -250,6 +250,10 @@ pub struct DirectoryRead {
 /// dropped and refetched, not served, so no entry reply this returns
 /// describes a file by attributes the guest may not believe.
 ///
+/// `privileged` is the mount's own presentation of setuid and setgid, applied
+/// here for the same reason it is applied to every other entry reply: a mount
+/// that opted out shows the bits nowhere, a listing included.
+///
 /// # Errors
 ///
 /// The server's errno, or `EIO` on a dead connection.
@@ -259,6 +263,7 @@ pub async fn read_directory<S: DirectorySink>(
     caller: Caller,
     read: DirectoryRead,
     attr_ttl: Duration,
+    privileged: Privileged,
     sink: &mut S,
 ) -> Result<(), Errno> {
     let DirectoryRead { handle, cookie, .. } = read;
@@ -276,7 +281,7 @@ pub async fn read_directory<S: DirectorySink>(
 
     let mut delivered = 0;
     for item in &batch.entries {
-        let attr = entry_attr(&item.entry);
+        let attr = entry_attr(&item.entry, privileged);
         let refused = sink.offer(&DirectoryEntry {
             node_id: item.entry.node_id,
             name: &item.name,

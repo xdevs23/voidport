@@ -93,6 +93,14 @@ pub enum Command {
         /// caching normally instead of giving up mmap.
         #[arg(long)]
         direct_io: bool,
+        /// Show no setuid or setgid bits on this mount, and refuse a chmod that
+        /// would set one. Stronger than the classic nosuid, which honors
+        /// nothing but still shows the bits: this masks them, so nothing on
+        /// this mount can read that a file carries one. Recorded bits are
+        /// untouched — other mounts of the same namespace keep presenting
+        /// them, and a chmod through this mount cannot clear them.
+        #[arg(long)]
+        no_privileged_bits: bool,
         /// How much memory, in MiB, this mount may hold for reading ahead of a
         /// sequential reader. A ceiling and not an allocation: an idle mount
         /// holds nothing. Zero turns the engine off and every read goes to the

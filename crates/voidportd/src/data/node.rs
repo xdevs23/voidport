@@ -136,15 +136,21 @@ impl Node {
         self.pin().map(|pin| pin.identity())
     }
 
-    /// Where the pinned entry lived when it was pinned, or `None` for a
+    /// The entry's whole host path **as the host has it now**, or `None` for a
     /// synthesized directory.
     ///
-    /// This is a record of what the pin names, not a statement about current
-    /// policy: the namespace may since have re-pointed the path this node was
-    /// reached by somewhere else entirely.
+    /// The node's recipe, not the location the namespace described at pin time:
+    /// the two part company wherever the server has since moved the entry, or
+    /// moved a parent it was reached through, and only the recipe names
+    /// something the host can be asked about. It is therefore also the space
+    /// [`Move`] is spelled in, so a locator built from it is one
+    /// [`RecordStore::relocate`](crate::records::RecordStore::relocate) can
+    /// re-point.
+    ///
+    /// A snapshot, because the recipe lives behind the pin's own lock.
     #[must_use]
-    pub fn host_backing(&self) -> Option<&HostBacking> {
-        self.pin().map(|pin| pin.backing())
+    pub fn host_recipe(&self) -> Option<HostBacking> {
+        self.pin().map(|pin| pin.recipe())
     }
 
     /// The effective share mode, or `None` for a synthesized directory (which
@@ -297,6 +303,29 @@ impl Move {
             from: None,
             to,
         }
+    }
+
+    /// The entry that moved, as the host had it before the move.
+    ///
+    /// Read by the namespace's record store, which owes the very same
+    /// re-pointing the node table does: a record's locator must follow the
+    /// entry the server itself moved, or a restart would revalidate it against
+    /// a name that is gone.
+    #[must_use]
+    pub fn entry(&self) -> HostIdentity {
+        self.entry
+    }
+
+    /// Where it was, or `None` for a link, which moves nothing.
+    #[must_use]
+    pub fn from(&self) -> Option<&HostBacking> {
+        self.from.as_ref()
+    }
+
+    /// Where it is now.
+    #[must_use]
+    pub fn to(&self) -> &HostBacking {
+        &self.to
     }
 
     /// Whether this move can have taken other nodes' entries with it, which is

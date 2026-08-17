@@ -211,6 +211,7 @@ mod tests {
                         uid_map: vec![IdMapping::new(IdSentinel::Uid, 0)],
                         gid_map: vec![IdMapping::new(IdSentinel::Gid, 0)],
                     },
+                    privileged_bits: true,
                     rules: vec![
                         Rule::new("/project", ShareMode::Rw).with_target("project"),
                         Rule::new("/project/*", ShareMode::Hidden),
@@ -227,6 +228,7 @@ mod tests {
                     direct_io: HostDirectIo::Cached,
                     auth: AuthMode::None,
                     ownership: OwnershipSpec::Static { uid: 0, gid: 0 },
+                    privileged_bits: true,
                     rules: Vec::new(),
                     xattr: Vec::new(),
                 },

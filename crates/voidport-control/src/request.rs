@@ -136,6 +136,17 @@ requests! {
         /// The new posture.
         posture: HostDirectIo,
     } => "direct-io-set",
+    /// Turns a namespace's privileged mode bits (setuid, setgid) on or off.
+    ///
+    /// Off, presentation masks them — recorded and host-real alike — and a
+    /// chmod attempting to set them is refused; recorded truth is kept, not
+    /// discarded, so turning the switch back on presents it again.
+    PrivilegedBitsSet {
+        /// The namespace to change.
+        namespace: NamespaceName,
+        /// Whether the namespace records and presents privileged bits.
+        enabled: bool,
+    } => "privileged-bits-set",
     /// Sets a namespace's auth mode.
     AuthSet {
         /// The namespace to change.
@@ -270,6 +281,13 @@ mod tests {
                 r#"{"op":"direct-io-set","namespace":"p","posture":"passthrough"}"#,
             ),
             (
+                Request::PrivilegedBitsSet {
+                    namespace: name("p"),
+                    enabled: false,
+                },
+                r#"{"op":"privileged-bits-set","namespace":"p","enabled":false}"#,
+            ),
+            (
                 Request::AuthSet {
                     namespace: name("p"),
                     mode: AuthMode::None,
@@ -362,6 +380,10 @@ mod tests {
             Request::DirectIoSet {
                 namespace: name("p"),
                 posture: HostDirectIo::Cached,
+            },
+            Request::PrivilegedBitsSet {
+                namespace: name("p"),
+                enabled: true,
             },
             Request::AuthSet {
                 namespace: name("p"),

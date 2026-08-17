@@ -168,6 +168,20 @@ direct_io = "cached"
 # How clients authenticate. v1: `none`.
 auth = "none"
 
+# Whether this namespace records and presents the privileged mode bits, setuid
+# and setgid. On by default: a guest expects a filesystem where they work,
+# persist and strip as local semantics demand, and the server records them
+# because its own host backing must never carry a privileged bit an
+# unprivileged process set. What the bits MEAN is the guest kernel's decision,
+# in its own trust domain — the server only presents them, and a guest that
+# does not want them can mount with `--no-privileged-bits`.
+#
+# Off, presentation masks setuid and setgid — recorded and host-real alike —
+# and a chmod attempting to set one is refused. Recorded truth is kept, not
+# discarded: turning it back on presents it again. The records live in a
+# sidecar file beside this one and are deleted with the namespace.
+privileged_bits = true
+
 # --- Ownership --------------------------------------------------------------
 # Three modes, each with its own required fields; a field belonging to another
 # mode is a load error, not a silently ignored key.

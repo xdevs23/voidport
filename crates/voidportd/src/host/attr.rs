@@ -2,13 +2,16 @@
 //!
 //! Attributes are read fresh from the host on every request that needs them —
 //! the server is a passthrough proxy and the host filesystem is the truth — and
-//! then pass through exactly two policy transformations before they reach the
+//! then pass through exactly three policy transformations before they reach the
 //! wire:
 //!
 //! * **ownership** is forward-mapped through the namespace's algebra, which may
-//!   also decide the file must not be seen at all (`unmapped: hide`), and
+//!   also decide the file must not be seen at all (`unmapped: hide`),
 //! * **permission bits** go through the presented-bits function, which is where
-//!   a read-only graft loses its write bits.
+//!   a read-only graft loses its write bits, and
+//! * **privileged bits** are merged from the namespace's record store — the
+//!   setuid and setgid bits the host backing must not carry — or masked away
+//!   where the namespace switch is off (see [`crate::records`]).
 //!
 //! The `ino` is never the host's: it is the server-global synthetic number
 //! keyed by `(host_dev, host_ino)`, so identity is stable across sessions and
@@ -22,6 +25,7 @@ use rustix::io::Errno;
 use voidport_proto::attr::{Attr, Timespec, file_type};
 use zerocopy::byteorder::little_endian::{U32, U64};
 
+use crate::records::Privileged;
 use crate::rules::{
     EffectiveMode, HostIds, OwnerPresentation, Ownership, SYNTHESIZED_DIR_PERMISSIONS,
     presented_mode,
@@ -77,7 +81,7 @@ const S_IFDIR: u32 = 0o040_000;
 /// The server cares about three distinctions and no more: directories drive
 /// child resolution, symlinks are pinned but never followed, and everything
 /// else is a leaf it passes bytes through.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum FileKind {
     /// A directory.
     Directory,
@@ -157,7 +161,7 @@ pub struct HostIdentity {
 /// Where a filesystem records no birth time the check falls back to
 /// `(device, inode, kind)` and the guarantee is best-effort for that
 /// filesystem — stated, not hidden.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct NodeIdentity {
     /// The host device.
     pub device: u64,
@@ -266,6 +270,24 @@ impl HostAttr {
         Ok(Self { stat })
     }
 
+    /// Reads the metadata of an absolute host path, following no symlink at
+    /// the final component.
+    ///
+    /// The one stat that does **not** run under the containment discipline,
+    /// and it is deliberately narrow: the record sidecar's revalidation names a
+    /// locator the server itself wrote, before any graft descriptor exists —
+    /// a fresh process has nothing pinned to descend from. Nothing is opened
+    /// and nothing is served from it: the answer decides only whether a
+    /// recorded row still describes the file it was written for.
+    ///
+    /// # Errors
+    ///
+    /// Returns the host errno — `ENOENT` where the locator names nothing.
+    pub fn of_host_path(path: &std::path::Path) -> Result<Self, Errno> {
+        let stat = statx(rustix::fs::CWD, path, AtFlags::SYMLINK_NOFOLLOW, WANTED)?;
+        Ok(Self { stat })
+    }
+
     /// Reads the metadata of one named entry of a pinned directory.
     ///
     /// `name` is a single component — [`Name`](crate::rules::Name) cannot be
@@ -349,8 +371,20 @@ impl HostAttr {
     /// `ino` is the server-global synthetic inode number for
     /// [`Self::identity`]; the caller allocates it, because allocation is
     /// server-global state and this function is otherwise pure.
+    ///
+    /// `privileged` is the third and last transformation of the presented mode:
+    /// the recorded setuid and setgid bits ORed in, or masked away where the
+    /// namespace switch is off. It is a plain value the caller resolved once
+    /// for the whole operation — no host syscall, no per-session cache — which
+    /// is what keeps a listing's per-entry cost a table lookup.
     #[must_use]
-    pub fn present(&self, ino: u64, mode: EffectiveMode, ownership: &Ownership) -> Option<Attr> {
+    pub fn present(
+        &self,
+        ino: u64,
+        mode: EffectiveMode,
+        ownership: &Ownership,
+        privileged: Privileged,
+    ) -> Option<Attr> {
         let OwnerPresentation::Visible(guest) = ownership.forward(self.owner()) else {
             return None;
         };
@@ -361,7 +395,7 @@ impl HostAttr {
             atime: timespec(self.stat.stx_atime.tv_sec, self.stat.stx_atime.tv_nsec),
             mtime: timespec(self.stat.stx_mtime.tv_sec, self.stat.stx_mtime.tv_nsec),
             ctime: timespec(self.stat.stx_ctime.tv_sec, self.stat.stx_ctime.tv_nsec),
-            mode: U32::new(presented_mode(self.host_mode(), mode)),
+            mode: U32::new(privileged.apply(presented_mode(self.host_mode(), mode))),
             nlink: U32::new(self.stat.stx_nlink as u32),
             uid: U32::new(guest.uid),
             gid: U32::new(guest.gid),
@@ -416,6 +450,7 @@ fn timespec(sec: i64, nsec: u32) -> Timespec {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::records::PrivilegedBits;
     use crate::rules::{
         IdMap, IdMapping, OwnershipMode, ServerIdentity, SquashIds, UnmappedPolicy,
     };
@@ -452,7 +487,12 @@ mod tests {
         assert!(!host.kind().is_directory());
         assert_eq!(host.kind().dirent_type(host.host_mode()), file_type::REG);
         let attr = host
-            .present(77, EffectiveMode::Rw, &passthrough())
+            .present(
+                77,
+                EffectiveMode::Rw,
+                &passthrough(),
+                Privileged::Recorded(PrivilegedBits::NONE),
+            )
             .expect("passthrough ownership shows every file");
         assert_eq!(attr.ino.get(), 77);
         assert_eq!(attr.size.get(), 10);
@@ -467,7 +507,12 @@ mod tests {
         let pinned = pin(&scratch.file("file", b"x"));
         let host = HostAttr::of(pinned.as_fd()).expect("stattable");
         let attr = host
-            .present(1, EffectiveMode::Ro, &passthrough())
+            .present(
+                1,
+                EffectiveMode::Ro,
+                &passthrough(),
+                Privileged::Recorded(PrivilegedBits::NONE),
+            )
             .expect("visible");
         assert_eq!(attr.mode.get() & 0o222, 0);
         assert_eq!(attr.mode.get(), host.host_mode() & !0o222);
@@ -499,7 +544,10 @@ mod tests {
             SquashIds::default(),
         )
         .expect("valid ownership");
-        assert!(host.present(1, EffectiveMode::Rw, &ownership).is_none());
+        assert!(
+            host.present(1, EffectiveMode::Rw, &ownership, Privileged::Masked)
+                .is_none()
+        );
     }
 
     #[test]

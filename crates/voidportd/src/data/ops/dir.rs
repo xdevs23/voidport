@@ -39,7 +39,11 @@ pub fn mkdir(context: &Context<'_>, request: Request<'_, MkdirRequest>) -> OpRes
     let site = session.site(&parent, &name)?;
     let body = request.body();
     let mode = permissions(body.mode.get(), body.umask.get());
-    rustix::fs::mkdirat(site.directory.as_fd(), site.name.as_bytes(), mode)?;
+    rustix::fs::mkdirat(
+        site.directory.as_fd(),
+        site.name.as_bytes(),
+        host_permissions(mode),
+    )?;
     let resolved = adopt(
         session,
         &site,
@@ -79,7 +83,13 @@ pub fn mknod(context: &Context<'_>, request: Request<'_, MknodRequest>) -> OpRes
     let mode = permissions(body.mode.get(), body.umask.get());
     // The device number is never passed on: the only kinds served take none,
     // and a nonzero one on a FIFO would be a lie the host would ignore.
-    rustix::fs::mknodat(site.directory.as_fd(), site.name.as_bytes(), kind, mode, 0)?;
+    rustix::fs::mknodat(
+        site.directory.as_fd(),
+        site.name.as_bytes(),
+        kind,
+        host_permissions(mode),
+        0,
+    )?;
     let resolved = adopt(
         session,
         &site,
@@ -299,6 +309,9 @@ pub fn readdirplus(context: &Context<'_>, request: Request<'_, ReaddirplusReques
     session.handles().owned_by(handle, node.id)?;
     let listing = session.handles().listing(handle)?;
     let namespace = session.namespace();
+    // Both snapshots once, for the whole batch: the record table is read here
+    // and never per entry, so an entry's privileged bits cost a map lookup.
+    let privileged = session.privileged(&namespace);
     let parent = session.parent_dir(&namespace, &node)?;
 
     let cookie = request.body().cookie.get();
@@ -316,7 +329,7 @@ pub fn readdirplus(context: &Context<'_>, request: Request<'_, ReaddirplusReques
     // every other operation of this session — a lookup, a getattr, a write's
     // entry reply — behind one listing.
     for (offset, entry) in remaining.iter().enumerate() {
-        let resolved = match session.admit_listed(&namespace, &parent, entry) {
+        let resolved = match session.admit_listed(&namespace, &privileged, &parent, entry) {
             Ok(resolved) => resolved,
             // The entry went away, or ownership policy now hides it. Skipping
             // it keeps the listing honest: every name it reports resolves.
@@ -408,6 +421,10 @@ fn adopt(
         Adoption::Created { caller, mode } => {
             session.apply_create_ownership(fd.as_fd(), caller);
             super::file::apply_mode(fd.as_fd(), mode)?;
+            // Before the entry reply below is built, because that reply
+            // presents the mode the guest asked for — the recorded bits
+            // included.
+            super::file::record_created_mode(session, fd.as_fd(), &site.recipe, mode)?;
         }
         // A symlink is the exception: it is owned through the site — the
         // directory descriptor the creation was issued against and the one
@@ -439,8 +456,9 @@ enum Adoption {
     Created {
         /// Whose it becomes.
         caller: GuestIds,
-        /// The bits it takes, the guest's umask already subtracted.
-        mode: Mode,
+        /// The mode the guest delivered, its umask already subtracted. The
+        /// host takes it less the privileged bits; the record takes those.
+        mode: u32,
     },
     /// A new symlink: the same, applied to the link itself and never followed
     /// through to whatever it names.
@@ -457,9 +475,21 @@ fn caller<M: voidport_proto::message::RequestBody>(request: &Request<'_, M>) -> 
     GuestIds::new(request.head().uid.get(), request.head().gid.get())
 }
 
-/// The permission bits a create requests, with the caller's umask applied.
-pub(super) fn permissions(mode: u32, umask: u32) -> Mode {
-    Mode::from_bits_truncate(mode & !umask & 0o7777)
+/// The permission bits a create **delivers**, with the caller's umask applied.
+///
+/// The privileged bits are kept here, because they are what the record takes
+/// its new value from; [`host_permissions`] is what reaches the host.
+pub(super) fn permissions(mode: u32, umask: u32) -> u32 {
+    mode & !umask & 0o7777
+}
+
+/// The mode a create applies to the host backing.
+///
+/// The one shared masking rule, the same one a chmod goes through: the host
+/// file never gains a privileged bit this server's own user set, on either
+/// path.
+pub(super) fn host_permissions(delivered: u32) -> Mode {
+    Mode::from_bits_truncate(crate::records::host_mode(delivered))
 }
 
 /// The host rename flags a wire request asks for.
@@ -483,10 +513,30 @@ mod tests {
 
     #[test]
     fn a_umask_takes_bits_away_and_never_adds_any() {
-        assert_eq!(permissions(0o777, 0o022), Mode::from_bits_truncate(0o755));
-        assert_eq!(permissions(0o666, 0o077), Mode::from_bits_truncate(0o600));
+        assert_eq!(permissions(0o777, 0o022), 0o755);
+        assert_eq!(permissions(0o666, 0o077), 0o600);
         // Nothing outside the permission bits survives.
-        assert_eq!(permissions(0o100_644, 0), Mode::from_bits_truncate(0o644));
+        assert_eq!(permissions(0o100_644, 0), 0o644);
+    }
+
+    /// The host mode a create applies never carries a privileged bit, and the
+    /// delivered mode keeps them so the record can take them.
+    #[test]
+    fn a_create_masks_the_privileged_bits_out_of_the_host_mode() {
+        assert_eq!(permissions(0o6755, 0), 0o6755);
+        assert_eq!(
+            host_permissions(permissions(0o6755, 0)),
+            Mode::from_bits_truncate(0o755)
+        );
+        assert_eq!(
+            host_permissions(permissions(0o4644, 0o022)),
+            Mode::from_bits_truncate(0o644)
+        );
+        // The sticky bit is not privileged and survives both.
+        assert_eq!(
+            host_permissions(permissions(0o1777, 0)),
+            Mode::from_bits_truncate(0o1777)
+        );
     }
 
     #[test]

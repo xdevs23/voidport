@@ -154,6 +154,23 @@ impl<'a> Response<'a, ReadResponse> {
     }
 }
 
+/// Bit values for [`WriteRequest::write_flags`].
+///
+/// The field has carried must-be-zero-on-send / ignore-unknown-on-receive from
+/// day one, which is what makes adding a flag additive: the zero value is
+/// exactly the old behaviour, an elder peer ignores the bit, and every existing
+/// frame stays byte-identical. The strictly enforced `reserved` field beside it
+/// is unaffected and is still a framing error when nonzero.
+pub mod write_flags {
+    /// The guest kernel asks for this file's privileged mode bits to be
+    /// stripped, because the writer does not hold the file-mode privilege.
+    ///
+    /// Carried on **every chunk** of a write the guest kernel split, since
+    /// stripping is idempotent. An elder server ignores it and strips nothing:
+    /// fail-open for stripping under version skew, until both sides update.
+    pub const PRIVILEGED_STRIP: u32 = 1 << 0;
+}
+
 wire_struct! {
     /// Write to an open file. The payload carries the data.
     pub struct WriteRequest {
@@ -165,8 +182,8 @@ wire_struct! {
         pub data_len: U32,
         /// Linux `open(2)` flags the handle was opened with.
         pub flags: U32,
-        /// Write flags. v1 defines none: zero on send, unknown bits ignored on
-        /// receive.
+        /// See [`write_flags`]: zero on send for a flag the sender does not
+        /// mean, unknown bits ignored on receive.
         pub write_flags: U32,
         /// Reserved; zero.
         pub reserved: U32,

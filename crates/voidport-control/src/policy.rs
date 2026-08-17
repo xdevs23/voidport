@@ -481,6 +481,11 @@ fn default_squash_id() -> u32 {
     DEFAULT_SQUASH_ID
 }
 
+/// The default of a switch that is on unless an operator turned it off.
+fn enabled() -> bool {
+    true
+}
+
 /// One rule in source form.
 ///
 /// `path` is a rule path (`/a/b`, or `/a/*` for the per-directory fallback),
@@ -694,6 +699,17 @@ pub struct NamespaceSpec {
     /// How host ownership maps into guest id space.
     #[serde(default)]
     pub ownership: OwnershipSpec,
+    /// Whether the namespace records and presents privileged mode bits
+    /// (setuid, setgid).
+    ///
+    /// Enabled by default: a guest expects a filesystem where setuid works,
+    /// persists and strips as local semantics demand, and the server records
+    /// what its own host backing must not carry. Disabled, presentation masks
+    /// those bits — recorded and host-real alike — and a chmod attempting to
+    /// set them is refused. Enforcement of what the bits *mean* is always the
+    /// guest kernel's, in its own trust domain.
+    #[serde(default = "enabled")]
+    pub privileged_bits: bool,
     /// The rule table.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub rules: Vec<Rule>,
@@ -713,6 +729,7 @@ impl NamespaceSpec {
             direct_io: HostDirectIo::default(),
             auth: AuthMode::default(),
             ownership: OwnershipSpec::default(),
+            privileged_bits: enabled(),
             rules: Vec::new(),
             xattr: Vec::new(),
         }
@@ -889,6 +906,10 @@ mod tests {
         assert_eq!(spec.permission, PermissionMode::Passthrough);
         assert_eq!(spec.direct_io, HostDirectIo::Cached);
         assert_eq!(spec.auth, AuthMode::None);
+        assert!(
+            spec.privileged_bits,
+            "a namespace that says nothing records and presents privileged bits"
+        );
         assert!(spec.rules.is_empty());
         assert!(spec.rule("/a").is_none());
 
@@ -977,7 +998,7 @@ mod tests {
         assert!(spec.xattr.is_empty());
         assert_eq!(
             json(&spec),
-            r#"{"name":"project","permission":"passthrough","direct_io":"cached","auth":"none","ownership":{"mode":"passthrough"}}"#
+            r#"{"name":"project","permission":"passthrough","direct_io":"cached","auth":"none","ownership":{"mode":"passthrough"},"privileged_bits":true}"#
         );
         assert!(spec.xattr_rule("user.*").is_none());
 

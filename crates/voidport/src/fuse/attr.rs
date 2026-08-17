@@ -19,16 +19,57 @@ use crate::client::{Entry, TimeChange};
 const FORMAT_MASK: u32 = 0o170_000;
 /// The permission, setuid, setgid and sticky bits of a mode word.
 const PERMISSION_MASK: u32 = 0o7777;
+/// `S_ISUID | S_ISGID`: the privileged bits `--no-privileged-bits` masks.
+pub const PRIVILEGED_MASK: u32 = 0o6000;
+
+/// Whether this mount shows privileged mode bits at all.
+///
+/// The client-side half of the two switches every recorded-metadata feature
+/// has: the server's is per namespace, this one opts **one mount** out. It is
+/// stronger than the classic `nosuid`, which honors nothing but still shows the
+/// bits: this masks them, so nothing on the mount can even read that a file
+/// carries them.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum Privileged {
+    /// Setuid and setgid present as the server sends them.
+    #[default]
+    Present,
+    /// They are masked out of every attribute this mount hands the kernel.
+    Masked,
+}
+
+impl Privileged {
+    /// What `--no-privileged-bits` resolves to.
+    #[must_use]
+    pub fn of(masked: bool) -> Self {
+        if masked { Self::Masked } else { Self::Present }
+    }
+
+    /// The mode this mount presents.
+    #[must_use]
+    pub fn apply(self, mode: u32) -> u32 {
+        match self {
+            Self::Present => mode,
+            Self::Masked => mode & !PRIVILEGED_MASK,
+        }
+    }
+
+    /// Whether this mount masks.
+    #[must_use]
+    pub fn is_masked(self) -> bool {
+        self == Self::Masked
+    }
+}
 
 /// The attributes of an entry reply, presented to the kernel.
 #[must_use]
-pub fn entry_attr(entry: &Entry) -> FileAttr {
-    node_attr(entry.node_id, &entry.attr)
+pub fn entry_attr(entry: &Entry, privileged: Privileged) -> FileAttr {
+    node_attr(entry.node_id, &entry.attr, privileged)
 }
 
 /// The attributes of a node the client already knows the id of.
 #[must_use]
-pub fn node_attr(node_id: u64, attr: &Attr) -> FileAttr {
+pub fn node_attr(node_id: u64, attr: &Attr, privileged: Privileged) -> FileAttr {
     FileAttr {
         ino: INodeNo(node_id),
         size: attr.size.get(),
@@ -39,7 +80,7 @@ pub fn node_attr(node_id: u64, attr: &Attr) -> FileAttr {
         // Linux has no creation time in `struct stat`; the field is macOS's.
         crtime: UNIX_EPOCH,
         kind: mode_kind(attr.mode.get()),
-        perm: (attr.mode.get() & PERMISSION_MASK) as u16,
+        perm: (privileged.apply(attr.mode.get()) & PERMISSION_MASK) as u16,
         nlink: attr.nlink.get(),
         uid: attr.uid.get(),
         gid: attr.gid.get(),
@@ -161,8 +202,29 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_that_opts_out_shows_no_privileged_bits() {
+        assert_eq!(
+            node_attr(9, &attr(0o106_755), Privileged::Present).perm,
+            0o6755
+        );
+        assert_eq!(
+            node_attr(9, &attr(0o106_755), Privileged::Masked).perm,
+            0o0755,
+            "stronger than nosuid: the bits are not shown at all"
+        );
+        // Every other bit is untouched, the sticky bit included.
+        assert_eq!(
+            node_attr(9, &attr(0o101_777), Privileged::Masked).perm,
+            0o1777
+        );
+        assert!(Privileged::of(true).is_masked());
+        assert!(!Privileged::of(false).is_masked());
+        assert_eq!(Privileged::default(), Privileged::Present);
+    }
+
+    #[test]
     fn the_presented_inode_is_the_node_id_not_the_wire_ino() {
-        let presented = node_attr(9, &attr(0o100_644));
+        let presented = node_attr(9, &attr(0o100_644), Privileged::Present);
         assert_eq!(presented.ino, INodeNo(9));
         assert_eq!(presented.kind, FileType::RegularFile);
         assert_eq!(presented.perm, 0o644);

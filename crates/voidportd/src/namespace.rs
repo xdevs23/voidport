@@ -45,6 +45,8 @@ pub struct Namespace {
     ownership: Ownership,
     rules: RuleTable,
     xattr: XattrRules,
+    /// Whether privileged mode bits are recorded and presented at all.
+    privileged_bits: bool,
     grafts: Arc<Grafts>,
 }
 
@@ -56,12 +58,17 @@ impl Namespace {
     /// ownership algebra, an unopenable graft target — is a build boundary in
     /// [`crate::state::build`].
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "a namespace is the whole of one entry of the state document, frozen; grouping its parts into a struct would only move the same list one layer out"
+    )]
     pub fn new(
         name: NamespaceName,
         modes: PolicyModes,
         ownership: Ownership,
         rules: RuleTable,
         xattr: XattrRules,
+        privileged_bits: bool,
         grafts: Grafts,
     ) -> Self {
         Self {
@@ -70,8 +77,25 @@ impl Namespace {
             ownership,
             rules,
             xattr,
+            privileged_bits,
             grafts: Arc::new(grafts),
         }
+    }
+
+    /// Whether this namespace records and presents privileged mode bits.
+    ///
+    /// Enabled by default, and disabled loudly: presentation then masks setuid
+    /// and setgid — recorded and host-real alike — a chmod attempting to set
+    /// them is refused, and a delivered mode neither records nor deletes, so a
+    /// read-modify-write chmod from a mount that was shown no bits cannot
+    /// destroy recorded truth other mounts still present.
+    ///
+    /// Per namespace, like everything else here: a change through the control
+    /// plane reaches a mounted guest by the same snapshot swap that carries a
+    /// share-mode change, and is live at the next operation.
+    #[must_use]
+    pub fn privileged_bits(&self) -> bool {
+        self.privileged_bits
     }
 
     /// The pinned graft descriptors every host lookup starts from.

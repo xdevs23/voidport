@@ -364,6 +364,9 @@ impl Form {
                         direct_io: HostDirectIo::default(),
                         auth,
                         ownership,
+                        // A create takes the default; the switch has an
+                        // operation of its own.
+                        privileged_bits: true,
                         rules: Vec::new(),
                         xattr: Vec::new(),
                     },

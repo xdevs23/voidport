@@ -62,7 +62,9 @@ use voidport_proto::ops::dir::rename_flags;
 use voidport_proto::ops::xattr::setxattr_flags;
 
 use crate::client::{AttrChange, Caller, Client, Lock, LockKind, Readahead};
-use crate::fuse::attr::{entry_attr, node_attr, time_change, timespec};
+use crate::fuse::attr::{
+    PRIVILEGED_MASK, Privileged, entry_attr, node_attr, time_change, timespec,
+};
 use crate::fuse::dir::{
     Directories, DirectoryEntry, DirectoryRead, DirectorySink, read_directory, release_directory,
 };
@@ -252,6 +254,10 @@ pub struct VoidportFs {
     entry_ttl: Duration,
     /// What the mount asked for with `--direct-io`.
     direct_io: bool,
+    /// Whether this mount shows privileged mode bits at all — the client-side
+    /// switch `--no-privileged-bits` sets. Read by every attribute this
+    /// adapter hands the kernel, and by the one callback that can change them.
+    privileged: Privileged,
     /// What [`direct_io`](Self::direct_io) resolved to once the kernel answered
     /// the handshake. Written by `init` and read by every open thereafter.
     caching: DataCaching,
@@ -281,12 +287,17 @@ impl VoidportFs {
     /// callbacks the kernel is owed a reply for are counted, for the teardown
     /// that has to wait them out.
     #[must_use]
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the adapter is the mount's whole configuration; a struct around it would be the same list under another name"
+    )]
     pub fn new(
         client: Arc<Client>,
         runtime: tokio::runtime::Handle,
         attr_ttl: Duration,
         entry_ttl: Duration,
         direct_io: bool,
+        privileged: Privileged,
         readahead: Arc<Readahead>,
         inflight: Arc<InFlight>,
     ) -> Self {
@@ -296,6 +307,7 @@ impl VoidportFs {
             attr_ttl,
             entry_ttl,
             direct_io,
+            privileged,
             caching: DataCaching::Page,
             directories: Arc::default(),
             readahead,
@@ -391,6 +403,7 @@ impl fuser::Filesystem for VoidportFs {
 
     fn lookup(&self, request: &Request, parent: INodeNo, name: &OsStr, reply: ReplyEntry) {
         let (client, caller) = (self.client(), caller_of(request));
+        let privileged = self.privileged;
         let (attr_ttl, entry_ttl) = (self.attr_ttl, self.entry_ttl);
         let name = name.as_bytes().to_vec();
         self.spawn(async move {
@@ -398,7 +411,7 @@ impl fuser::Filesystem for VoidportFs {
                 Ok(entry) => reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,
-                    &entry_attr(&entry),
+                    &entry_attr(&entry, privileged),
                     Generation(entry.generation),
                 ),
                 Err(error) => reply.error(errno(error)),
@@ -421,9 +434,10 @@ impl fuser::Filesystem for VoidportFs {
 
     fn getattr(&self, request: &Request, ino: INodeNo, fh: Option<FileHandle>, reply: ReplyAttr) {
         let (client, caller, ttl) = (self.client(), caller_of(request), self.attr_ttl);
+        let privileged = self.privileged;
         self.spawn(async move {
             match client.getattr(caller, ino.0, fh.map(|fh| fh.0)).await {
-                Ok(attr) => reply.attr(&ttl, &node_attr(ino.0, &attr)),
+                Ok(attr) => reply.attr(&ttl, &node_attr(ino.0, &attr, privileged)),
                 Err(error) => reply.error(errno(error)),
             }
         });
@@ -449,6 +463,7 @@ impl fuser::Filesystem for VoidportFs {
         reply: ReplyAttr,
     ) {
         let (client, caller, ttl) = (self.client(), caller_of(request), self.attr_ttl);
+        let privileged = self.privileged;
         let change = AttrChange {
             mode,
             uid,
@@ -467,13 +482,23 @@ impl fuser::Filesystem for VoidportFs {
         if changes_data {
             readahead.invalidate(ino.0);
         }
+        // A mount that shows no privileged bits takes none either — the same
+        // refusal the server makes for a namespace whose switch is off.
+        if privileged.is_masked() && mode.is_some_and(|mode| mode & PRIVILEGED_MASK != 0) {
+            return reply.error(Errno::EPERM);
+        }
         self.spawn(async move {
+            let change = match preserve_privileged(&client, caller, ino.0, change, privileged).await
+            {
+                Ok(change) => change,
+                Err(error) => return reply.error(errno(error)),
+            };
             let settled = client.setattr(caller, ino.0, change).await;
             if changes_data {
                 readahead.invalidate(ino.0);
             }
             match settled {
-                Ok(attr) => reply.attr(&ttl, &node_attr(ino.0, &attr)),
+                Ok(attr) => reply.attr(&ttl, &node_attr(ino.0, &attr, privileged)),
                 Err(error) => reply.error(errno(error)),
             }
         });
@@ -521,6 +546,7 @@ impl fuser::Filesystem for VoidportFs {
             return;
         }
         let (client, caller) = (self.client(), caller_of(request));
+        let privileged = self.privileged;
         let (attr_ttl, entry_ttl) = (self.attr_ttl, self.entry_ttl);
         let name = name.as_bytes().to_vec();
         self.spawn(async move {
@@ -531,7 +557,7 @@ impl fuser::Filesystem for VoidportFs {
                 Ok(entry) => reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,
-                    &entry_attr(&entry),
+                    &entry_attr(&entry, privileged),
                     Generation(entry.generation),
                 ),
                 Err(error) => reply.error(mknod_errno(error)),
@@ -549,6 +575,7 @@ impl fuser::Filesystem for VoidportFs {
         reply: ReplyEntry,
     ) {
         let (client, caller) = (self.client(), caller_of(request));
+        let privileged = self.privileged;
         let (attr_ttl, entry_ttl) = (self.attr_ttl, self.entry_ttl);
         let name = name.as_bytes().to_vec();
         self.spawn(async move {
@@ -556,7 +583,7 @@ impl fuser::Filesystem for VoidportFs {
                 Ok(entry) => reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,
-                    &entry_attr(&entry),
+                    &entry_attr(&entry, privileged),
                     Generation(entry.generation),
                 ),
                 Err(error) => reply.error(errno(error)),
@@ -589,6 +616,7 @@ impl fuser::Filesystem for VoidportFs {
         reply: ReplyEntry,
     ) {
         let (client, caller) = (self.client(), caller_of(request));
+        let privileged = self.privileged;
         let (attr_ttl, entry_ttl) = (self.attr_ttl, self.entry_ttl);
         let name = link_name.as_bytes().to_vec();
         let target = target.as_os_str().as_bytes().to_vec();
@@ -597,7 +625,7 @@ impl fuser::Filesystem for VoidportFs {
                 Ok(entry) => reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,
-                    &entry_attr(&entry),
+                    &entry_attr(&entry, privileged),
                     Generation(entry.generation),
                 ),
                 Err(error) => reply.error(errno(error)),
@@ -638,6 +666,7 @@ impl fuser::Filesystem for VoidportFs {
         reply: ReplyEntry,
     ) {
         let (client, caller) = (self.client(), caller_of(request));
+        let privileged = self.privileged;
         let (attr_ttl, entry_ttl) = (self.attr_ttl, self.entry_ttl);
         let name = newname.as_bytes().to_vec();
         self.spawn(async move {
@@ -645,7 +674,7 @@ impl fuser::Filesystem for VoidportFs {
                 Ok(entry) => reply.entry_with_ttls(
                     &attr_ttl,
                     &entry_ttl,
-                    &entry_attr(&entry),
+                    &entry_attr(&entry, privileged),
                     Generation(entry.generation),
                 ),
                 Err(error) => reply.error(errno(error)),
@@ -726,6 +755,11 @@ impl fuser::Filesystem for VoidportFs {
     /// guest write still arrive in order, because each is awaited before the
     /// next is sent.
     ///
+    /// The kernel's suid-kill mark rides **every** slice, not the first: the
+    /// server's strip is idempotent, and a mark carried on one chunk of a write
+    /// the kernel split would leave the rest of the write unstripped if a
+    /// reconnect resumed in the middle of it.
+    ///
     /// A local write drops the file's prefetched blocks, before and after: the
     /// first bump discards prefetch replies that were read before the write and
     /// arrive after it, and the second drops anything fetched while the write
@@ -738,12 +772,19 @@ impl fuser::Filesystem for VoidportFs {
         fh: FileHandle,
         offset: u64,
         data: &[u8],
-        _write_flags: WriteFlags,
+        write_flags: WriteFlags,
         _flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
         let (client, caller) = (self.client(), caller_of(request));
+        // The kernel's own delegation, forwarded verbatim: it marks a direct-io
+        // write by a caller without the file-mode privilege, and the server
+        // strips per the mode-only local rule. Nothing is negotiated for it, so
+        // none of the kernel's own stripping is turned off — this is the one
+        // case the kernel cannot do itself, because the bits are recorded on
+        // the server and its host backing does not carry them.
+        let strip = write_flags.contains(WriteFlags::FUSE_WRITE_KILL_SUIDGID);
         let data = data.to_vec();
         let readahead = Arc::clone(&self.readahead);
         readahead.invalidate(ino.0);
@@ -761,6 +802,7 @@ impl fuser::Filesystem for VoidportFs {
                         fh.0,
                         offset + written as u64,
                         &data[written..end],
+                        strip,
                     )
                     .await
                 {
@@ -873,6 +915,7 @@ impl fuser::Filesystem for VoidportFs {
     ) {
         let (client, caller, attr_ttl) = (self.client(), caller_of(request), self.attr_ttl);
         let directories = Arc::clone(&self.directories);
+        let privileged = self.privileged;
         self.spawn(async move {
             let mut sink = PlainSink { reply };
             match read_directory(
@@ -885,6 +928,7 @@ impl fuser::Filesystem for VoidportFs {
                     cookie: offset,
                 },
                 attr_ttl,
+                privileged,
                 &mut sink,
             )
             .await
@@ -906,6 +950,7 @@ impl fuser::Filesystem for VoidportFs {
         let (client, caller, ttl) = (self.client(), caller_of(request), self.entry_ttl);
         let attr_ttl = self.attr_ttl;
         let directories = Arc::clone(&self.directories);
+        let privileged = self.privileged;
         self.spawn(async move {
             let mut sink = PlusSink { reply, ttl };
             match read_directory(
@@ -918,6 +963,7 @@ impl fuser::Filesystem for VoidportFs {
                     cookie: offset,
                 },
                 attr_ttl,
+                privileged,
                 &mut sink,
             )
             .await
@@ -1071,6 +1117,7 @@ impl fuser::Filesystem for VoidportFs {
         reply: ReplyCreate,
     ) {
         let (client, caller, ttl) = (self.client(), caller_of(request), self.entry_ttl);
+        let privileged = self.privileged;
         let name = name.as_bytes().to_vec();
         let fopen = self.caching.fopen_flags();
         self.spawn(async move {
@@ -1080,7 +1127,7 @@ impl fuser::Filesystem for VoidportFs {
             {
                 Ok((entry, handle)) => reply.created(
                     &ttl,
-                    &entry_attr(&entry),
+                    &entry_attr(&entry, privileged),
                     Generation(entry.generation),
                     FileHandle(handle),
                     fopen,
@@ -1284,6 +1331,35 @@ fn caller_of(request: &Request) -> Caller {
 }
 
 /// A POSIX errno as a kernel reply wants it.
+/// Keeps a chmod through a masked mount from destroying recorded privileged
+/// bits.
+///
+/// The server takes a delivered mode's privileged bits as the record's new
+/// value — present record, absent delete — and a mount that opted out was shown
+/// a mode without them, so a read-modify-write chmod from it would clear what
+/// other mounts still present. Putting the bits the server currently holds back
+/// into the mode makes the assignment a no-op instead: nothing is recorded and
+/// nothing is deleted, which is exactly what a masked presentation owes.
+///
+/// The cost is one extra round trip, on a chmod, on a mount that opted out —
+/// and nothing at all on every other mount and every other operation.
+async fn preserve_privileged(
+    client: &Client,
+    caller: Caller,
+    node_id: u64,
+    change: AttrChange,
+    privileged: Privileged,
+) -> Result<AttrChange, rustix::io::Errno> {
+    let (Privileged::Masked, Some(mode)) = (privileged, change.mode) else {
+        return Ok(change);
+    };
+    let held = client.getattr(caller, node_id, None).await?;
+    Ok(AttrChange {
+        mode: Some(mode | (held.mode.get() & PRIVILEGED_MASK)),
+        ..change
+    })
+}
+
 pub(crate) fn errno(error: rustix::io::Errno) -> Errno {
     Errno::from_i32(error.raw_os_error())
 }

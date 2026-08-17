@@ -358,6 +358,20 @@ so keep it in a private directory — it is created owner-only (0600).
   implausible from inside the guest while being the host kernel's
   honest answer. The `static` and `map` ownership modes (including
   squashing unmapped ids) are opt-in per namespace.
+- **setuid and setgid work, and the host backing never carries them**: a guest
+  chmod that sets one is recorded by the server and merged into what every
+  mount of that namespace is shown, on every file kind and through every name
+  of a hard link; it survives a server restart, and it strips exactly as local
+  semantics demand — a write by a caller without the file-mode privilege clears
+  setuid, and clears setgid where group-execute is set. The host file the
+  namespace grafts is never given a privileged bit the server's own user set,
+  on a chmod or on a create. Enforcement of what the bits mean is the guest
+  kernel's, in its own trust domain. Two switches turn it off: per namespace on
+  the server (`voidport-ctl privileged-bits disable ns`, which masks the bits
+  and refuses a chmod that would set one) and per mount on the guest
+  (`voidport mount … --no-privileged-bits`, which is stronger than the classic
+  `nosuid` — that honors nothing but still shows the bits, this shows nothing).
+  Opting one mount out never destroys what the server recorded for the others.
 - **POSIX continuity through the proxy**: rename-while-open,
   unlink-while-open, hardlink identity and symlinks behave as they would
   locally; symlinks resolve in the guest's namespace, never on the host.

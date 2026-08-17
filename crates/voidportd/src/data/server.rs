@@ -123,6 +123,16 @@ impl DataPlane {
         self.namespaces.namespace(name)
     }
 
+    /// What a handshake mounts: the namespace of that name and its record
+    /// store, from one snapshot read.
+    #[must_use]
+    pub fn mount_of(
+        &self,
+        name: &NamespaceName,
+    ) -> Option<(Arc<Namespace>, Option<Arc<crate::records::RecordStore>>)> {
+        self.namespaces.mount_of(name)
+    }
+
     /// The live-session registry.
     #[must_use]
     pub fn sessions(&self) -> Arc<Sessions> {

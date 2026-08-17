@@ -15,7 +15,7 @@ use voidport_proto::ops::file::{
     CreateRequest, CreateResponse, FileLock, FlushRequest, FlushResponse, FsyncRequest,
     FsyncResponse, GetlkRequest, GetlkResponse, OpenRequest, OpenResponse, ReadRequest,
     ReadResponse, ReleaseRequest, ReleaseResponse, SetlkRequest, SetlkResponse, WriteRequest,
-    WriteResponse, fsync_flags, lock_type, release_flags, setlk_flags,
+    WriteResponse, fsync_flags, lock_type, release_flags, setlk_flags, write_flags,
 };
 use zerocopy::byteorder::little_endian::{U32, U64};
 
@@ -133,7 +133,10 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
     // exists must not re-own it or re-mode it. The fallback passes no mode at
     // all: `openat2` — unlike `openat` — refuses a nonzero mode on an open that
     // cannot create.
-    let (fd, created) = match open(flags | OFlags::CREATE | OFlags::EXCL, mode) {
+    let (fd, created) = match open(
+        flags | OFlags::CREATE | OFlags::EXCL,
+        super::dir::host_permissions(mode),
+    ) {
         Ok(fd) => (fd, true),
         Err(Errno::EXIST) if !exclusive => (open(flags, Mode::empty())?, false),
         Err(error) => return Err(error),
@@ -143,6 +146,9 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
         let caller = GuestIds::new(request.head().uid.get(), request.head().gid.get());
         session.apply_create_ownership(fd.as_fd(), caller);
         apply_mode(fd.as_fd(), mode)?;
+        // Before the entry reply below is built, because that reply presents
+        // the mode the guest asked for — the recorded bits included.
+        record_created_mode(session, fd.as_fd(), &site.recipe, mode)?;
     }
 
     // The entry becomes a node pinned from the site it was created at — not
@@ -285,14 +291,40 @@ pub fn read(context: &Context<'_>, request: Request<'_, ReadRequest>) -> OpResul
 /// [`BackingIo`](crate::host::BackingIo) for why the server's buffers can never
 /// satisfy direct I/O on their own.
 pub fn write(context: &Context<'_>, request: Request<'_, WriteRequest>) -> OpResult {
+    let session = context.session;
     let body = request.body();
-    let file = context.session.handles().file(body.handle.get())?;
+    let file = session.handles().file(body.handle.get())?;
     let written = file
         .backing_io()
         .write(file.fd(), request.data(), body.offset.get())?;
+    if body.write_flags.get() & write_flags::PRIVILEGED_STRIP != 0 {
+        strip_privileged(context.session, request.head().node_id.get());
+    }
     context.reply(&WriteResponse {
         written: U32::new(u32::try_from(written).map_err(|_| Errno::OVERFLOW)?),
     })
+}
+
+/// Applies the strip the guest kernel asked for on a write that already
+/// happened.
+///
+/// Never a failure of the write. The bytes are on the host by the time this
+/// runs, and answering `EIO` for a bookkeeping step the guest did not ask about
+/// would tell it a write failed that did not — so a strip that cannot read the
+/// node says so in the log and the write is answered as what it was.
+fn strip_privileged(session: &crate::data::session::Session, node_id: u64) {
+    let stripped = session.node(node_id).and_then(|node| {
+        let namespace = session.namespace();
+        let privileged = session.privileged(&namespace);
+        session.strip_written(&namespace, &privileged, &node)
+    });
+    if let Err(error) = stripped {
+        tracing::debug!(
+            node = node_id,
+            %error,
+            "a written file's privileged bits could not be stripped"
+        );
+    }
 }
 
 /// Releases a handle, closing the host descriptor it held.
@@ -615,13 +647,45 @@ impl Drop for LockWait {
 /// # Errors
 ///
 /// Returns the host errno of the mode change.
-pub(super) fn apply_mode(fd: std::os::fd::BorrowedFd<'_>, mode: Mode) -> Result<(), Errno> {
+pub(super) fn apply_mode(fd: std::os::fd::BorrowedFd<'_>, mode: u32) -> Result<(), Errno> {
     rustix::fs::chmodat(
         rustix::fs::CWD,
         crate::host::open::proc_path(fd).as_str(),
-        mode,
+        super::dir::host_permissions(mode),
         rustix::fs::AtFlags::empty(),
     )
+}
+
+/// Records the privileged bits a create delivered.
+///
+/// Run **before** the entry reply is built, so the reply presents the mode the
+/// guest asked for. A create that delivered none records nothing and stats
+/// nothing: the entry is a fresh inode, so there is no record for an absent bit
+/// to delete — the assignment rule's delete arm belongs to chmod, where a
+/// record can already exist.
+///
+/// `recipe` is the site's, never its backing: a create under a directory the
+/// server itself renamed lands where the host has that directory now, and a
+/// locator spelled from the namespace's older description would name nothing
+/// for the restart's revalidating stat to find.
+///
+/// # Errors
+///
+/// The host errno of the stat that names the created inode.
+pub(super) fn record_created_mode(
+    session: &crate::data::session::Session,
+    fd: std::os::fd::BorrowedFd<'_>,
+    recipe: &crate::rules::HostBacking,
+    delivered: u32,
+) -> Result<(), Errno> {
+    if crate::records::PrivilegedBits::of(delivered).is_empty() {
+        return Ok(());
+    }
+    let namespace = session.namespace();
+    let privileged = session.privileged(&namespace);
+    let identity = crate::host::attr::HostAttr::of(fd)?.node_identity();
+    session.record_delivered_mode(&privileged, identity, recipe, delivered);
+    Ok(())
 }
 
 /// The kind and range a wire lock describes.

@@ -146,6 +146,14 @@ fn render_namespace(namespace: &NamespaceSpec) -> String {
         format!("permission: {}", namespace.permission),
         format!("direct-io:  {}", namespace.direct_io),
         format!("auth:       {}", namespace.auth),
+        format!(
+            "setid bits: {}",
+            if namespace.privileged_bits {
+                "recorded and presented"
+            } else {
+                "masked (chmod refuses them)"
+            }
+        ),
     ];
     lines.extend(render_ownership(&namespace.ownership));
     if namespace.rules.is_empty() {
@@ -365,6 +373,7 @@ mod tests {
                     uid_map: vec![IdMapping::new(IdSentinel::Uid, 0)],
                     gid_map: Vec::new(),
                 },
+                privileged_bits: false,
                 rules: vec![
                     Rule::new("/project", ShareMode::Rw).with_target("project"),
                     Rule::new("/project/*", ShareMode::Hidden),
@@ -380,6 +389,10 @@ mod tests {
         assert!(rendered.contains("namespace:  project"), "{rendered}");
         assert!(rendered.contains("direct-io:  always"), "{rendered}");
         assert!(rendered.contains("ownership:  map"), "{rendered}");
+        assert!(
+            rendered.contains("setid bits: masked (chmod refuses them)"),
+            "{rendered}"
+        );
         assert!(rendered.contains("unmapped: hide"), "{rendered}");
         // The sentinel is shown as written, never resolved.
         assert!(rendered.contains("uid -> 0"), "{rendered}");

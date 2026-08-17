@@ -127,7 +127,15 @@ impl Session {
             return Some(None);
         };
         let host = self.stat_entry(namespace, parent, name, backing).ok()?;
-        host.present(0, *mode, namespace.ownership())?;
+        // The visibility question only, and the mode it computes is discarded:
+        // privileged bits are a presentation merge and can hide nothing, so
+        // this asks with the neutral value.
+        host.present(
+            0,
+            *mode,
+            namespace.ownership(),
+            crate::records::Privileged::Recorded(crate::records::PrivilegedBits::NONE),
+        )?;
         Some(Some(host.host_identity()))
     }
 
@@ -185,7 +193,19 @@ impl Session {
     /// **One table at a time.** The peers are taken as a snapshot and each
     /// table is locked and released in turn — no session ever holds two node
     /// tables, and no lock is held across the registry's.
+    ///
+    /// The namespace's record store owes the very same re-pointing, and takes
+    /// it here: a locator left naming the old place would be revalidated
+    /// against a name the server itself removed, and recorded truth would be
+    /// dropped at the next restart for a move the guest asked for. It takes it
+    /// **once**, because a store is the namespace's and not the session's — one
+    /// instance across every mount and every republish — and because all the
+    /// moves belong in one pass, so an exchange applies at most one of them to
+    /// any record. Another *namespace* grafting the same host directory is
+    /// another bookkeeper, and the rename is host-side mutation to it: its own
+    /// locator goes stale and its next revalidation drops it, conservatively.
     pub fn rebind(&self, moves: &[Move]) {
+        self.records.relocate(moves);
         self.nodes().rebind_moved(moves);
         let Some(peers) = self.peers.upgrade() else {
             return;

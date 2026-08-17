@@ -721,7 +721,11 @@ fn handshake(plane: &DataPlane, peer: &Peer, bytes: &[u8]) -> Result<Accepted, R
         .ok()
         .and_then(|name| voidport_control::NamespaceName::new(name).ok())
         .ok_or_else(|| refuse(Errno::INVAL))?;
-    let namespace = plane.namespace(&name).ok_or_else(|| refuse(Errno::NOENT))?;
+    // One snapshot read for both: the namespace this mount serves and the
+    // record store it records through. A namespace deleted between the two
+    // would otherwise hand a session a store the registry no longer names.
+    let (namespace, records) = plane.mount_of(&name).ok_or_else(|| refuse(Errno::NOENT))?;
+    let records = records.ok_or_else(|| refuse(Errno::NOENT))?;
     let subpath = parse_subpath(request.subpath()).map_err(refuse)?;
 
     let reservation = plane
@@ -733,6 +737,7 @@ fn handshake(plane: &DataPlane, peer: &Peer, bytes: &[u8]) -> Result<Accepted, R
         peer.clone(),
         plane.registries(),
         namespace,
+        records,
         subpath,
         plane.identity(),
         plane.limits(),

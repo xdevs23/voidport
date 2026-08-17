@@ -33,7 +33,7 @@ use voidport_proto::ops::file::{
     CreateRequest, CreateResponse, FileLock, FlushRequest, FlushResponse, FsyncRequest,
     FsyncResponse, GetlkRequest, GetlkResponse, OpenRequest, OpenResponse, ReadRequest,
     ReadResponse, ReleaseRequest, ReleaseResponse, SetlkRequest, SetlkResponse, WriteRequest,
-    WriteResponse, fsync_flags, lock_type, release_flags, setlk_flags,
+    WriteResponse, fsync_flags, lock_type, release_flags, setlk_flags, write_flags,
 };
 use voidport_proto::ops::node::{
     ForgetRequest, GetattrRequest, GetattrResponse, LookupRequest, LookupResponse, ReadlinkRequest,
@@ -607,6 +607,14 @@ impl Client {
     /// connection that then died may have been applied, so it fails `EIO`; one
     /// still queued provably was not, and only that one is re-sent.
     ///
+    /// `strip_privileged` carries the guest kernel's own suid-kill mark: the
+    /// running kernel sets it on a direct-io write by a caller without the
+    /// file-mode privilege, and the server clears the recorded bits per the
+    /// mode-only local rule. It rides every chunk of a split write, stripping
+    /// being idempotent; a server too old to know the flag ignores it and
+    /// strips nothing, which is fail-open for stripping under version skew and
+    /// is stated, not hidden.
+    ///
     /// # Errors
     ///
     /// The server's errno, or `EIO` on a degraded mount.
@@ -617,13 +625,18 @@ impl Client {
         handle: u64,
         offset: u64,
         data: &[u8],
+        strip_privileged: bool,
     ) -> Result<u32, Errno> {
         let body = WriteRequest {
             handle: U64::new(handle),
             offset: U64::new(offset),
             data_len: U32::new(length(data)?),
             flags: U32::ZERO,
-            write_flags: U32::ZERO,
+            write_flags: U32::new(if strip_privileged {
+                write_flags::PRIVILEGED_STRIP
+            } else {
+                0
+            }),
             reserved: U32::ZERO,
         };
         self.call::<_, WriteResponse, _>(caller, node_id, &body, data, Replay::Once, |body, _| {

@@ -47,6 +47,7 @@ use crate::data::sessions::Sessions;
 use crate::data::subscribe::{NotificationQueue, Subscribers};
 use crate::error::render;
 use crate::namespace::Namespace;
+use crate::records::{RecordHome, RecordStore};
 use crate::registry::{Registry, summarize};
 use crate::rules::{NamespacePath, TableError, XattrRulesError};
 use crate::state::{
@@ -118,6 +119,22 @@ impl Published {
         self.snapshot().registry.get(name)
     }
 
+    /// The namespace of that name and the record store that goes with it,
+    /// taken from **one** snapshot read.
+    ///
+    /// The handshake takes both together on purpose: a session captures its
+    /// store handle beside its namespace resolution, so a namespace deleted
+    /// while it is serving does not take the store from underneath it.
+    #[must_use]
+    pub fn mount_of(
+        &self,
+        name: &NamespaceName,
+    ) -> Option<(Arc<Namespace>, Option<Arc<RecordStore>>)> {
+        let snapshot = self.snapshot();
+        let namespace = snapshot.registry.get(name)?;
+        Some((namespace, snapshot.registry.records(name)))
+    }
+
     /// Starts — or restarts — a session's share subscription.
     ///
     /// Taken under the **write** lock even though nothing is published: that is
@@ -185,6 +202,9 @@ pub struct Service {
     state_file: PathBuf,
     control_socket: PathBuf,
     environment: Environment,
+    /// Where each namespace's record sidecar lives, derived from the state file
+    /// once: a namespace-create opens a store there, and a removal deletes it.
+    records: RecordHome,
     /// Held across a whole mutation; nothing else takes it.
     mutations: Mutex<()>,
     /// The published snapshot. Readers clone the `Arc` and let go.
@@ -233,10 +253,13 @@ impl Service {
         let limits = loaded.document.server.limits;
         let descriptor_budget =
             DescriptorBudget::sized(loaded.document.server.node_descriptor_budget, descriptors);
+        let state_file = state_file.into();
+        let records = RecordHome::for_state_file(&state_file);
         Self {
-            state_file: state_file.into(),
+            state_file,
             control_socket: control_socket.into(),
             environment,
+            records,
             mutations: Mutex::new(()),
             published: Published::new(Snapshot {
                 document: loaded.document,
@@ -372,6 +395,12 @@ impl Service {
             Request::DirectIoSet { namespace, posture } => {
                 self.mutate_namespace(&namespace, |spec| {
                     spec.direct_io = posture;
+                    Ok(())
+                })
+            }
+            Request::PrivilegedBitsSet { namespace, enabled } => {
+                self.mutate_namespace(&namespace, |spec| {
+                    spec.privileged_bits = enabled;
                     Ok(())
                 })
             }
@@ -667,6 +696,10 @@ impl Service {
         let change = edit(&mut document)?;
 
         let mut registry = current.registry.clone();
+        // A removal's store, kept live across the persist: retiring it deletes
+        // the sidecar, and recorded truth may not be destroyed for a mutation
+        // the disk never took.
+        let mut retiring = None;
         match &change {
             Change::Upsert(name) => {
                 let spec = document
@@ -686,15 +719,31 @@ impl Service {
                     };
                     ControlError::new(code, format!("namespace {:?}: {source}", name.as_str()))
                 })?;
-                registry.insert(namespace);
+                // A name the registry already holds keeps the very store its
+                // sessions are writing to; only a namespace-create opens one,
+                // and only there can reading a sidecar fail.
+                registry
+                    .insert(namespace, &self.records)
+                    .map_err(|source| {
+                        ControlError::new(
+                            ErrorCode::InvalidConfiguration,
+                            format!("namespace {:?}: {}", name.as_str(), render(&source)),
+                        )
+                    })?;
             }
             Change::Remove(name) => {
-                registry.remove(name);
+                retiring = registry.remove(name).and_then(|removed| removed.records);
             }
         }
 
         let result = persist(&document, &self.state_file);
         self.commit(document, registry, result)?;
+        // The removal is durable now, so the namespace's recorded truth goes
+        // with it: the store takes no further writes and its sidecar is
+        // deleted. A re-created name starts empty.
+        if let Some(records) = retiring {
+            records.retire();
+        }
         Ok(Reply::Done {})
     }
 

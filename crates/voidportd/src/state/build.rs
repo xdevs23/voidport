@@ -62,6 +62,7 @@ pub fn build_namespace(
         ownership,
         rules,
         xattr,
+        spec.privileged_bits,
         grafts,
     ))
 }

@@ -66,6 +66,7 @@ fn run(arguments: Cli) -> Result<()> {
             reconnect_stall,
             no_auto_unmount,
             direct_io,
+            no_privileged_bits,
             readahead,
         } => {
             let parsed = MountUrl::parse(&url).with_context(|| format!("cannot mount {url}"))?;
@@ -78,6 +79,7 @@ fn run(arguments: Cli) -> Result<()> {
                 reconnect_stall: seconds(reconnect_stall)?,
                 auto_unmount: !no_auto_unmount,
                 direct_io,
+                privileged_bits: !no_privileged_bits,
                 readahead: mebibytes(readahead),
             };
             let mount = Mount::new(&parsed, &mountpoint, &options)
