@@ -13,6 +13,7 @@
 //! where FUSE itself is unusable, which [`preflight`] decides once.
 #![allow(dead_code, reason = "each test file uses part of this")]
 
+pub mod census;
 pub mod daemon;
 pub mod mapping;
 

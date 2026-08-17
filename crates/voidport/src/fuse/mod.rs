@@ -134,13 +134,29 @@ impl DataCaching {
 
     /// The flags an `open` or `create` reply carries under this mode.
     ///
+    /// A direct handle also announces `FOPEN_PARALLEL_DIRECT_WRITES`, and the
+    /// announcement is the whole of it: without it the guest kernel takes the
+    /// inode's lock **exclusively** around every direct write, so an application
+    /// using asynchronous I/O has its writes to one file serialized before they
+    /// ever reach a wire that could have overlapped them. With it the kernel
+    /// takes the lock shared and the writes overlap — which is safe here for the
+    /// reason it is safe at all: each write names its own offset and length, and
+    /// the server places it there.
+    ///
+    /// **Honestly scoped.** The kernel keeps its exclusive lock — and therefore
+    /// keeps serializing — for the three cases where a write's placement is not
+    /// knowable in advance: `O_APPEND`, where the offset is the eventual end of
+    /// file; a write extending past the current end; and a file that has ever
+    /// been mapped, whose page cache is the other writer. So this helps in-place
+    /// overwrites of an already-sized file, and nothing else claims otherwise.
+    ///
     /// Nothing else is added: `FOPEN_KEEP_CACHE` stays off because v1 caching is
     /// writethrough and conservative, in both modes.
     #[must_use]
     fn fopen_flags(self) -> FopenFlags {
         match self {
             Self::Page => FopenFlags::empty(),
-            Self::Direct => FopenFlags::FOPEN_DIRECT_IO,
+            Self::Direct => FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES,
         }
     }
 }
@@ -1437,19 +1453,21 @@ mod tests {
         assert_eq!(DataCaching::resolve(false, false), DataCaching::Page);
     }
 
-    /// Only one bit is ever added, and only in the direct mode: a page-caching
-    /// mount replies exactly what it replied before the option existed.
+    /// Bits are added only in the direct mode: a page-caching mount replies
+    /// exactly what it replied before the option existed.
     #[test]
     fn only_the_direct_mode_sets_a_reply_flag() {
         assert_eq!(DataCaching::Page.fopen_flags(), FopenFlags::empty());
         assert_eq!(
             DataCaching::Direct.fopen_flags(),
-            FopenFlags::FOPEN_DIRECT_IO
+            FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES
         );
-        // The kernel's own value for it (`FOPEN_DIRECT_IO`, `include/uapi/
-        // linux/fuse.h`), so a renamed or re-valued library constant cannot
-        // silently change what the kernel is told.
+        // The kernel's own values for them (`FOPEN_DIRECT_IO` and
+        // `FOPEN_PARALLEL_DIRECT_WRITES`, `include/uapi/linux/fuse.h`), so a
+        // renamed or re-valued library constant cannot silently change what the
+        // kernel is told.
         assert_eq!(FopenFlags::FOPEN_DIRECT_IO.bits(), 1 << 0);
+        assert_eq!(FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES.bits(), 1 << 6);
         // `FUSE_DIRECT_IO_ALLOW_MMAP` is an INIT capability, not an open flag:
         // it is negotiated once in `init`, and it is the *pair* of the two that
         // keeps `mmap` working. Its kernel value is `1ULL << 36`.
