@@ -3143,20 +3143,39 @@ client streaming pays, is exactly what that data plane replaces.
    for the plain sequential writer.
 3. Both gates pass with the new tests executing.
 
+Two facts from the increment's first build pass, folded in dated
+2026-08-17: the cached default is a stated CHANGE from the de-facto
+tree — the server's open-flag mask passed a guest handle's O_DIRECT
+straight to the backing open, unpinned and untested; the decided
+caching model masks it by default, so only the postures grant it.
+And an uncached posture owes a production contract the first draft
+lacked: the server's I/O buffers are not block-aligned, and direct
+I/O refuses misaligned buffers regardless of the guest's own
+alignment — so **direct backing I/O serves through an aligned path
+at the single I/O site**: the server learns the backing file's
+direct-I/O alignment (the statx direct-alignment fields, with the
+logical block size as the fallback) and bounces direct reads and
+writes through buffers aligned to it. An aligned guest request
+serves; a request the backing filesystem itself would refuse
+answers that refusal.
+
 ### Acceptance criteria — host-direct-io-postures increment
 
 1. The per-namespace setting round-trips the state file and the
    control plane's namespace mutation, persisted, live at the next
-   open; the default posture is byte-identical to today.
+   open; the default posture masks a guest handle's O_DIRECT, a
+   stated change pinned by test, and everything else is
+   byte-identical to today.
 2. Passthrough: a guest handle opened O_DIRECT gets a backing open
-   with O_DIRECT — proven by the backing descriptor's flags — and
-   an unaligned request answers the same errno the backing
-   filesystem gives locally; a handle without O_DIRECT rides the
-   host cache unchanged.
+   with O_DIRECT — proven by the backing descriptor's flags — an
+   ALIGNED request round-trips real data through the uncached
+   descriptor, and a request the backing filesystem refuses
+   locally answers the same errno; a handle without O_DIRECT rides
+   the host cache unchanged.
 3. Always: every backing open in the namespace carries O_DIRECT,
-   reads and writes alike, and the alignment posture is the
-   backing filesystem's; the performance note states where the
-   bound moved when measured.
+   reads and writes alike, aligned requests serve through the
+   bounce path, and the performance report states the measured
+   bounce cost and where the throughput bound moved.
 4. The artifacts carry the setting: the state example, the README
    semantics section, and the man pages.
 5. Both gates pass with the new suites executing.
