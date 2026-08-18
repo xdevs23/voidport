@@ -2,19 +2,33 @@
 //!
 //! Every transition is a method here and a verdict for the adapter to perform.
 //! The machine owns the phase, the one monotonic stall deadline, the
-//! generations connections are known by, the probe tokens attempts are known
-//! by, and the bar a teardown raises. It owns no socket, no task and no clock:
-//! instants arrive as arguments, and the deadline comparisons — the tie-break
-//! above all — are made here on those arguments, never by an adapter.
+//! generations connections are known by, the connection the mount is installed
+//! over, the probe tokens attempts are known by, and the bar a teardown raises.
+//! It owns no socket, no task and no clock: instants arrive as arguments, and
+//! the deadline comparisons — the tie-break above all — are made here on those
+//! arguments, never by an adapter.
 //!
-//! The adapter keeps beside it exactly what the core may not hold: the
-//! connection object of the generation the machine says is installed, the
-//! handle the probe token names, and the prose reason a phase carries.
+//! The connection is the adapter's own object, held as the opaque value `C` —
+//! the machine never looks inside it, exactly as the request table never looks
+//! inside a wakeup. Holding it is what keeps "whether a connection is
+//! installed" and "which connection that is" one fact under one lock: the
+//! machine hands it out to serve a request over, and hands it back when the
+//! mount gives it up.
+//!
+//! The adapter keeps beside it what a value cannot carry: the handle the probe
+//! token names, and the prose reason a phase carries.
 
 use core::time::Duration;
 
 use crate::backoff::{DEGRADED_ATTEMPT_BOUND, Schedule};
 use crate::time::Instant;
+
+/// The generation the *first* connection carries, which
+/// [`Machine::connected`] has already handed out.
+///
+/// A plain number and not an accessor, because it is the same for every mount
+/// and says nothing about what a mount is connected over.
+pub const FIRST_GENERATION: u64 = 1;
 
 /// What a mount is doing right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -50,11 +64,13 @@ pub enum Recovery {
 }
 
 /// What a mount is doing, with what the phase carries.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum State {
+#[derive(Debug)]
+enum State<C> {
     Connected {
-        /// The generation of the connection the adapter has installed.
+        /// The generation the installed connection is known by.
         generation: u64,
+        /// The connection itself, as the adapter handed it over.
+        connection: C,
     },
     Reconnecting {
         /// The one deadline every stalled request shares.
@@ -65,12 +81,16 @@ enum State {
 }
 
 /// What a request that wants a connection is owed.
+///
+/// The connection is lent, not given: it stays installed, so a caller takes
+/// whatever reference of its own it needs while it still holds the lock the
+/// machine changes under.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Serve {
-    /// Serve it over the installed connection, of this generation.
+pub enum Serve<'a, C> {
+    /// Serve it over this connection, which is the one installed.
     Now {
-        /// The generation the adapter must serve it over.
-        generation: u64,
+        /// The connection the adapter must serve it over.
+        connection: &'a C,
     },
     /// Stall it: wait for a phase change, and no later than this instant.
     Stall {
@@ -123,9 +143,13 @@ impl Lost {
 }
 
 /// The mount's phase, and the bookkeeping around it.
-#[derive(Clone, Copy, Debug)]
-pub struct Machine {
-    state: State,
+///
+/// `C` is whatever the adapter serves a request over — a connection object in
+/// userspace, whatever names a session in kernel space. The machine never looks
+/// inside it.
+#[derive(Debug)]
+pub struct Machine<C> {
+    state: State<C>,
     recovery: Recovery,
     /// The generation the next connection will carry. Monotonic.
     next_generation: u64,
@@ -135,34 +159,31 @@ pub struct Machine {
     probe: Option<u64>,
 }
 
-impl Machine {
-    /// The machine of a mount whose first handshake has just completed.
+impl<C> Machine<C> {
+    /// The machine of a mount whose first handshake has just completed, over
+    /// `connection`.
     ///
     /// That connection is generation 1 — the first the machine hands out — and
     /// the mount starts Connected over it, because a mount that could not be
     /// established is a mount error and never a mount that starts out degraded.
     #[must_use]
-    pub fn connected() -> Self {
+    pub fn connected(connection: C) -> Self {
         Self {
-            state: State::Connected { generation: 1 },
+            state: State::Connected {
+                generation: FIRST_GENERATION,
+                connection,
+            },
             recovery: Recovery::Running,
-            next_generation: 2,
+            next_generation: FIRST_GENERATION + 1,
             next_probe: 1,
             probe: None,
         }
     }
 
-    /// The generation the *first* connection carries, which
-    /// [`Machine::connected`] has already handed out.
-    #[must_use]
-    pub const fn first_generation() -> u64 {
-        1
-    }
-
     /// What the mount is doing right now.
     #[must_use]
     pub fn phase(&self) -> Phase {
-        match self.state {
+        match &self.state {
             State::Connected { .. } => Phase::Connected,
             State::Reconnecting { .. } => Phase::Reconnecting,
             State::Degraded => Phase::Degraded,
@@ -179,7 +200,7 @@ impl Machine {
     #[must_use]
     pub fn connected_generation(&self) -> Option<u64> {
         match self.state {
-            State::Connected { generation } => Some(generation),
+            State::Connected { generation, .. } => Some(generation),
             _ => None,
         }
     }
@@ -201,10 +222,12 @@ impl Machine {
 
     /// What a request that wants a connection is owed right now.
     #[must_use]
-    pub fn serve(&self) -> Serve {
-        match self.state {
-            State::Connected { generation } => Serve::Now { generation },
-            State::Reconnecting { deadline } => Serve::Stall { deadline },
+    pub fn serve(&self) -> Serve<'_, C> {
+        match &self.state {
+            State::Connected { connection, .. } => Serve::Now { connection },
+            State::Reconnecting { deadline } => Serve::Stall {
+                deadline: *deadline,
+            },
             State::Degraded | State::Closed => Serve::Fail,
         }
     }
@@ -256,6 +279,11 @@ impl Machine {
     /// instant the server breaks away. The probe still runs, so a server that
     /// comes back is still picked up — what zero removes is the waiting, not
     /// the recovery.
+    ///
+    /// The mount lets the dead connection go here. It is not handed back,
+    /// because whoever reports a death is holding the connection it is
+    /// reporting — that is where the generation came from — and burying it is
+    /// that caller's own next step.
     pub fn lost(&mut self, generation: u64, now: Instant, stall: Duration) -> Lost {
         if self.connected_generation() != Some(generation) {
             return Lost::Ignored;
@@ -300,19 +328,26 @@ impl Machine {
     /// synchronous — an aborted probe can already be past its last suspension —
     /// so a handshake can arrive here after the mount was torn down, after a
     /// teardown paused the recovery, or after a replacement attempt took this
-    /// one's place. `false` means the adapter must bury the connection it just
-    /// made instead, which is what keeps a mount from ever holding two live
-    /// sessions and splitting its callbacks across them, and what stops a
+    /// one's place. `Err(connection)` hands the connection straight back for
+    /// the adapter to bury, which is what keeps a mount from ever holding two
+    /// live sessions and splitting its callbacks across them, and what stops a
     /// superseded attempt from clearing the handle its replacement is cancelled
     /// through.
-    pub fn install(&mut self, probe: u64, generation: u64) -> bool {
+    ///
+    /// # Errors
+    ///
+    /// The connection itself, when the mount would not take it.
+    pub fn install(&mut self, probe: u64, generation: u64, connection: C) -> Result<(), C> {
         let wanted = matches!(self.state, State::Reconnecting { .. } | State::Degraded);
         if self.recovery != Recovery::Running || !wanted || !self.owns(probe) {
-            return false;
+            return Err(connection);
         }
-        self.state = State::Connected { generation };
+        self.state = State::Connected {
+            generation,
+            connection,
+        };
         self.probe = None;
-        true
+        Ok(())
     }
 
     /// The generation the next connection carries.
@@ -378,11 +413,16 @@ impl Machine {
 
     /// Tears the mount down: nothing is ever written or reconnected again.
     ///
-    /// Answers the probe token the adapter must cancel, if one was running.
-    pub fn close(&mut self) -> Option<u64> {
+    /// Answers the connection the adapter must bury, if one was installed. The
+    /// reconnect attempt is retired here too, and the adapter cancels the task
+    /// its token named.
+    pub fn close(&mut self) -> Option<C> {
         self.recovery = Recovery::Ended;
-        self.state = State::Closed;
-        self.probe.take()
+        self.probe = None;
+        match core::mem::replace(&mut self.state, State::Closed) {
+            State::Connected { connection, .. } => Some(connection),
+            State::Reconnecting { .. } | State::Degraded | State::Closed => None,
+        }
     }
 
     /// Cancels the reconnect attempt and its backoff, and stops stalling.
@@ -399,14 +439,19 @@ impl Machine {
     /// breaking away in the moment after this call must neither start a probe
     /// behind the teardown nor open a window for callbacks the teardown is
     /// about to fail anyway.
-    pub fn stop_reconnecting(&mut self) -> StopReconnecting {
+    ///
+    /// Answers whether the mount closed here, which is the phase change the
+    /// adapter is owed an announcement of. A mount that was Connected keeps its
+    /// connection, so there is never one to bury from here; the reconnect
+    /// attempt is retired, and the adapter cancels the task its token named.
+    pub fn stop_reconnecting(&mut self) -> bool {
         self.recovery = Recovery::Ended;
-        let probe = self.probe.take();
+        self.probe = None;
         let closed = matches!(self.state, State::Reconnecting { .. } | State::Degraded);
         if closed {
             self.state = State::Closed;
         }
-        StopReconnecting { probe, closed }
+        closed
     }
 
     /// Cancels the reconnect attempt in flight and the backoff behind it,
@@ -422,14 +467,16 @@ impl Machine {
     ///
     /// Retiring the cancelled task's token is what stops the attempt the
     /// cancellation cannot reach in time from transitioning the mount or
-    /// displacing its replacement.
-    pub fn pause_recovery(&mut self) -> Option<u64> {
+    /// displacing its replacement. The adapter cancels the task that token
+    /// named; a mount that was Connected keeps its connection, so there is
+    /// nothing to bury from here.
+    pub fn pause_recovery(&mut self) {
         // A recovery that has already ended is never handed back, so it is
         // never taken away either: pausing lowers the bar it raised.
         if self.recovery == Recovery::Running {
             self.recovery = Recovery::Paused;
         }
-        self.probe.take()
+        self.probe = None;
     }
 
     /// Starts the recovery again after a teardown that was refused.
@@ -451,46 +498,42 @@ impl Machine {
     }
 }
 
-/// What a terminal cancellation left for the adapter to do.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct StopReconnecting {
-    /// The reconnect task to cancel, if one was running.
-    pub probe: Option<u64>,
-    /// Whether the mount closed here, and its phase change is owed an
-    /// announcement.
-    pub closed: bool,
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
 
     const STALL: Duration = Duration::from_secs(5);
     const START: Instant = Instant::ORIGIN;
+    /// What a mount is connected over, in these tests. The machine never looks
+    /// inside a connection, so a name it can hand back is connection enough.
+    const FIRST: &str = "the first connection";
+    /// What a probe brings back.
+    const NEXT: &str = "the replacement connection";
 
     fn at(secs: u64) -> Instant {
         Instant::from_nanos(secs * 1_000_000_000)
     }
 
+    /// A mount whose first handshake has just completed.
+    fn machine() -> Machine<&'static str> {
+        Machine::connected(FIRST)
+    }
+
     #[test]
     fn a_mount_starts_connected_over_the_first_generation() {
-        let machine = Machine::connected();
+        let machine = machine();
         assert_eq!(machine.phase(), Phase::Connected);
-        assert_eq!(
-            machine.connected_generation(),
-            Some(Machine::first_generation())
-        );
+        assert_eq!(machine.connected_generation(), Some(FIRST_GENERATION));
         assert_eq!(
             machine.serve(),
-            Serve::Now {
-                generation: Machine::first_generation()
-            }
+            Serve::Now { connection: &FIRST },
+            "and the request it serves goes over the connection it was given"
         );
     }
 
     #[test]
     fn only_the_generation_the_mount_holds_can_lose_it() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         assert_eq!(machine.lost(7, START, STALL), Lost::Ignored);
         assert_eq!(machine.phase(), Phase::Connected);
         assert_eq!(
@@ -504,7 +547,7 @@ mod tests {
 
     #[test]
     fn a_zero_window_is_fail_fast_and_still_wants_a_probe() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         let lost = machine.lost(1, START, Duration::ZERO);
         assert_eq!(lost, Lost::Degraded);
         assert!(lost.wants_probe(), "what zero removes is the waiting");
@@ -515,7 +558,7 @@ mod tests {
 
     #[test]
     fn the_deadline_wins_every_tie() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         let Lost::Stalling { deadline } = machine.lost(1, START, STALL) else {
             panic!("the mount stalls");
         };
@@ -527,7 +570,7 @@ mod tests {
         // A handshake that completes in the very instant the window closes
         // does not save the caller that waited it out.
         let probe = machine.start_probe().expect("a probe");
-        assert!(machine.install(probe, 2));
+        assert!(machine.install(probe, 2, NEXT).is_ok());
         assert_eq!(machine.phase(), Phase::Connected);
         assert_eq!(
             machine.woke(deadline, deadline),
@@ -543,7 +586,7 @@ mod tests {
 
     #[test]
     fn the_first_caller_past_the_deadline_degrades_the_mount() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         let Lost::Stalling { deadline } = machine.lost(1, START, STALL) else {
             panic!("the mount stalls");
         };
@@ -562,7 +605,7 @@ mod tests {
 
     #[test]
     fn the_window_bounds_an_attempt_and_the_degraded_schedule_takes_over() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         machine.lost(1, START, STALL);
         let probe = machine.start_probe().expect("a probe");
         assert_eq!(machine.schedule(), Schedule::Stalling);
@@ -591,7 +634,7 @@ mod tests {
 
     #[test]
     fn only_the_current_probe_owns_the_recovery() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         assert!(!machine.owns(1), "a mount with no probe running owns none");
         machine.lost(1, START, STALL);
         let first = machine.start_probe().expect("a probe");
@@ -601,24 +644,27 @@ mod tests {
         // What a refused teardown leaves behind: the attempt was cancelled and
         // its token retired, but a cancellation is not synchronous, so the task
         // may still be running. Only the replacement may transition the mount.
-        assert_eq!(machine.pause_recovery(), Some(first));
+        machine.pause_recovery();
+        assert!(!machine.owns(first), "the cancelled attempt is retired");
         assert_eq!(machine.recovery(), Recovery::Paused);
-        assert!(
-            !machine.install(first, 2),
-            "a paused mount installs nothing"
+        assert_eq!(
+            machine.install(first, 2, NEXT),
+            Err(NEXT),
+            "a paused mount installs nothing, and hands the connection back"
         );
         let second = machine.resume_recovery().expect("the replacement attempt");
         assert_ne!(second, first);
         assert!(!machine.owns(first));
         assert!(!machine.degrade(first));
-        assert!(!machine.install(first, 2));
-        assert!(machine.install(second, 2));
+        assert_eq!(machine.install(first, 2, NEXT), Err(NEXT));
+        assert!(machine.install(second, 2, NEXT).is_ok());
         assert_eq!(machine.connected_generation(), Some(2));
+        assert_eq!(machine.serve(), Serve::Now { connection: &NEXT });
     }
 
     #[test]
     fn a_refusal_cuts_the_window_short_and_the_probe_runs_on() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         machine.lost(1, START, STALL);
         let probe = machine.start_probe().expect("a probe");
         assert!(machine.degrade(probe));
@@ -629,22 +675,19 @@ mod tests {
             "the configuration may come back, so the probe keeps running"
         );
         // And it is the ordinary return to Connected from there.
-        assert!(machine.install(probe, 2));
+        assert!(machine.install(probe, 2, NEXT).is_ok());
     }
 
     #[test]
     fn a_teardown_that_never_comes_back_stops_everything() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         machine.lost(1, START, STALL);
         let probe = machine.start_probe().expect("a probe");
-        let stopped = machine.stop_reconnecting();
-        assert_eq!(
-            stopped,
-            StopReconnecting {
-                probe: Some(probe),
-                closed: true
-            }
+        assert!(
+            machine.stop_reconnecting(),
+            "the mount closed here and its phase change is owed an announcement"
         );
+        assert!(!machine.owns(probe), "the attempt in flight is retired");
         assert_eq!(machine.phase(), Phase::Closed);
         assert_eq!(machine.recovery(), Recovery::Ended);
         assert_eq!(machine.start_probe(), None);
@@ -658,32 +701,54 @@ mod tests {
 
     #[test]
     fn a_death_behind_a_teardown_ends_the_mount_instead_of_stalling() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         // A teardown from Connected keeps the connection but ends recovery.
-        let stopped = machine.stop_reconnecting();
         assert!(
-            !stopped.closed,
+            !machine.stop_reconnecting(),
             "a connected mount unmounts the ordinary way"
         );
         assert_eq!(machine.phase(), Phase::Connected);
+        assert_eq!(
+            machine.serve(),
+            Serve::Now { connection: &FIRST },
+            "and it keeps serving over the connection it holds"
+        );
         assert_eq!(machine.lost(1, START, STALL), Lost::Closed);
         assert_eq!(machine.phase(), Phase::Closed);
     }
 
     #[test]
     fn closing_retires_the_probe_and_nothing_reconnects() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         machine.lost(1, START, STALL);
         let probe = machine.start_probe().expect("a probe");
-        assert_eq!(machine.close(), Some(probe));
+        assert_eq!(
+            machine.close(),
+            None,
+            "a mount that lost its connection has none to bury"
+        );
+        assert!(!machine.owns(probe), "the attempt in flight is retired");
         assert_eq!(machine.phase(), Phase::Closed);
-        assert!(!machine.install(probe, 2));
+        assert_eq!(machine.install(probe, 2, NEXT), Err(NEXT));
         assert_eq!(machine.close(), None);
     }
 
     #[test]
+    fn closing_a_connected_mount_hands_its_connection_back_to_be_buried() {
+        let mut machine = machine();
+        assert_eq!(machine.close(), Some(FIRST));
+        assert_eq!(machine.phase(), Phase::Closed);
+        assert_eq!(
+            machine.close(),
+            None,
+            "a connection is handed back once, and only to whoever closed the mount"
+        );
+        assert_eq!(machine.serve(), Serve::Fail);
+    }
+
+    #[test]
     fn generations_are_monotonic_across_every_attempt() {
-        let mut machine = Machine::connected();
+        let mut machine = machine();
         assert_eq!(machine.take_generation(), 2);
         assert_eq!(machine.take_generation(), 3);
         assert_eq!(machine.take_generation(), 4);

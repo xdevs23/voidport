@@ -66,7 +66,7 @@ use voidport_proto::message::{
 };
 use voidport_proto::opcode::Opcode;
 use voidport_session::handshake::{HandshakeError, TooLong};
-use voidport_session::reconnect::{Lost, Machine, Phase, Serve, Woke};
+use voidport_session::reconnect::{FIRST_GENERATION, Lost, Machine, Phase, Serve, Woke};
 use voidport_session::replay::{Decision, OpenFlags};
 use voidport_session::{Backoff, Instant};
 
@@ -287,17 +287,16 @@ pub struct Client {
 
 /// What the adapter keeps beside the session core's state machine.
 ///
-/// The machine owns the phase, the deadline, the generations and the probe
-/// tokens; these are the things a core with no I/O may not hold — the
-/// connection object of the generation it says is installed, the handle of the
-/// task its probe token names, and the prose reason a phase carries. They
-/// change under this one lock, together with the machine, so no observer can
-/// see one without the other.
+/// The machine owns the phase, the deadline, the generations, the probe tokens
+/// and the connection itself — which it holds as opaque data and hands back to
+/// be served over or buried, so "whether a connection is installed" and "which
+/// one" cannot drift apart. What is left here is what a value cannot carry: the
+/// handle of the task a probe token names, and the prose reason a phase
+/// carries. They change under this one lock, together with the machine, so no
+/// observer can see one without the other.
 #[derive(Debug)]
 struct State {
-    machine: Machine,
-    /// The installed connection, while the machine says one is.
-    connection: Option<Arc<Connection>>,
+    machine: Machine<Arc<Connection>>,
     /// The reconnect task the machine's probe token names.
     probe: Option<tokio::task::AbortHandle>,
     /// Why the mount is not serving, in the words an operator reads.
@@ -407,7 +406,7 @@ impl Client {
         };
         let capacity = concurrency.capacity();
         let Established { connection, reader } =
-            Connection::dial(&target, Machine::first_generation(), capacity).await?;
+            Connection::dial(&target, FIRST_GENERATION, capacity).await?;
         let max_frame_len = connection.max_frame_len();
         let connection = Arc::new(connection);
         let (changes, _) = watch::channel(0);
@@ -417,8 +416,7 @@ impl Client {
             capacity,
             base: tokio::time::Instant::now(),
             state: Mutex::new(State {
-                machine: Machine::connected(),
-                connection: Some(Arc::clone(&connection)),
+                machine: Machine::connected(Arc::clone(&connection)),
                 probe: None,
                 reason: None,
                 backoff: Backoff::seeded(seed()),
@@ -526,9 +524,9 @@ impl Client {
     /// when the peer has stopped reading.
     pub fn close(&self) {
         let mut state = self.lock();
-        state.machine.close();
+        let installed = state.machine.close();
         state.cancel_probe();
-        if let Some(connection) = state.connection.take() {
+        if let Some(connection) = installed {
             connection.bury(Death::Closed);
         }
         self.announce(&mut state);
@@ -551,9 +549,9 @@ impl Client {
     /// (the core's ended recovery, honoured wherever a death is reported).
     pub fn stop_reconnecting(&self) {
         let mut state = self.lock();
-        let stopped = state.machine.stop_reconnecting();
+        let closed = state.machine.stop_reconnecting();
         state.cancel_probe();
-        if stopped.closed {
+        if closed {
             self.announce(&mut state);
         }
     }
@@ -586,9 +584,13 @@ impl Client {
     /// lifted. A mount that is Connected or Closed has nothing to recover, and
     /// a recovery that *ended* is never resumed: only a pause is lifted here.
     pub fn resume_recovery(&self) {
+        // Taken before the core is asked for an attempt, so a client that
+        // cannot spawn one never leaves the machine holding a token for a task
+        // nobody started.
+        let Some(me) = self.weak() else { return };
         let mut state = self.lock();
         if let Some(token) = state.machine.resume_recovery() {
-            self.spawn_probe(&mut state, token);
+            self.spawn_probe(&mut state, me, token);
         }
     }
 
@@ -605,12 +607,11 @@ impl Client {
             let (deadline, mut changes) = {
                 let state = self.lock();
                 match state.machine.serve() {
-                    // The machine says a connection is installed, so the
-                    // adapter holds one: they change under this one lock.
-                    Serve::Now { .. } => {
-                        let connection = state.connection.clone().ok_or(Errno::IO)?;
+                    // The core hands out the connection it holds, so a request
+                    // is served over exactly the one the phase names.
+                    Serve::Now { connection } => {
                         return Ok(Serving {
-                            connection,
+                            connection: Arc::clone(connection),
                             stalled,
                         });
                     }
@@ -645,9 +646,14 @@ impl Client {
     /// The installed connection, or `None` if there is none right now.
     ///
     /// Never stalls: it is what a request with nothing to wait for — a
-    /// no-response `forget` — asks with.
+    /// no-response `forget` — asks with, so a mount that is stalling out a
+    /// window answers it the same way a degraded one does.
     fn current(&self) -> Option<Arc<Connection>> {
-        self.lock().connection.clone()
+        let state = self.lock();
+        match state.machine.serve() {
+            Serve::Now { connection } => Some(Arc::clone(connection)),
+            Serve::Stall { .. } | Serve::Fail => None,
+        }
     }
 
     /// Sends one request and returns its reply, replaying per the discipline.
@@ -890,8 +896,10 @@ impl Client {
         if lost == Lost::Ignored {
             return;
         }
+        // The mount let this connection go with the phase change, and whoever
+        // reports a death is holding the connection it reports: burying it is
+        // this caller's own step.
         connection.bury(reason.clone());
-        state.connection = None;
         state.reason = Some(reason);
         self.announce(&mut state);
         if lost.wants_probe() {
@@ -937,23 +945,28 @@ impl Client {
     /// Connected, atomically.
     ///
     /// The core says whether this attempt may install at all — a torn-down
-    /// mount, a paused recovery and a superseded attempt each answer no — and a
-    /// connection it refuses is buried instead, which is what keeps a mount
-    /// from ever holding two live sessions and splitting its callbacks across
-    /// them.
+    /// mount, a paused recovery and a superseded attempt each answer no — and it
+    /// hands a connection it will not take straight back to be buried, which is
+    /// what keeps a mount from ever holding two live sessions and splitting its
+    /// callbacks across them.
     fn install(&self, established: Established, probe: u64) {
         let Established { connection, reader } = established;
         let connection = Arc::new(connection);
         {
             let mut state = self.lock();
-            if !state.machine.install(probe, connection.generation()) {
-                connection.bury(Death::Closed);
+            if let Err(refused) =
+                state
+                    .machine
+                    .install(probe, connection.generation(), Arc::clone(&connection))
+            {
+                refused.bury(Death::Closed);
                 return;
             }
             self.max_frame_len
                 .store(connection.max_frame_len(), Ordering::Relaxed);
-            state.connection = Some(Arc::clone(&connection));
             state.reason = None;
+            // The task that installed a connection is done, so its handle is
+            // let go with the token the core just retired.
             state.probe = None;
             self.announce(&mut state);
         }
@@ -1019,22 +1032,18 @@ impl Client {
     /// neither gets a task here — which is what stops a connection dying
     /// mid-unmount from putting a dialler behind the teardown.
     fn start_probe(&self, state: &mut MutexGuard<'_, State>) {
+        // Taken before the core is asked for an attempt: a client that cannot
+        // spawn a task that outlives this call must not leave the machine
+        // holding a token for one nobody started. The reference is set the
+        // moment the client is built, before anything can lose a connection.
+        let Some(me) = self.weak() else { return };
         if let Some(token) = state.machine.start_probe() {
-            self.spawn_probe(state, token);
+            self.spawn_probe(state, me, token);
         }
     }
 
     /// Spawns the attempt the core has just handed out a token for.
-    fn spawn_probe(&self, state: &mut MutexGuard<'_, State>, token: u64) {
-        let Some(me) = self.weak() else {
-            // A client whose own weak reference is not set yet cannot spawn a
-            // task that outlives the call, so the token is given straight back
-            // and the bar goes up: nothing dials. Unreachable in a mount that
-            // exists — the reference is set the moment the client is built,
-            // before anything can lose a connection.
-            state.machine.pause_recovery();
-            return;
-        };
+    fn spawn_probe(&self, state: &mut MutexGuard<'_, State>, me: Weak<Client>, token: u64) {
         // A fresh attempt is a fresh outage as far as the schedule is
         // concerned; the jitter source keeps advancing across all of them.
         state.backoff.restart();
