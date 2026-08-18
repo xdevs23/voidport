@@ -4580,14 +4580,47 @@ bounded by the signing key's, which retracts the earlier
 for-the-server's-lifetime phrasing (a signed token is
 self-contained and outlives the member that minted it; the same
 decision resolves the once-open question of token behavior across
-interchangeable members). Local-only transports keep the v1 trust
-model (decided 2026-08-18): a connection arriving over vsock, a
-unix socket, or loopback (127.0.0.*) requires no authentication
-regardless of the namespace's configured auth — the transport
-itself is the identity statement there, exactly as
-THREAT-MODEL.md records for v1 — and a namespace's auth
-requirement binds the non-local transports. The remaining auth
-types stay open, to be specified before any of them is built.
+interchangeable members). Local-only transports may keep the v1
+trust model (decided 2026-08-18; refined the same day, retracting
+the broader first wording in place): `auth = "none"` remains a
+legal namespace configuration for connections arriving over
+vsock, a unix socket, or loopback (127.0.0.*) — the transport is
+an acceptable identity statement there, exactly as
+THREAT-MODEL.md records for v1 — while a namespace that
+configures a real auth type enforces it on every transport, local
+included, which is what lets the PAM type below protect a local
+mount at all.
+
+Further types, decided in direction 2026-08-18, each specified
+fully before built:
+
+- **OIDC single sign-on.** A user authenticates against the
+  deployment's identity provider; access to namespaces is decided
+  by the claims the provider issues (a role or group), the server
+  validating the provider's tokens against its published keys —
+  the same verification machinery the approval JWT establishes,
+  keyed by the provider instead of the fleet key. The mount flow
+  suited to a command line is the standard device-authorization
+  grant. The exact claim-to-namespace mapping is open.
+- **Client credentials.** An application identity — client id and
+  secret — granted access to named namespaces: the
+  machine-to-machine complement of the SSO type, riding the same
+  provider infrastructure where one exists.
+- **PAM owner authentication.** A namespace names an owner
+  account on the serving host; mounting requires completing a PAM
+  conversation as that account. The recorded use it exists for: a
+  permissionless filesystem (a FAT removable drive) served as a
+  namespace with per-user protection instead of world-open
+  permissions. Two constraints recorded with it: authenticating
+  arbitrary accounts through PAM requires a privileged helper
+  beside the ordinary-user server, and a PAM conversation must
+  never cross a network in the clear, so the type binds to local
+  transports until transport encryption exists.
+- **Open, raised by every remote type:** the wire would carry
+  bearer tokens and PAM conversations; plaintext TCP makes both
+  interceptable, so transport encryption — or binding remote auth
+  types to encrypted transports only — is a v2 design question
+  the auth foundation answers before any remote type ships.
 
 The design law above all for the kernel work (decided 2026-08-17;
 refined the same day): everything is designed robustly from the
