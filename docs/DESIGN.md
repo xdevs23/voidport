@@ -4648,13 +4648,25 @@ identical flow — one code path, no second mechanism. Realities
 recorded for the implementation: the HTTP-01 and TLS-ALPN-01
 challenges need ports 80 or 443 reachable from the CA, so a
 server not fronting those needs the DNS-01 challenge (provider
-credentials, the way caddy does it) — both get support; ZeroSSL's
-ACME endpoint involves external account binding obtained
-automatically from an account email (uncertain in detail,
-verified when built); and certificate state for a fleet of
+credentials, the way caddy does it) — both get support. ZeroSSL's
+external account binding is settled (2026-08-18, from the caddy
+maintainer's own account, retracting the uncertainty in place):
+EAB is always required by ZeroSSL, and it is generated
+automatically when an account email is provided — so the
+configuration carries an **email field**, and manually generated
+EAB credentials (key id and MAC key) remain configurable for the
+deployment that has them. Certificate state for a fleet of
 identical replicas serving one domain lives where the fleet's
 shared state lives — the backend — so members do not race the
 CA's rate limits issuing per-member duplicates.
+
+**Domains are per namespace where wanted (decided 2026-08-18).**
+A namespace can carry its own domain, so one namespace serves
+under one name and another under another. The mechanism is the
+web servers' own: one listener serves many domains through server
+name indication — the certificate follows the name the client
+dialed, and the domain names the namespaces it fronts. A
+namespace without its own domain rides the server-wide one.
 
 The design law above all for the kernel work (decided 2026-08-17;
 refined the same day): everything is designed robustly from the
