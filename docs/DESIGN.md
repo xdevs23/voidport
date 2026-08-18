@@ -4636,6 +4636,26 @@ shape, which is not TLS: a fixed static-keypair handshake with no
 certificate machinery, suited to machine pairs with
 pre-registered keys, the fleet-internal case included.
 
+**Certificates are ACME-only (decided 2026-08-18).** The TLS
+path carries no self-signed generation and no manual certificate
+configuration beyond naming the domain: automatic issuance and
+renewal in the caddy shape, ordered **ZeroSSL first, Let's
+Encrypt as the fallback**, through an established ACME client
+library. The ACME directory endpoint is configurable, which is
+the whole internal-PKI story in one knob: a deployment wanting
+its own CA points it at a step-ca instance and rides the
+identical flow — one code path, no second mechanism. Realities
+recorded for the implementation: the HTTP-01 and TLS-ALPN-01
+challenges need ports 80 or 443 reachable from the CA, so a
+server not fronting those needs the DNS-01 challenge (provider
+credentials, the way caddy does it) — both get support; ZeroSSL's
+ACME endpoint involves external account binding obtained
+automatically from an account email (uncertain in detail,
+verified when built); and certificate state for a fleet of
+identical replicas serving one domain lives where the fleet's
+shared state lives — the backend — so members do not race the
+CA's rate limits issuing per-member duplicates.
+
 The design law above all for the kernel work (decided 2026-08-17;
 refined the same day): everything is designed robustly from the
 start — a hazard is fixed through architecture, never through
