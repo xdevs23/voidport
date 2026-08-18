@@ -177,27 +177,31 @@ disagree.
 
 ## Transport — kernel-owned vsock
 
-**Proven by source and compile-proven; never yet executed.** The
+**Measured (2026-08-18): the transport is executed fact.** Phase
+1 ran: the probe module, from inside a nix-built KVM guest on the
+stable set member, created a kernel-owned vsock socket, connected
+to the host, sent a 65-byte hello, received the 44-byte reply,
+and was accepted by the unmodified v1 server — session visible in
+the server's own table, reproduced across guest runs with fresh
+addressing each, and independently rerun before commit. The
 kernel-socket constructor is family-agnostic; the vsock family
 threads the kernel flag through its allocation; the send and
-receive calls carry kernel buffers. Every needed symbol is a plain
-export — moot for licensing, since the Rust runtime's exports force
-GPL-2.0 regardless, consistent with the recorded license split. The
-newest-kernel signature drift in the connect call is found and
-fixed in the probes. Two source-proven preconditions: the vsock
-transport module is ensured by the guest image's module
-configuration (a soft dependency declared by the module, and the
-built-image case controls its image — a mount-time preflight
-answers a typed error when the transport is absent anyway), and
-socket calls run in task context: the client's I/O lives on its
-own kernel threads.
+receive calls carry kernel buffers; socket calls run in task
+context on the module's own kernel threads. The vsock transport
+module is ensured by the guest image's module configuration (a
+soft dependency, and the built-image case controls its image — a
+mount-time preflight answers a typed error when the transport is
+absent anyway).
 
-**The first implementation phase is the load test this document is
-not allowed to assume**: a module exchanging one real frame with
-the running v1 server over vsock. No published precedent exists
-anywhere for kernel-space Rust over vsock; this is the highest
-information per hour in the plan, and nothing in this document
-claims it has happened.
+**The C surface came out empty.** All six kernel-socket calls are
+declared in the kernel's generated bindings crate and are called
+from Rust directly — the shim the probes once carried is retired,
+not ported. The one bindings gap: the vsock address structure is
+absent from the bindings, and is mirrored as a repr(C) struct
+with static assertions on size, alignment and every field offset;
+it is userspace ABI, frozen by the kernel's own compatibility
+promise. Licensing is moot either way: the Rust runtime's exports
+force GPL-2.0 regardless, consistent with the recorded split.
 
 ## The data path and the caching decision
 
@@ -453,12 +457,12 @@ out of tree after three years.
 
 Each phase gates the next; none is started by this document.
 
-1. **Frame over vsock, executed**: the probe module exchanges one
-   real frame with the v1 server at runtime — in a minimal probe
-   guest first (the full ring-2 harness comes later), then ring 3.
-   Runs on the stable member of the kernel set first; the other
-   members join the ladder with the phase-3 harness. Converts the
-   transport from compile-proven to measured; no precedent exists.
+1. ~~**Frame over vsock, executed**~~ — done 2026-08-18, on the
+   stable member, with the transport section above carrying the
+   measured record. Ring 3 stays unavailable until the development
+   machine boots a set member, and the ladder states that instead
+   of assuming it. The other members join with the phase-3
+   harness.
 2. **The shared core extraction**: the session logic leaves the
    userspace client for the no_std core crate, with the fixed-
    capacity replay design and the permissive license entry owed to
