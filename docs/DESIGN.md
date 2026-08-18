@@ -4570,19 +4570,24 @@ no server-wide notion of it. The first supported type is **admin
 approval**: a client's request to a protected namespace parks as
 a pending approval carrying a request ID; the operator approves
 it (`voidport-ctl auth approve --yes <request-id>`, or the TUI's
-approval dialog), and the server mints an ephemeral token with no
-expiry, valid for the rest of the server's lifetime, which both
-identifies and authenticates that client from then on. Local-only
-transports keep the v1 trust model (decided 2026-08-18): a
-connection arriving over vsock, a unix socket, or loopback
-(127.0.0.*) requires no authentication regardless of the
-namespace's configured auth — the transport itself is the
-identity statement there, exactly as THREAT-MODEL.md records for
-v1 — and a namespace's auth requirement binds the non-local
-transports. Open, to be settled with the remaining types: how a
-minted token behaves across fleet members, given that approval
-names one server while the fleet shape makes members
-interchangeable.
+approval dialog), and the server mints a token that both
+identifies and authenticates that client from then on. The token
+is a **JWT** (decided 2026-08-18): the servers are given a
+private signing key, every member of the fleet holds it, and any
+member therefore verifies any token no matter which member issued
+it — the minted token carries no expiry, and its validity is
+bounded by the signing key's, which retracts the earlier
+for-the-server's-lifetime phrasing (a signed token is
+self-contained and outlives the member that minted it; the same
+decision resolves the once-open question of token behavior across
+interchangeable members). Local-only transports keep the v1 trust
+model (decided 2026-08-18): a connection arriving over vsock, a
+unix socket, or loopback (127.0.0.*) requires no authentication
+regardless of the namespace's configured auth — the transport
+itself is the identity statement there, exactly as
+THREAT-MODEL.md records for v1 — and a namespace's auth
+requirement binds the non-local transports. The remaining auth
+types stay open, to be specified before any of them is built.
 
 The design law above all for the kernel work (decided 2026-08-17;
 refined the same day): everything is designed robustly from the
