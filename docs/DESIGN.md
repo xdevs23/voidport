@@ -4519,6 +4519,53 @@ process, one host, tokio + blocking-pool host I/O, FUSE data path):
   all of v1 the normative state is `auth = "none"` with the transport
   as the trust model, exactly as THREAT-MODEL.md states it.
 
+**Scale-out topology (decided 2026-08-18).** The fleet shape is
+**identical replicas over shared backends**: every server runs the
+same configuration, speaks a compatible protocol (version skew is
+allowed when the protocol is), and supports the same backends; the
+backend owns the data, so any member answers any request the same
+way. Scaling is horizontal by construction — N instances behind a
+load balancer or DNS — with no director tier and no partitioning
+layer of voidport's own. Locking, atomicity and coherence are
+backend obligations: the server forwards what it is given and
+promises nothing the backend does not. A thousand members over one
+shared filesystem is an ordinary deployment. Members that share a
+configuration but not the storage behind it are a
+misconfiguration, defended only this far: a client rejects a
+desynced server, and how desync is detected is an implementation
+choice. Sessions migrate transparently between members under the
+resilience contract, and a client may hold several connections at
+once where bandwidth calls for it.
+
+Every constellation is in scope: same machine, across a VM
+boundary, LAN, or arbitrary-latency WAN — correctness never
+depends on round-trip time, every timeout is configurable, and no
+protocol step is latency-sensitive by construction. Architectures
+mix freely (x86_64, ARM64, RISC-V, either endianness in one
+fleet): the wire stays **explicit little-endian** per the recorded
+v1 encoding decision, now affirmed for the fleet — every
+mainstream target is little-endian natively so the common case
+swaps nothing, and a big-endian member interoperates by
+construction because the wire is typed, never host-order.
+Transports are stream transports only — TCP, unix, vsock; UDP is
+out of scope by decision, loss recovery belongs to the transport.
+Hardware failure within one member remains best-effort survival
+in v2; guaranteed survival across members is v3's aggregation.
+
+**Authentication (decided 2026-08-18; the first type, more to
+follow).** Auth is **scoped to the namespace, never the server**:
+each namespace defines its own authentication, and a server holds
+no server-wide notion of it. The first supported type is **admin
+approval**: a client's request to a protected namespace parks as
+a pending approval carrying a request ID; the operator approves
+it (`voidport-ctl auth approve --yes <request-id>`, or the TUI's
+approval dialog), and the server mints an ephemeral token with no
+expiry, valid for the rest of the server's lifetime, which both
+identifies and authenticates that client from then on. Open, to
+be settled with the remaining types: how a minted token behaves
+across fleet members, given that approval names one server while
+the fleet shape makes members interchangeable.
+
 The design law above all for the kernel work (decided 2026-08-17;
 refined the same day): everything is designed robustly from the
 start — a hazard is fixed through architecture, never through
