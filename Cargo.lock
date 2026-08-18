@@ -2296,6 +2296,7 @@ dependencies = [
  "url",
  "voidport-control",
  "voidport-proto",
+ "voidport-session",
  "voidport-tui",
  "voidportd",
  "vsock",
@@ -2356,6 +2357,14 @@ dependencies = [
  "libc",
  "portable-pty",
  "vt100",
+]
+
+[[package]]
+name = "voidport-session"
+version = "1.0.0"
+dependencies = [
+ "voidport-proto",
+ "zerocopy",
 ]
 
 [[package]]

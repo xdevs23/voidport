@@ -30,7 +30,7 @@ use std::sync::mpsc;
 use std::time::Duration;
 
 use rustix::io::Errno;
-use voidport::client::{Caller, Client, ConnectError, Resilience};
+use voidport::client::{Caller, Client, Concurrency, ConnectError, Resilience};
 use voidport::url::Endpoint;
 use voidport_proto::PROTOCOL_VERSION;
 use voidport_proto::frame::{
@@ -202,6 +202,7 @@ fn assert_poisons(fault: Fault) {
             Resilience {
                 stall: Duration::ZERO,
             },
+            Concurrency::default(),
         )
         .await
         .expect("the handshake succeeds");

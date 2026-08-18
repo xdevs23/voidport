@@ -40,6 +40,25 @@ wire_struct! {
     }
 }
 
+impl HelloRequest {
+    /// Builds the handshake a client sends: this crate's protocol version, no
+    /// feature flags, no auth blob, and the two payload regions the caller is
+    /// about to write.
+    ///
+    /// The one place a client states which protocol it speaks, so no client
+    /// states it a second time.
+    #[must_use]
+    pub fn new(namespace_len: u32, subpath_len: u32) -> Self {
+        Self {
+            protocol_version: U32::new(crate::PROTOCOL_VERSION),
+            flags: U32::ZERO,
+            namespace_len: U32::new(namespace_len),
+            subpath_len: U32::new(subpath_len),
+            auth_len: U32::ZERO,
+        }
+    }
+}
+
 wire_body!(
     request HelloRequest => Opcode::Hello,
     encode_validate = |message: &HelloRequest| {

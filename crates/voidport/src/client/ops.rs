@@ -5,21 +5,14 @@
 //! policy — what is allowed, what an errno means — is the server's, and this
 //! module never second-guesses it.
 //!
-//! One judgement does live here, and only here: **what the replay discipline
-//! may do with each operation if its connection dies mid-flight.** The class
-//! sits at the call site, beside the request it describes, because that is
-//! where "is applying this twice the same as applying it once?" is answerable
-//! by looking at one thing. The design's list is the authority:
-//!
-//! * [`Replay::Idempotent`] — the list, and nothing beyond it: lookup, getattr,
-//!   read, readdirplus, the xattr reads, statfs, readlink, getlk, and an `open`
-//!   that neither creates nor truncates;
-//! * [`Replay::Once`] — everything else. Every mutation; an `open` carrying
-//!   `O_CREAT`/`O_TRUNC`/`O_EXCL`, because those *are* mutations; and `flush`
-//!   and `fsync`, which the list leaves out and which act on server-side state
-//!   — the caller's record-lock owner, the host file's durability — that this
-//!   client may not re-apply on a guest's behalf;
-//! * [`Replay::Moot`] — `release`, whose handle died with the session.
+//! What the replay discipline may do with each operation if its connection dies
+//! mid-flight is **not** decided here, and no longer stated at each call site:
+//! it is the session core's classification table
+//! ([`voidport_session::replay::of`]), keyed on the opcode the request carries.
+//! The one thing this module still contributes to it is the guest ABI: `open`
+//! is the operation whose class depends on its arguments, and which numeric bit
+//! is `O_CREAT` is an architecture's business, not the protocol's — so
+//! [`open_flags`] names the guest's bits and the core decides what they mean.
 
 use rustix::fs::OFlags;
 use rustix::io::Errno;
@@ -49,7 +42,9 @@ use voidport_proto::ops::xattr::{
 };
 use zerocopy::byteorder::little_endian::{U32, U64};
 
-use super::{Caller, Class, Client, DirEntry, Entry, Replay};
+use voidport_session::replay::OpenFlags;
+
+use super::{Caller, Class, Client, DirEntry, Entry};
 
 /// A time a `setattr` sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -192,25 +187,24 @@ impl XattrNames {
     }
 }
 
-/// The open flags that make an `open` a mutation.
+/// The guest's open flags, in the terms the core's classification names.
 ///
-/// A plain open may be repeated freely after a reconnect; one that creates,
-/// refuses to create, or truncates cannot, because a second application would
-/// see — or make — a different world.
-///
-/// `O_APPEND` is deliberately not among them: it describes how the handle
-/// places writes, and opening a file for appending twice leaves the file
-/// exactly as one open would. The *writes* through such a handle are the ones
-/// that must not be repeated, and [`Client::write`] classes them accordingly.
-const MUTATING_OPEN: OFlags = OFlags::CREATE.union(OFlags::EXCL).union(OFlags::TRUNC);
-
-/// How an `open` with these flags may be replayed.
-fn open_replay(flags: u32) -> Replay {
-    if OFlags::from_bits_retain(flags).intersects(MUTATING_OPEN) {
-        Replay::Once
-    } else {
-        Replay::Idempotent
-    }
+/// A translation and nothing else: which bit is `O_CREAT` is the running
+/// architecture's ABI, which `rustix` answers for this build, and what a
+/// creating or truncating open means for a replay is the core's. Flags the
+/// classification does not distinguish are dropped here, because the core has
+/// no opinion to give about them.
+fn open_flags(flags: u32) -> OpenFlags {
+    let flags = OFlags::from_bits_retain(flags);
+    [
+        (OFlags::CREATE, OpenFlags::CREATE),
+        (OFlags::EXCL, OpenFlags::EXCLUSIVE),
+        (OFlags::TRUNC, OpenFlags::TRUNCATE),
+        (OFlags::APPEND, OpenFlags::APPEND),
+    ]
+    .into_iter()
+    .filter(|(guest, _)| flags.contains(*guest))
+    .fold(OpenFlags::NONE, |named, (_, flag)| named.union(flag))
 }
 
 impl Client {
@@ -223,14 +217,9 @@ impl Client {
         let body = LookupRequest {
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, LookupResponse, _>(
-            caller,
-            parent,
-            &body,
-            name,
-            Replay::Idempotent,
-            |body, _| Ok(Entry::of(&body.entry)),
-        )
+        self.call::<_, LookupResponse, _>(caller, parent, &body, name, |body, _| {
+            Ok(Entry::of(&body.entry))
+        })
         .await
     }
 
@@ -267,15 +256,8 @@ impl Client {
             }),
             reserved: U32::ZERO,
         };
-        self.call::<_, GetattrResponse, _>(
-            caller,
-            node_id,
-            &body,
-            &[],
-            Replay::Idempotent,
-            |body, _| Ok(body.attr),
-        )
-        .await
+        self.call::<_, GetattrResponse, _>(caller, node_id, &body, &[], |body, _| Ok(body.attr))
+            .await
     }
 
     /// Changes a node's attributes.
@@ -333,10 +315,8 @@ impl Client {
             mtime: instant(change.mtime),
             ctime: change.ctime.unwrap_or_else(|| Timespec::new(0, 0)),
         };
-        self.call::<_, SetattrResponse, _>(caller, node_id, &body, &[], Replay::Once, |body, _| {
-            Ok(body.attr)
-        })
-        .await
+        self.call::<_, SetattrResponse, _>(caller, node_id, &body, &[], |body, _| Ok(body.attr))
+            .await
     }
 
     /// Reads a symlink's target, verbatim.
@@ -350,7 +330,6 @@ impl Client {
             node_id,
             &ReadlinkRequest {},
             &[],
-            Replay::Idempotent,
             |_, payload| Ok(payload.to_vec()),
         )
         .await
@@ -374,14 +353,9 @@ impl Client {
         };
         let mut payload = name.to_vec();
         payload.extend_from_slice(target);
-        self.call::<_, SymlinkResponse, _>(
-            caller,
-            parent,
-            &body,
-            &payload,
-            Replay::Once,
-            |body, _| Ok(Entry::of(&body.entry)),
-        )
+        self.call::<_, SymlinkResponse, _>(caller, parent, &body, &payload, |body, _| {
+            Ok(Entry::of(&body.entry))
+        })
         .await
     }
 
@@ -404,7 +378,7 @@ impl Client {
             name_len: U32::new(length(name)?),
             reserved: U32::ZERO,
         };
-        self.call::<_, MkdirResponse, _>(caller, parent, &body, name, Replay::Once, |body, _| {
+        self.call::<_, MkdirResponse, _>(caller, parent, &body, name, |body, _| {
             Ok(Entry::of(&body.entry))
         })
         .await
@@ -435,7 +409,7 @@ impl Client {
             rdev: U32::new(rdev),
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, MknodResponse, _>(caller, parent, &body, name, Replay::Once, |body, _| {
+        self.call::<_, MknodResponse, _>(caller, parent, &body, name, |body, _| {
             Ok(Entry::of(&body.entry))
         })
         .await
@@ -450,7 +424,7 @@ impl Client {
         let body = UnlinkRequest {
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, UnlinkResponse, _>(caller, parent, &body, name, Replay::Once, |_, _| Ok(()))
+        self.call::<_, UnlinkResponse, _>(caller, parent, &body, name, |_, _| Ok(()))
             .await
     }
 
@@ -463,7 +437,7 @@ impl Client {
         let body = RmdirRequest {
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, RmdirResponse, _>(caller, parent, &body, name, Replay::Once, |_, _| Ok(()))
+        self.call::<_, RmdirResponse, _>(caller, parent, &body, name, |_, _| Ok(()))
             .await
     }
 
@@ -490,10 +464,8 @@ impl Client {
         };
         let mut payload = name.to_vec();
         payload.extend_from_slice(new_name);
-        self.call::<_, RenameResponse, _>(caller, parent, &body, &payload, Replay::Once, |_, _| {
-            Ok(())
-        })
-        .await
+        self.call::<_, RenameResponse, _>(caller, parent, &body, &payload, |_, _| Ok(()))
+            .await
     }
 
     /// Creates a hard link to an existing node.
@@ -513,7 +485,7 @@ impl Client {
             name_len: U32::new(length(name)?),
             reserved: U32::ZERO,
         };
-        self.call::<_, LinkResponse, _>(caller, parent, &body, name, Replay::Once, |body, _| {
+        self.call::<_, LinkResponse, _>(caller, parent, &body, name, |body, _| {
             Ok(Entry::of(&body.entry))
         })
         .await
@@ -529,15 +501,19 @@ impl Client {
             flags: U32::new(flags),
             reserved: U32::ZERO,
         };
-        self.call::<_, OpenResponse, _>(
+        // The one operation whose replay class depends on its arguments, so
+        // the one that hands the core more than its opcode.
+        self.call_on::<_, OpenResponse, _>(
             caller,
             node_id,
             &body,
             &[],
-            open_replay(flags),
+            open_flags(flags),
+            Class::Prompt,
             |body, _| Ok(body.handle.get()),
         )
         .await
+        .map(|(handle, _)| handle)
     }
 
     /// Creates and opens a file in one round trip.
@@ -560,7 +536,7 @@ impl Client {
             umask: U32::new(umask),
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, CreateResponse, _>(caller, parent, &body, name, Replay::Once, |body, _| {
+        self.call::<_, CreateResponse, _>(caller, parent, &body, name, |body, _| {
             Ok((Entry::of(&body.entry), body.handle.get()))
         })
         .await
@@ -585,21 +561,16 @@ impl Client {
             size: U32::new(size),
             flags: U32::ZERO,
         };
-        self.call::<_, ReadResponse, _>(
-            caller,
-            node_id,
-            &body,
-            &[],
-            Replay::Idempotent,
-            |_, payload| Ok(payload.to_vec()),
-        )
+        self.call::<_, ReadResponse, _>(caller, node_id, &body, &[], |_, payload| {
+            Ok(payload.to_vec())
+        })
         .await
     }
 
     /// Writes file data, returning how much was written.
     ///
-    /// [`Replay::Once`] carries more weight here than "a mutation must not be
-    /// applied twice". A write at an offset that was applied and then repeated
+    /// The core's once-only class carries more weight here than "a mutation
+    /// must not be applied twice". A write at an offset that was applied and then repeated
     /// would at least be idempotent in its effect; a write on a handle the
     /// guest opened `O_APPEND` would not, because the server does not place it
     /// at the offset in the request — the host appends it — so a re-sent append
@@ -704,7 +675,7 @@ impl Client {
             node_id,
             &body,
             data,
-            Replay::Once,
+            OpenFlags::NONE,
             class,
             |body, _| Ok(body.written.get()),
         )
@@ -769,7 +740,7 @@ impl Client {
         // A mutation, and not on the design's idempotent list: the server drops
         // the caller's record-lock owner here, so a written attempt that lost
         // its answer has to be assumed applied, not re-sent.
-        self.call::<_, FlushResponse, _>(caller, node_id, &body, &[], Replay::Once, |_, _| Ok(()))
+        self.call::<_, FlushResponse, _>(caller, node_id, &body, &[], |_, _| Ok(()))
             .await
     }
 
@@ -793,7 +764,7 @@ impl Client {
         // Not on the design's idempotent list either: a durability barrier the
         // guest was told nothing about is not one this client may re-issue on
         // its own, so a written attempt that lost its answer fails.
-        self.call::<_, FsyncResponse, _>(caller, node_id, &body, &[], Replay::Once, |_, _| Ok(()))
+        self.call::<_, FsyncResponse, _>(caller, node_id, &body, &[], |_, _| Ok(()))
             .await
     }
 
@@ -803,14 +774,9 @@ impl Client {
     ///
     /// The server's errno, or `EIO` on a degraded mount.
     pub async fn statfs(&self, caller: Caller, node_id: u64) -> Result<StatfsResponse, Errno> {
-        self.call::<_, StatfsResponse, _>(
-            caller,
-            node_id,
-            &StatfsRequest {},
-            &[],
-            Replay::Idempotent,
-            |body, _| Ok(*body),
-        )
+        self.call::<_, StatfsResponse, _>(caller, node_id, &StatfsRequest {}, &[], |body, _| {
+            Ok(*body)
+        })
         .await
     }
 
@@ -837,26 +803,19 @@ impl Client {
             size: U32::new(size),
             reserved: U32::ZERO,
         };
-        self.call::<_, ReaddirplusResponse, _>(
-            caller,
-            node_id,
-            &body,
-            &[],
-            Replay::Idempotent,
-            |_, payload| {
-                DirEntryIter::new(payload)
-                    .map(|item| {
-                        let item = item?;
-                        Ok(DirEntry {
-                            name: item.tail.to_vec(),
-                            entry: Entry::of(&item.header.entry),
-                            next_cookie: item.header.next_cookie.get(),
-                            entry_type: item.header.entry_type.get(),
-                        })
+        self.call::<_, ReaddirplusResponse, _>(caller, node_id, &body, &[], |_, payload| {
+            DirEntryIter::new(payload)
+                .map(|item| {
+                    let item = item?;
+                    Ok(DirEntry {
+                        name: item.tail.to_vec(),
+                        entry: Entry::of(&item.header.entry),
+                        next_cookie: item.header.next_cookie.get(),
+                        entry_type: item.header.entry_type.get(),
                     })
-                    .collect()
-            },
-        )
+                })
+                .collect()
+        })
         .await
     }
 
@@ -876,19 +835,12 @@ impl Client {
             size: U32::new(size),
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, GetxattrResponse, _>(
-            caller,
-            node_id,
-            &body,
-            name,
-            Replay::Idempotent,
-            |body, payload| {
-                Ok(XattrValue {
-                    size: body.size.get(),
-                    value: payload.to_vec(),
-                })
-            },
-        )
+        self.call::<_, GetxattrResponse, _>(caller, node_id, &body, name, |body, payload| {
+            Ok(XattrValue {
+                size: body.size.get(),
+                value: payload.to_vec(),
+            })
+        })
         .await
     }
 
@@ -913,15 +865,8 @@ impl Client {
         };
         let mut payload = name.to_vec();
         payload.extend_from_slice(value);
-        self.call::<_, SetxattrResponse, _>(
-            caller,
-            node_id,
-            &body,
-            &payload,
-            Replay::Once,
-            |_, _| Ok(()),
-        )
-        .await
+        self.call::<_, SetxattrResponse, _>(caller, node_id, &body, &payload, |_, _| Ok(()))
+            .await
     }
 
     /// Lists extended attribute names, or probes the list size with
@@ -944,22 +889,15 @@ impl Client {
             size: U32::new(size),
             reserved: U32::ZERO,
         };
-        self.call::<_, ListxattrResponse, _>(
-            caller,
-            node_id,
-            &body,
-            &[],
-            Replay::Idempotent,
-            |body, payload| {
-                XattrNameIter::new(payload)
-                    .map(|item| Ok(item?.tail.to_vec()))
-                    .collect::<Result<Vec<_>, _>>()
-                    .map(|names| XattrNames {
-                        size: body.size.get(),
-                        names,
-                    })
-            },
-        )
+        self.call::<_, ListxattrResponse, _>(caller, node_id, &body, &[], |body, payload| {
+            XattrNameIter::new(payload)
+                .map(|item| Ok(item?.tail.to_vec()))
+                .collect::<Result<Vec<_>, _>>()
+                .map(|names| XattrNames {
+                    size: body.size.get(),
+                    names,
+                })
+        })
         .await
     }
 
@@ -977,15 +915,8 @@ impl Client {
         let body = RemovexattrRequest {
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, RemovexattrResponse, _>(
-            caller,
-            node_id,
-            &body,
-            name,
-            Replay::Once,
-            |_, _| Ok(()),
-        )
-        .await
+        self.call::<_, RemovexattrResponse, _>(caller, node_id, &body, name, |_, _| Ok(()))
+            .await
     }
 
     /// Tests whether a lock could be placed.
@@ -1006,14 +937,9 @@ impl Client {
             handle: U64::new(handle),
             lock: lock.wire(),
         };
-        self.call::<_, GetlkResponse, _>(
-            caller,
-            node_id,
-            &body,
-            &[],
-            Replay::Idempotent,
-            |body, _| Ok(Lock::of(&body.lock)),
-        )
+        self.call::<_, GetlkResponse, _>(caller, node_id, &body, &[], |body, _| {
+            Ok(Lock::of(&body.lock))
+        })
         .await?
         .ok_or(Errno::IO)
     }
@@ -1039,13 +965,13 @@ impl Client {
             flags: U32::new(if wait { setlk_flags::WAIT } else { 0 }),
             reserved: U32::ZERO,
         };
-        self.call::<_, SetlkResponse, _>(caller, node_id, &body, &[], Replay::Once, |_, _| Ok(()))
+        self.call::<_, SetlkResponse, _>(caller, node_id, &body, &[], |_, _| Ok(()))
             .await
     }
 
     /// Starts — or restarts — this session's share subscription.
     ///
-    /// [`Replay::Idempotent`] by the subscription contract's own resync rule: a
+    /// Idempotent by the subscription contract's own resync rule: a
     /// `Subscribe` on an already-subscribed session answers a fresh snapshot on
     /// the same stream, so re-sending one whose reply was lost costs a snapshot
     /// and nothing else. Against the fresh session a reconnect built it is the
@@ -1081,7 +1007,7 @@ impl Client {
             0,
             &body,
             &[],
-            Replay::Idempotent,
+            OpenFlags::NONE,
             Class::Prompt,
             |_, _| Ok(()),
         )
@@ -1102,10 +1028,8 @@ impl Client {
         let body = UnsubscribeRequest {
             reserved: U32::ZERO,
         };
-        self.call::<_, UnsubscribeResponse, _>(caller, 0, &body, &[], Replay::Idempotent, |_, _| {
-            Ok(())
-        })
-        .await
+        self.call::<_, UnsubscribeResponse, _>(caller, 0, &body, &[], |_, _| Ok(()))
+            .await
     }
 }
 
@@ -1127,17 +1051,23 @@ fn instant(change: Option<TimeChange>) -> Timespec {
 mod tests {
     use super::*;
 
+    use voidport_proto::opcode::Opcode;
+    use voidport_session::replay::{self, Replay};
+
+    /// The guest bits reach the core's names, so the class the core decides is
+    /// the class this architecture's flags describe.
     #[test]
     fn only_an_open_that_creates_or_truncates_is_a_mutation() {
-        assert_eq!(open_replay(0), Replay::Idempotent);
+        let class = |flags: u32| replay::of(Opcode::Open, open_flags(flags));
+        assert_eq!(class(0), Replay::Idempotent);
         assert_eq!(
-            open_replay(OFlags::RDWR.bits() | OFlags::APPEND.bits()),
+            class(OFlags::RDWR.bits() | OFlags::APPEND.bits()),
             Replay::Idempotent,
             "appending is a property of the handle, not a change to the file"
         );
         for mutating in [OFlags::CREATE, OFlags::EXCL, OFlags::TRUNC] {
             assert_eq!(
-                open_replay(OFlags::RDWR.bits() | mutating.bits()),
+                class(OFlags::RDWR.bits() | mutating.bits()),
                 Replay::Once,
                 "{mutating:?} makes an open a mutation"
             );

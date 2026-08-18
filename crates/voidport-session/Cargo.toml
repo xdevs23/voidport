@@ -1,0 +1,23 @@
+[package]
+name = "voidport-session"
+description = "voidport session core: handshake validation, request tracking, replay discipline and reconnect, shared by both clients"
+version.workspace = true
+edition.workspace = true
+# MIT, not the workspace's GPL-3.0-only: the in-kernel client is GPL-2.0-only
+# and the two copyleft versions do not combine, so the crate both clients
+# consume carries the wire crate's permissive license for the same reason the
+# wire crate does.
+license = "MIT"
+
+[dependencies]
+voidport-proto = { workspace = true }
+
+# Dev-dependency only, and deliberately not a dependency: the crate itself
+# needs nothing but the wire crate and `core`, which is what keeps the kernel
+# build's hand-written rule set the size it already is. The ring-1 tests build
+# wire bodies to feed the handshake, and those bodies are `zerocopy` types.
+[dev-dependencies]
+zerocopy = { workspace = true }
+
+[lints]
+workspace = true

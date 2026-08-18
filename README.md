@@ -470,11 +470,14 @@ Per component, chosen by role (full texts in `LICENSES/`):
 | `voidportd` (the server) | AGPL-3.0-only |
 | `voidport`, `voidport-ctl`, `voidport-control`, `voidport-tui`, `voidport-bench`, `voidport-torture`, `voidport-pty` | GPL-3.0-only |
 | `voidport-proto` (wire format) | MIT |
+| `voidport-session` (session core) | MIT |
 | `kernel/probe` (the kernel module) | GPL-2.0-only |
 
 The server carries the AGPL because its value is delivered over a network;
 the tools carry the GPL; the wire-format crate is MIT so any client —
 the kernel module included — can speak the protocol without license
-friction. The module's own license is not a choice: the kernel's Rust
+friction. The session core is MIT for the same reason and by the same
+necessity: both clients consume it, and a GPL-2.0-only module cannot link
+a GPL-3.0-only crate. The module's own license is not a choice: the kernel's Rust
 runtime exports it is built on are GPL-2.0-only, and a GPL-2.0-only module
 is what may use them.

@@ -23,6 +23,76 @@
           inherit system;
           nixpkgsPath = nixpkgs;
         };
+
+      # The bare-metal target the session core is proven std-free against.
+      noStdTarget = "x86_64-unknown-none";
+
+      # A sysroot that carries that target beside this machine's own.
+      #
+      # The rust toolchain nixpkgs builds ships the standard library for the
+      # host and for wasm and bpf, and none of those proves what the session
+      # core's contract asks for: a 64-bit target with no standard library and
+      # no allocator behind it. So the two crates such a target needs — `core`
+      # and `compiler_builtins` — are built here, from the very library source
+      # the shell's own compiler was built from, and the host's own are linked
+      # in beside them so one sysroot answers for both. A `cargo check` against
+      # it therefore builds the core for a target that has no `std` to fall
+      # back on, which is the proof, and builds the proc macros it needs for
+      # the host as usual.
+      noStdSysroot =
+        pkgs:
+        pkgs.runCommand "rust-std-${noStdTarget}"
+          {
+            nativeBuildInputs = [
+              pkgs.rustc
+              pkgs.cargo
+              # `compiler_builtins` runs a build script, which is an ordinary
+              # host program and wants an ordinary host linker.
+              pkgs.stdenv.cc
+            ];
+            libSrc = pkgs.rustPlatform.rustLibSrc;
+          }
+          ''
+            export HOME="$TMPDIR"
+            export CARGO_HOME="$TMPDIR/cargo"
+            # The sysroot crates are the compiler's own, and they use the
+            # compiler's own unstable features; every sysroot build enables
+            # them the same way.
+            export RUSTC_BOOTSTRAP=1
+
+            libdir="$out/lib/rustlib/${noStdTarget}/lib"
+            mkdir -p "$libdir"
+            rustc --edition 2024 -O --crate-type rlib --crate-name core \
+              --target ${noStdTarget} --out-dir "$libdir" "$libSrc/core/src/lib.rs"
+
+            # `compiler_builtins` is a cargo package with a build script that
+            # decides what its target supports, so it is built as one — from
+            # the in-tree shim the compiler's own sysroot build uses, against
+            # the vendored dependencies the library source ships.
+            cp -r "$libSrc/compiler-builtins/builtins-shim" \
+                  "$libSrc/compiler-builtins/compiler-builtins" \
+                  "$libSrc/compiler-builtins/libm" "$TMPDIR"
+            chmod -R u+w "$TMPDIR/builtins-shim" "$TMPDIR/compiler-builtins" "$TMPDIR/libm"
+            printf '\n[workspace]\n' >> "$TMPDIR/builtins-shim/Cargo.toml"
+            mkdir -p "$TMPDIR/builtins-shim/.cargo"
+            cat > "$TMPDIR/builtins-shim/.cargo/config.toml" <<EOF
+            [source.crates-io]
+            replace-with = "vendored"
+            [source.vendored]
+            directory = "$libSrc/vendor"
+            EOF
+            (
+              cd "$TMPDIR/builtins-shim"
+              RUSTFLAGS="--sysroot=$out" cargo build --offline --release \
+                --target ${noStdTarget} --features compiler-builtins,mem \
+                --target-dir "$TMPDIR/target"
+            )
+            cp "$TMPDIR/target/${noStdTarget}/release/libcompiler_builtins.rlib" "$libdir"
+
+            host="$(rustc --print sysroot)/lib/rustlib"
+            ln -s "$host/${pkgs.stdenv.hostPlatform.rust.rustcTargetSpec}" "$out/lib/rustlib/"
+            ln -s "$host/etc" "$out/lib/rustlib/"
+          '';
     in
     {
       packages = forAllSystems (pkgs: {
@@ -82,6 +152,10 @@
             # check, not only on the ones that happen to be kind.
             e2fsprogs
           ];
+          # Where the checks find the std-free target the session core is
+          # proven against; `cargo check --target` reaches it through this.
+          VOIDPORT_NO_STD_SYSROOT = noStdSysroot pkgs;
+          VOIDPORT_NO_STD_TARGET = noStdTarget;
           # Keep build artifacts out of the source tree: the tree may live on a
           # slow network mount, and a `path:.` flake reference copies the whole
           # tree (gitignore does not filter it) into the nix store.

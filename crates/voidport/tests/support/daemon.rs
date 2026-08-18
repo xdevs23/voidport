@@ -27,7 +27,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use rustix::process::{Pid, Signal};
-use voidport::client::{Client, MountState, Resilience};
+use voidport::client::{Client, Concurrency, MountState, Resilience};
 use voidport::mount::{Mount, MountOptions};
 use voidport::url::{Endpoint, MountUrl};
 
@@ -605,6 +605,7 @@ impl Ground {
                 "work",
                 b"",
                 Resilience { stall },
+                Concurrency::default(),
             ))
             .expect("the mount is established")
     }

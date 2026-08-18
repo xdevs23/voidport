@@ -23,7 +23,6 @@ use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
 use voidport::url::{Endpoint, MountUrl};
-use voidport_proto::PROTOCOL_VERSION;
 use voidport_proto::frame::{FRAME_HEADER_LEN, Frame, FrameWriter, MAX_HELLO_FRAME_LEN};
 use voidport_proto::message::{
     REQUEST_HEAD_LEN, RequestBody, RequestHead, ResponseBody, ResponseOutcome,
@@ -130,13 +129,7 @@ impl Session {
     /// Handshakes, adopting the frame bound the server announces.
     fn hello(&mut self, namespace: &str, subpath: &[u8]) -> anyhow::Result<()> {
         let namespace = namespace.as_bytes();
-        let body = HelloRequest {
-            protocol_version: U32::new(PROTOCOL_VERSION),
-            flags: U32::ZERO,
-            namespace_len: U32::new(namespace.len() as u32),
-            subpath_len: U32::new(subpath.len() as u32),
-            auth_len: U32::ZERO,
-        };
+        let body = HelloRequest::new(namespace.len() as u32, subpath.len() as u32);
         let mut payload = Vec::with_capacity(namespace.len() + subpath.len());
         payload.extend_from_slice(namespace);
         payload.extend_from_slice(subpath);

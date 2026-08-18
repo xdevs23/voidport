@@ -89,8 +89,11 @@ const MAX_INFLIGHT_PER_HANDLE: usize = 8;
 /// How many prefetch reads one mount may have on the wire at once.
 ///
 /// At most 2 MiB of serialized prefetch replies per mount, which is what bounds
-/// the engine's own contribution to an interactive operation's latency.
-const MAX_INFLIGHT_PER_MOUNT: usize = 16;
+/// the engine's own contribution to an interactive operation's latency. It is
+/// also one term of the mount's request-table capacity
+/// ([`Concurrency`](super::Concurrency)), because this window is what bounds
+/// the engine's own share of what is outstanding.
+pub(super) const MAX_INFLIGHT_PER_MOUNT: usize = 16;
 
 /// What a mount's readahead engine is doing, for tests to assert on.
 ///

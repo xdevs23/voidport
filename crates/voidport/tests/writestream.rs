@@ -45,8 +45,8 @@ use rustix::fs::OFlags;
 use rustix::io::Errno;
 use support::{Fixture, preflight};
 use voidport::client::{
-    Caller, Client, DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT, Resilience, WriteStream,
-    WriteStreamStats,
+    Caller, Client, Concurrency, DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT, Resilience,
+    WriteStream, WriteStreamStats,
 };
 use voidport::mount::MountOptions;
 use voidport::url::Endpoint;
@@ -444,6 +444,7 @@ fn stream_with(policy: Policy, data: &[u8], strip: bool) -> Streamed {
             Resilience {
                 stall: Duration::ZERO,
             },
+            Concurrency::default(),
         )
         .await
         .expect("the handshake succeeds");

@@ -2,6 +2,7 @@
 resolver = "3"
 members = [
     "crates/voidport-proto",
+    "crates/voidport-session",
     "crates/voidport-control",
     "crates/voidportd",
     "crates/voidport",
@@ -21,6 +22,9 @@ repository = "https://github.com/xdevs23/voidport"
 [workspace.dependencies]
 voidport-control = { path = "crates/voidport-control" }
 voidport-proto = { path = "crates/voidport-proto" }
+# The session core both clients consume: no_std, allocation-free, and MIT so
+# the GPL-2.0-only kernel client may link it.
+voidport-session = { path = "crates/voidport-session" }
 # Dev-only: the shared pty harness, a workspace member of its own so nothing it
 # needs (a pty, a terminal parser) becomes a dependency of the product.
 voidport-pty = { path = "crates/voidport-pty" }

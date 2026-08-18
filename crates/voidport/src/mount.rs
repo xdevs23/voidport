@@ -113,8 +113,8 @@ use rustix::io::Errno;
 use rustix::mount::UnmountFlags;
 
 use crate::client::{
-    Client, ConnectError, DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT, DEFAULT_POOL_BYTES,
-    DEFAULT_RECONNECT_STALL, Readahead, Resilience, WriteStream,
+    Client, Concurrency, ConnectError, DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT,
+    DEFAULT_POOL_BYTES, DEFAULT_RECONNECT_STALL, Readahead, Resilience, WriteStream,
 };
 use crate::fuse::{InFlight, VoidportFs};
 use crate::url::MountUrl;
@@ -494,6 +494,13 @@ impl Mount {
             url.namespace.as_str(),
             &url.subpath,
             options.resilience(),
+            // The mount's own engines size the session's request table: the
+            // write window this mount was configured with, the readahead
+            // engine's own, and the allowance everything prompt runs in.
+            Concurrency {
+                write_chunks_per_mount: options.write_stream_per_mount.get(),
+                ..Concurrency::default()
+            },
         ))?;
 
         // The engine's freshness bound is the mount's attribute TTL: a

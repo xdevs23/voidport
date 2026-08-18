@@ -16,7 +16,7 @@ use std::time::Duration;
 
 use anyhow::{Context as _, Result};
 use clap::Parser as _;
-use voidport::client::{Client, Resilience};
+use voidport::client::{Client, Concurrency, Resilience};
 use voidport::mount::{Mount, MountOptions};
 use voidport::subscribe::Subscription;
 use voidport::url::MountUrl;
@@ -131,6 +131,10 @@ fn subscribe(url: &MountUrl, resilience: Resilience) -> Result<()> {
             url.namespace.as_str(),
             &url.subpath,
             resilience,
+            // A subscription runs no bulk engine, so its session is sized by
+            // the engine defaults and its allowance carries the traffic it
+            // does have.
+            Concurrency::default(),
         )
         .await?;
         let mut shares = Subscription::open(client)

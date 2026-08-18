@@ -8,34 +8,22 @@
 //! module is the layer above it, and its whole subject is **what happens when
 //! that socket dies**.
 //!
-//! ## The mount is a state machine
+//! ## What decides, and what performs
 //!
-//! * **Connected** — a connection is installed and requests flow.
-//! * **Reconnecting** — the server broke away. Newly arriving callbacks *stall*
-//!   here, bounded by **one monotonic deadline** (`--reconnect-stall`, 5 s by
-//!   default) shared by every stalled request — not by a per-request timer, so
-//!   a request that arrives late in the window is not given a fresh window of
-//!   its own. That deadline wins every tie: a stall that reaches it fails
-//!   `EIO`, and a handshake that completes in the same instant finds the window
-//!   already closed, so no amount of scheduler delay can serve a request past
-//!   its window.
-//! * **Degraded** — the deadline passed. Stalled and subsequent requests fail
-//!   `EIO` **immediately**, and the probe keeps running on a slower backoff.
-//!   The rule: once the window has passed, further errored requests are
-//!   returned with errors immediately instead of waiting again.
-//! * **Closed** — the mount was torn down. Nothing reconnects.
+//! Nothing here decides the session. The mount state machine and its one
+//! monotonic deadline, the backoff schedule, the request table with its
+//! request ids and its replay discipline, and the handshake's validation are
+//! [`voidport_session`]'s — one authority, shared with the in-kernel client and
+//! documented there. This module is the adapter: it owns the sockets, the
+//! tasks, the wakeups and the clock, it supplies the core with instants and an
+//! operating-system seed, and it performs the verdicts the core returns.
 //!
-//! **One reconnect task owns every transition out of Connected.** Death
-//! observations coalesce onto it: whoever notices first — the reader task, a
-//! failing write, a caller finding a protocol fault — reports the *generation*
-//! it observed, and a report naming a generation the mount has already replaced
-//! is discarded. That is what stops a dying connection from poisoning its own
-//! replacement. A completed handshake **is** the probe, and installing it
-//! atomically returns the mount to Connected: once the server comes back,
-//! errors stop and everything resumes as usual. The probe carries a token for
-//! the same reason the connection carries a generation: cancelling a task is
-//! not synchronous, so a superseded attempt is identified and discarded, not
-//! allowed to transition the mount that replaced it.
+//! The mount is Connected, Reconnecting, Degraded or Closed
+//! ([`MountState`]); one reconnect task owns every transition out of
+//! Connected, and death observations coalesce onto it by generation. What each
+//! phase means, why the deadline wins every tie, and what the replay
+//! discipline does with a request whose connection died are the core's
+//! documentation, and this module holds nothing that could disagree with it.
 //!
 //! ## The client remembers nothing about the server's state
 //!
@@ -49,18 +37,6 @@
 //! the root, and a path rebuilds on first use with no application-visible
 //! error. Descriptors held open across the gap fail until the application
 //! reopens them — as if the tree had been replaced underneath, which it was.
-//!
-//! ## Replay discipline
-//!
-//! A request is *queued* (never fully written), *written*, or *answered*. The
-//! linearization point is the write itself, recorded in
-//! [`Connection::transmit`](connection::Connection). After a re-handshake a
-//! queued request is simply sent — it provably never reached the server, whose
-//! socket is shut down before anything is retried. A written-but-unanswered
-//! request is re-sent only if it is idempotent; a written-but-unanswered
-//! non-idempotent mutation fails `EIO` instead of risking double application.
-//! No-response requests and releases addressing a dead generation are dropped
-//! as moot: their referents died with the session.
 
 mod connection;
 mod ops;
@@ -82,7 +58,6 @@ use std::time::Duration;
 
 use rustix::io::Errno;
 use tokio::sync::watch;
-use tokio::time::Instant;
 use voidport_proto::attr::Attr;
 use voidport_proto::error::FramingError;
 use voidport_proto::frame::{FRAME_HEADER_LEN, Frame};
@@ -90,45 +65,20 @@ use voidport_proto::message::{
     RESPONSE_HEAD_LEN, RequestBody, RequestHead, ResponseBody, ResponseOutcome,
 };
 use voidport_proto::opcode::Opcode;
+use voidport_session::handshake::{HandshakeError, TooLong};
+use voidport_session::reconnect::{Lost, Machine, Phase, Serve, Woke};
+use voidport_session::replay::{Decision, OpenFlags};
+use voidport_session::{Backoff, Instant};
 
 use crate::url::Endpoint;
-use connection::{Class, Connection, Established, Sent, encode, read_replies};
-pub use connection::{MIN_MAX_FRAME_LEN, ROOT_NODE_ID};
+use connection::{Class, Connection, Established, encode, read_replies};
+pub use voidport_session::handshake::{MIN_MAX_FRAME_LEN, ROOT_NODE_ID};
 
 /// How long the mount stalls before it starts answering `EIO`.
 ///
 /// The number the design set: if the server has not come back after 5 seconds,
 /// the mount throws an I/O error.
 pub const DEFAULT_RECONNECT_STALL: Duration = Duration::from_secs(5);
-
-/// The first delay between reconnect attempts inside the stall window.
-const STALL_INITIAL_BACKOFF: Duration = Duration::from_millis(100);
-
-/// The ceiling that delay doubles up to inside the stall window.
-const STALL_MAX_BACKOFF: Duration = Duration::from_secs(1);
-
-/// The first delay between reconnect attempts once the mount is degraded.
-///
-/// Slower than inside the window, because nothing is waiting on it any more:
-/// the operator TUI worker's schedule, reused here.
-const DEGRADED_INITIAL_BACKOFF: Duration = Duration::from_millis(500);
-
-/// The ceiling that delay doubles up to once the mount is degraded.
-const DEGRADED_MAX_BACKOFF: Duration = Duration::from_secs(5);
-
-/// How long one degraded reconnect attempt may take before it is abandoned.
-///
-/// A peer that accepts the socket and never completes the handshake must not
-/// hold the probe forever; inside the stall window the window's remainder is
-/// the bound, and afterwards this is.
-const DEGRADED_ATTEMPT_BOUND: Duration = Duration::from_secs(5);
-
-/// How much of a backoff delay is jitter, as a divisor.
-///
-/// Two mounts that lost the same server must not retry in lockstep for ever;
-/// the delay is shortened by up to a quarter, never lengthened, so the schedule
-/// stays an upper bound.
-const JITTER_DIVISOR: u32 = 4;
 
 /// The guest identity a request is made on behalf of.
 ///
@@ -203,6 +153,52 @@ impl Default for Resilience {
     }
 }
 
+/// How many requests one mount may have outstanding at once.
+///
+/// The request table is fixed-capacity — it is the replay retention, and it
+/// backpressures instead of growing — so its size is **derived at mount from
+/// the mount's own bounded engines**, never invented.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Concurrency {
+    /// The write-streaming engine's per-mount chunk window.
+    pub write_chunks_per_mount: usize,
+    /// The readahead engine's per-mount prefetch window.
+    pub readahead_per_mount: usize,
+}
+
+impl Concurrency {
+    /// What the table holds for everything that is not bulk traffic.
+    ///
+    /// At least the server's own per-connection run-ahead bound, so a mount
+    /// can have as many prompt requests in flight as the server will run
+    /// ahead of — which means a prompt request never waits for the table
+    /// before it waits for the server.
+    pub const METADATA_ALLOWANCE: usize = 64;
+
+    /// The capacity a mount's request table is sized to.
+    ///
+    /// The derivation, stated where it is computed: the write window's
+    /// per-mount count, plus the readahead engine's per-mount count, plus the
+    /// metadata allowance. Each bulk engine is bounded by its own window
+    /// *before* it reaches the table, so bulk traffic cannot eat into the
+    /// allowance; a prompt request therefore always finds a slot, and the send
+    /// path's two-class rule keeps the guarantee it was built for.
+    #[must_use]
+    pub fn capacity(self) -> usize {
+        self.write_chunks_per_mount + self.readahead_per_mount + Self::METADATA_ALLOWANCE
+    }
+}
+
+impl Default for Concurrency {
+    /// The engines' own defaults, for a session that does not configure them.
+    fn default() -> Self {
+        Self {
+            write_chunks_per_mount: DEFAULT_CHUNKS_PER_MOUNT.get(),
+            readahead_per_mount: readahead::MAX_INFLIGHT_PER_MOUNT,
+        }
+    }
+}
+
 /// What a mount is doing right now.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum MountState {
@@ -214,6 +210,18 @@ pub enum MountState {
     Degraded,
     /// The mount was torn down.
     Closed,
+}
+
+impl MountState {
+    /// The phase the session core is in, as the mount surface names it.
+    fn of(phase: Phase) -> Self {
+        match phase {
+            Phase::Connected => Self::Connected,
+            Phase::Reconnecting => Self::Reconnecting,
+            Phase::Degraded => Self::Degraded,
+            Phase::Closed => Self::Closed,
+        }
+    }
 }
 
 /// Where a mount points, and what it asks the server for.
@@ -236,7 +244,15 @@ pub(crate) struct Target {
 pub struct Client {
     target: Target,
     resilience: Resilience,
-    state: Mutex<Machine>,
+    /// How many requests may be outstanding on one connection, derived at
+    /// mount from this mount's own engines ([`Concurrency::capacity`]) and
+    /// fixed for the mount's life.
+    capacity: usize,
+    /// The origin of the clock the core reasons about: every instant handed to
+    /// the session core is measured from here, and every deadline it answers
+    /// with is turned back into a runtime instant against it.
+    base: tokio::time::Instant,
+    state: Mutex<State>,
     /// Bumped under the state lock on every phase change, so a stalled caller
     /// subscribing under that same lock can never miss one.
     changes: watch::Sender<u64>,
@@ -269,87 +285,40 @@ pub struct Client {
     notifications: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Vec<u8>>>>,
 }
 
-/// The mount's phase, and the bookkeeping around it.
+/// What the adapter keeps beside the session core's state machine.
+///
+/// The machine owns the phase, the deadline, the generations and the probe
+/// tokens; these are the things a core with no I/O may not hold — the
+/// connection object of the generation it says is installed, the handle of the
+/// task its probe token names, and the prose reason a phase carries. They
+/// change under this one lock, together with the machine, so no observer can
+/// see one without the other.
 #[derive(Debug)]
-struct Machine {
-    phase: Phase,
-    /// The generation the next connection will carry. Monotonic.
-    next_generation: u64,
-    /// The single reconnect task, if one is running.
-    probe: Option<Probe>,
-    /// The token the next reconnect task will carry. Monotonic.
-    next_probe: u64,
-    /// Whether recovery may run at all.
-    recovery: Recovery,
+struct State {
+    machine: Machine,
+    /// The installed connection, while the machine says one is.
+    connection: Option<Arc<Connection>>,
+    /// The reconnect task the machine's probe token names.
+    probe: Option<tokio::task::AbortHandle>,
+    /// Why the mount is not serving, in the words an operator reads.
+    reason: Option<Death>,
+    /// The schedule the probe waits out between attempts, seeded per mount.
+    backoff: Backoff,
     /// The tick the change channel last published.
     tick: u64,
 }
 
-/// Whether a mount is allowed to recover, and for how long it is not.
-///
-/// The barrier the teardown paths need, and the reason cancelling the probe is
-/// not enough on its own: aborting a task is not synchronous, and a connection
-/// dying *during* a teardown would otherwise start a fresh one behind it.
-/// Anything but [`Recovery::Running`] means nothing dials and nothing is
-/// installed, whatever the phase says.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Recovery {
-    /// The ordinary state: a death opens the stall window and starts a probe.
-    Running,
-    /// An unmount is under way and the kernel may yet refuse it. Nothing dials,
-    /// but a death still opens the window an `EBUSY` mount is owed when
-    /// [`Client::resume_recovery`] hands the probe back.
-    Paused,
-    /// A teardown that never comes back. Nothing dials, and a death arriving
-    /// now ends the mount instead of opening a window nobody will wait out.
-    Ended,
-}
-
-/// The single reconnect task, and the token that says which one it is.
-#[derive(Debug)]
-struct Probe {
-    /// Identifies this task among every one the mount has ever spawned.
-    token: u64,
-    /// Cancels it.
-    handle: tokio::task::AbortHandle,
-}
-
-impl Machine {
-    /// Whether `probe` is the reconnect task the mount owns right now.
+impl State {
+    /// Cancels the reconnect task, if the machine just retired its token.
     ///
-    /// Cancelling a task is not cancelling it *now*: an abort takes effect at
-    /// the next await, so a task already past its last one runs to its end
-    /// regardless. An `EBUSY` unmount leaves exactly such a task behind —
-    /// [`Client::pause_recovery`] aborts it and [`Client::resume_recovery`]
-    /// starts its replacement — and the survivor must not install a connection,
-    /// end a window, or clear the handle belonging to the task that replaced
-    /// it. Every transition a probe makes is therefore gated on this.
-    fn owns(&self, probe: u64) -> bool {
-        self.probe
-            .as_ref()
-            .is_some_and(|current| current.token == probe)
+    /// Cancelling is not synchronous — an attempt already past its last
+    /// suspension runs to its end — which is exactly why the machine retires
+    /// the token as well: the survivor can no longer transition the mount.
+    fn cancel_probe(&mut self) {
+        if let Some(probe) = self.probe.take() {
+            probe.abort();
+        }
     }
-}
-
-/// Where a mount is in its life.
-#[derive(Debug)]
-enum Phase {
-    /// Serving over this connection.
-    Connected(Arc<Connection>),
-    /// Stalling until `deadline`, because `reason` ended the last connection.
-    Reconnecting {
-        /// The one deadline every stalled request shares.
-        deadline: Instant,
-        /// What ended the connection.
-        reason: Death,
-    },
-    /// Answering `EIO` at once, with the probe still running.
-    Degraded {
-        /// What ended the connection, or why the probe cannot re-establish it.
-        reason: Death,
-    },
-    /// Torn down.
-    Closed,
 }
 
 /// Why a connection is no longer usable.
@@ -378,32 +347,6 @@ impl fmt::Display for Death {
     }
 }
 
-/// What the replay discipline does with a request whose connection died.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Replay {
-    /// Idempotent: applying it twice is applying it once, so it is re-sent
-    /// whether or not it reached the server.
-    Idempotent,
-    /// A mutation that must not be applied twice. A *written* attempt may
-    /// already have taken effect, so it fails `EIO`; a *queued* one provably
-    /// did not, so it is re-sent.
-    Once,
-    /// Its referent — a handle, a node — died with the session, so a lost
-    /// attempt is moot and answers as though it had succeeded.
-    Moot,
-}
-
-impl Replay {
-    /// What to do with an attempt that got as far as `sent`.
-    fn decide(self, sent: Sent) -> Decision {
-        match (self, sent) {
-            (Self::Moot, _) => Decision::Moot,
-            (_, Sent::Queued) | (Self::Idempotent, Sent::Written) => Decision::Resend,
-            (Self::Once, Sent::Written) => Decision::Fail,
-        }
-    }
-}
-
 /// A connection to serve one request over, and how the request reached it.
 #[derive(Debug)]
 struct Serving {
@@ -414,17 +357,6 @@ struct Serving {
     /// gone, which is what makes it *retained* across the gap even though it
     /// was never written.
     stalled: bool,
-}
-
-/// What becomes of one lost attempt.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum Decision {
-    /// Send it again on the replacement connection.
-    Resend,
-    /// Answer `EIO`: it may already have been applied.
-    Fail,
-    /// Answer as though it had succeeded.
-    Moot,
 }
 
 impl Client {
@@ -440,10 +372,18 @@ impl Client {
         namespace: &str,
         subpath: &[u8],
     ) -> Result<Arc<Self>, ConnectError> {
-        Self::mount_with(endpoint, namespace, subpath, Resilience::default()).await
+        Self::mount_with(
+            endpoint,
+            namespace,
+            subpath,
+            Resilience::default(),
+            Concurrency::default(),
+        )
+        .await
     }
 
-    /// The same, with the resilience the mount was configured for.
+    /// The same, with the resilience and the concurrency bound the mount was
+    /// configured for.
     ///
     /// The *first* handshake is not resilient: a mount that cannot be
     /// established is a mount error the operator must see, not a mount that
@@ -458,25 +398,30 @@ impl Client {
         namespace: &str,
         subpath: &[u8],
         resilience: Resilience,
+        concurrency: Concurrency,
     ) -> Result<Arc<Self>, ConnectError> {
         let target = Target {
             endpoint: endpoint.clone(),
             namespace: namespace.to_owned(),
             subpath: subpath.to_vec(),
         };
-        let Established { connection, reader } = Connection::dial(&target, 1).await?;
+        let capacity = concurrency.capacity();
+        let Established { connection, reader } =
+            Connection::dial(&target, Machine::first_generation(), capacity).await?;
         let max_frame_len = connection.max_frame_len();
         let connection = Arc::new(connection);
         let (changes, _) = watch::channel(0);
         let client = Arc::new(Self {
             target,
             resilience,
-            state: Mutex::new(Machine {
-                phase: Phase::Connected(Arc::clone(&connection)),
-                next_generation: 2,
+            capacity,
+            base: tokio::time::Instant::now(),
+            state: Mutex::new(State {
+                machine: Machine::connected(),
+                connection: Some(Arc::clone(&connection)),
                 probe: None,
-                next_probe: 1,
-                recovery: Recovery::Running,
+                reason: None,
+                backoff: Backoff::seeded(seed()),
                 tick: 0,
             }),
             changes,
@@ -512,12 +457,7 @@ impl Client {
     /// What the mount is doing right now.
     #[must_use]
     pub fn state(&self) -> MountState {
-        match &self.lock().phase {
-            Phase::Connected(_) => MountState::Connected,
-            Phase::Reconnecting { .. } => MountState::Reconnecting,
-            Phase::Degraded { .. } => MountState::Degraded,
-            Phase::Closed => MountState::Closed,
-        }
+        MountState::of(self.lock().machine.phase())
     }
 
     /// The generation of the connection installed right now, if one is.
@@ -530,10 +470,7 @@ impl Client {
     /// visible — which is what the share subscription keys its resubscribe on,
     /// not on the phase.
     pub(crate) fn connected_generation(&self) -> Option<u64> {
-        match &self.lock().phase {
-            Phase::Connected(connection) => Some(connection.generation()),
-            Phase::Reconnecting { .. } | Phase::Degraded { .. } | Phase::Closed => None,
-        }
+        self.lock().machine.connected_generation()
     }
 
     /// Why the mount is not serving, if it is not.
@@ -543,9 +480,10 @@ impl Client {
     /// and not failing.
     #[must_use]
     pub fn death(&self) -> Option<Death> {
-        match &self.lock().phase {
-            Phase::Connected(_) => None,
-            Phase::Reconnecting { reason, .. } | Phase::Degraded { reason } => Some(reason.clone()),
+        let state = self.lock();
+        match state.machine.phase() {
+            Phase::Connected => None,
+            Phase::Reconnecting | Phase::Degraded => state.reason.clone(),
             Phase::Closed => Some(Death::Closed),
         }
     }
@@ -588,14 +526,11 @@ impl Client {
     /// when the peer has stopped reading.
     pub fn close(&self) {
         let mut state = self.lock();
-        state.recovery = Recovery::Ended;
-        if let Some(probe) = state.probe.take() {
-            probe.handle.abort();
-        }
-        if let Phase::Connected(connection) = &state.phase {
+        state.machine.close();
+        state.cancel_probe();
+        if let Some(connection) = state.connection.take() {
             connection.bury(Death::Closed);
         }
-        state.phase = Phase::Closed;
         self.announce(&mut state);
     }
 
@@ -613,18 +548,12 @@ impl Client {
     /// have an attempt in flight: a server breaking away in the moment after
     /// this call must neither start a probe behind the teardown nor open a
     /// stall window for callbacks the teardown is about to fail anyway
-    /// ([`Recovery::Ended`], honoured in [`Self::lost`]).
+    /// (the core's ended recovery, honoured wherever a death is reported).
     pub fn stop_reconnecting(&self) {
         let mut state = self.lock();
-        state.recovery = Recovery::Ended;
-        if let Some(probe) = state.probe.take() {
-            probe.handle.abort();
-        }
-        if matches!(
-            state.phase,
-            Phase::Reconnecting { .. } | Phase::Degraded { .. }
-        ) {
-            state.phase = Phase::Closed;
+        let stopped = state.machine.stop_reconnecting();
+        state.cancel_probe();
+        if stopped.closed {
             self.announce(&mut state);
         }
     }
@@ -640,19 +569,13 @@ impl Client {
     /// left exactly as it was, because the kernel may yet refuse the unmount —
     /// see [`Self::resume_recovery`], which puts back what this took away.
     ///
-    /// Dropping the cancelled task's handle also retires its token, so the
-    /// attempt this abort cannot reach in time ([`Machine::owns`]) can no
-    /// longer transition the mount or displace its replacement.
+    /// The machine retires the cancelled task's token as it hands it back, so
+    /// the attempt this abort cannot reach in time can no longer transition the
+    /// mount or displace its replacement.
     pub fn pause_recovery(&self) {
         let mut state = self.lock();
-        // A recovery that has already ended is never handed back, so it is
-        // never taken away either: pausing lowers the bar it raised.
-        if state.recovery == Recovery::Running {
-            state.recovery = Recovery::Paused;
-        }
-        if let Some(probe) = state.probe.take() {
-            probe.handle.abort();
-        }
+        state.machine.pause_recovery();
+        state.cancel_probe();
     }
 
     /// Starts the recovery again after a teardown the kernel refused.
@@ -664,15 +587,8 @@ impl Client {
     /// a recovery that *ended* is never resumed: only a pause is lifted here.
     pub fn resume_recovery(&self) {
         let mut state = self.lock();
-        if state.recovery != Recovery::Paused {
-            return;
-        }
-        state.recovery = Recovery::Running;
-        if matches!(
-            state.phase,
-            Phase::Reconnecting { .. } | Phase::Degraded { .. }
-        ) {
-            self.start_probe(&mut state);
+        if let Some(token) = state.machine.resume_recovery() {
+            self.spawn_probe(&mut state, token);
         }
     }
 
@@ -688,39 +604,40 @@ impl Client {
         loop {
             let (deadline, mut changes) = {
                 let state = self.lock();
-                match &state.phase {
-                    Phase::Connected(connection) => {
+                match state.machine.serve() {
+                    // The machine says a connection is installed, so the
+                    // adapter holds one: they change under this one lock.
+                    Serve::Now { .. } => {
+                        let connection = state.connection.clone().ok_or(Errno::IO)?;
                         return Ok(Serving {
-                            connection: Arc::clone(connection),
+                            connection,
                             stalled,
                         });
                     }
-                    Phase::Degraded { .. } | Phase::Closed => return Err(Errno::IO),
+                    Serve::Fail => return Err(Errno::IO),
                     // Subscribing under the same lock the phase changes under
                     // is what makes this wait race-free.
-                    Phase::Reconnecting { deadline, .. } => (*deadline, self.changes.subscribe()),
+                    Serve::Stall { deadline } => (deadline, self.changes.subscribe()),
                 }
             };
             stalled = true;
             // Bounded by the mount's one deadline, never by a timer of this
             // request's own: a request arriving late in the window inherits
             // what is left of it and no more.
-            let _ = tokio::time::timeout_at(deadline, changes.changed()).await;
-            // The clock, not the wakeup, decides what this wait meant — and it
-            // is read after the wait, never before, so nothing is failed early.
-            //
-            // The deadline wins every tie, which is what makes it *the*
-            // deadline. `timeout_at` polls what it wraps before its own timer,
-            // so a phase change landing in the same instant the window closes
-            // would otherwise send this caller round the loop to be served
-            // after its window — under scheduler delay, arbitrarily long after
-            // it. A stall that reached the deadline is owed `EIO`, whatever
-            // else happened in that instant; short of the deadline the caller
-            // looks at the phase again and, if it is still Reconnecting, waits
-            // out the rest of the same window.
-            if Instant::now() >= deadline {
-                self.expire();
-                return Err(Errno::IO);
+            let _ = tokio::time::timeout_at(self.wall(deadline), changes.changed()).await;
+            // What the wait meant is the core's decision, taken on the instant
+            // this adapter reads *after* the wait and never before: the
+            // deadline wins every tie, and a caller whose window closed is owed
+            // `EIO` whatever else happened in that instant.
+            let mut state = self.lock();
+            match state.machine.woke(deadline, self.now()) {
+                Woke::Expired { degraded } => {
+                    if degraded {
+                        self.publish_degraded(&mut state);
+                    }
+                    return Err(Errno::IO);
+                }
+                Woke::Retry => {}
             }
         }
     }
@@ -730,19 +647,18 @@ impl Client {
     /// Never stalls: it is what a request with nothing to wait for — a
     /// no-response `forget` — asks with.
     fn current(&self) -> Option<Arc<Connection>> {
-        match &self.lock().phase {
-            Phase::Connected(connection) => Some(Arc::clone(connection)),
-            _ => None,
-        }
+        self.lock().connection.clone()
     }
 
     /// Sends one request and returns its reply, replaying per the discipline.
     ///
-    /// `Ok(None)` is the moot answer, and only [`Replay::Moot`] can produce it.
+    /// `Ok(None)` is the moot answer, which only an operation the core
+    /// classifies as moot can produce.
     ///
-    /// `class` says how the frame queues for the connection's serialization
-    /// point, and nothing else: it survives a replay unchanged, because a
-    /// re-sent chunk is still a chunk.
+    /// `open` is the open flags of the one operation whose replay class depends
+    /// on its arguments, and nothing else reads it. `class` says how the frame
+    /// queues for the connection's serialization point, and nothing else: it
+    /// survives a replay unchanged, because a re-sent chunk is still a chunk.
     #[allow(
         clippy::too_many_arguments,
         reason = "one wire request, described by the fields the frame carries"
@@ -754,7 +670,7 @@ impl Client {
         body: &Q,
         payload: &[u8],
         opcode: Opcode,
-        replay: Replay,
+        open: OpenFlags,
         class: Class,
     ) -> Result<Option<(Arc<Connection>, Vec<u8>)>, Errno> {
         // A request is *retained* across the gap once it has waited on one: it
@@ -769,9 +685,11 @@ impl Client {
                 stalled,
             } = self.connected().await?;
             retained |= stalled;
-            let request_id = connection.take_request_id();
+            // The table is the mount's concurrency bound, and a full one is a
+            // wait: this is where a caller parks if every slot is taken.
+            let ticket = connection.claim(opcode, open).await;
             let frame = match encode(
-                request_id,
+                ticket.request_id(),
                 caller,
                 node_id,
                 body,
@@ -782,13 +700,16 @@ impl Client {
                 // A retained request that no longer fits the newly negotiated
                 // bound is the contract's noted edge: it fails, and it fails as
                 // the gap it could not be carried across.
-                Err(error) => return Err(unencodable(error, retained)),
+                Err(error) => {
+                    connection.release(ticket);
+                    return Err(unencodable(error, retained));
+                }
             };
-            match connection.call(request_id, opcode, &frame, class).await {
+            match connection.call(ticket, &frame, class).await {
                 Ok(bytes) => return Ok(Some((connection, bytes))),
-                Err(sent) => {
+                Err(decision) => {
                     self.lost(&connection);
-                    match replay.decide(sent) {
+                    match decision {
                         Decision::Resend => retained = true,
                         Decision::Fail => return Err(Errno::IO),
                         Decision::Moot => return Ok(None),
@@ -815,7 +736,6 @@ impl Client {
         node_id: u64,
         body: &Q,
         payload: &[u8],
-        replay: Replay,
         extract: impl FnOnce(&R, &[u8]) -> Result<T, FramingError>,
     ) -> Result<T, Errno>
     where
@@ -827,7 +747,7 @@ impl Client {
             node_id,
             body,
             payload,
-            replay,
+            OpenFlags::NONE,
             Class::Prompt,
             extract,
         )
@@ -861,7 +781,7 @@ impl Client {
         node_id: u64,
         body: &Q,
         payload: &[u8],
-        replay: Replay,
+        open: OpenFlags,
         class: Class,
         extract: impl FnOnce(&R, &[u8]) -> Result<T, FramingError>,
     ) -> Result<(T, u64), Errno>
@@ -870,9 +790,9 @@ impl Client {
         R: ResponseBody,
     {
         let answered = self
-            .exchange(caller, node_id, body, payload, R::OPCODE, replay, class)
+            .exchange(caller, node_id, body, payload, R::OPCODE, open, class)
             .await?;
-        // Only `Replay::Moot` answers without a reply, and it takes
+        // Only a moot operation answers without a reply, and those take
         // `call_moot`; a caller here that somehow reaches this arm has lost its
         // connection and gets what every lost request gets.
         let (connection, bytes) = answered.ok_or(Errno::IO)?;
@@ -917,7 +837,7 @@ impl Client {
                 body,
                 payload,
                 R::OPCODE,
-                Replay::Moot,
+                OpenFlags::NONE,
                 Class::Prompt,
             )
             .await?
@@ -956,76 +876,59 @@ impl Client {
     /// mount has already moved on from that generation.
     ///
     /// This is where death observations coalesce: the reader task, a failed
-    /// write and a caller that found a protocol fault all arrive here, and only
-    /// the one naming the generation the mount currently holds does anything.
+    /// write and a caller that found a protocol fault all arrive here, and the
+    /// core discards every one that names a generation the mount has already
+    /// replaced.
     fn lost(&self, connection: &Arc<Connection>) {
         let reason = connection
             .death()
             .unwrap_or_else(|| Death::Transport("the connection ended".to_owned()));
         let mut state = self.lock();
-        match &state.phase {
-            Phase::Connected(installed) if installed.generation() == connection.generation() => {}
-            // An older generation, or a recovery already under way: whatever
-            // this frame or error was, it cannot touch the replacement.
-            _ => return,
+        let lost = state
+            .machine
+            .lost(connection.generation(), self.now(), self.resilience.stall);
+        if lost == Lost::Ignored {
+            return;
         }
         connection.bury(reason.clone());
-        let stall = self.resilience.stall;
-        state.phase = if state.recovery == Recovery::Ended {
-            // A teardown that never comes back is already under way: there is
-            // nothing left to stall for and nothing will dial again, so the
-            // mount ends here instead of opening a window behind the teardown.
-            Phase::Closed
-        } else if stall.is_zero() {
-            // Fail-fast: the window closes the instant the server breaks away.
-            Phase::Degraded { reason }
-        } else {
-            Phase::Reconnecting {
-                deadline: Instant::now() + stall,
-                reason,
-            }
-        };
+        state.connection = None;
+        state.reason = Some(reason);
         self.announce(&mut state);
-        self.start_probe(&mut state);
+        if lost.wants_probe() {
+            self.start_probe(&mut state);
+        }
     }
 
     /// Ends the stall if its deadline has passed.
     ///
-    /// Called by whoever notices first — a stalled caller whose wait ran out,
-    /// or the probe between attempts — so the window's edge is the deadline
-    /// itself, not whenever a task happened to be scheduled. It needs no
-    /// probe identity for that reason: it reads the clock against the window
-    /// the mount is in right now, so a late caller cannot end a window that is
-    /// not the one it waited on.
+    /// Called by the probe between attempts; a stalled caller reaches the same
+    /// decision through its own wait ([`Self::connected`]).
     fn expire(&self) {
         let mut state = self.lock();
-        let Phase::Reconnecting { deadline, reason } = &state.phase else {
-            return;
-        };
-        if Instant::now() < *deadline {
-            return;
+        if state.machine.expire(self.now()) {
+            self.publish_degraded(&mut state);
         }
-        let reason = reason.clone();
-        tracing::warn!(%reason, "the server did not come back within the stall window");
-        state.phase = Phase::Degraded { reason };
-        self.announce(&mut state);
+    }
+
+    /// Reports a window that has just closed, and publishes the phase change.
+    fn publish_degraded(&self, state: &mut MutexGuard<'_, State>) {
+        if let Some(reason) = state.reason.clone() {
+            tracing::warn!(%reason, "the server did not come back within the stall window");
+        }
+        self.announce(state);
     }
 
     /// Ends the stall now, whatever the deadline says.
     ///
     /// A server that answers the handshake with a refusal is reachable and
     /// says no: waiting out the window would only delay the `EIO` the guest is
-    /// owed. The probe keeps running, because the configuration may return.
-    ///
-    /// Only the mount's current probe may cut a window short this way. A
-    /// refusal a cancelled attempt observed says nothing about the window a
-    /// later death opened, and the contract discards an old attempt's outcomes
-    /// exactly as it discards an old connection's frames.
+    /// owed. The probe keeps running, because the configuration may return, and
+    /// the core admits only the attempt the mount currently owns.
     fn degrade(&self, reason: Death, probe: u64) {
         let mut state = self.lock();
-        if state.owns(probe) && matches!(state.phase, Phase::Reconnecting { .. }) {
+        if state.machine.degrade(probe) {
             tracing::warn!(%reason, "the server refuses to serve this mount");
-            state.phase = Phase::Degraded { reason };
+            state.reason = Some(reason);
             self.announce(&mut state);
         }
     }
@@ -1033,32 +936,24 @@ impl Client {
     /// Installs a freshly handshaken connection and returns the mount to
     /// Connected, atomically.
     ///
-    /// Only a mount that is *waiting* for a connection, and only the probe it
-    /// currently owns, may install one. Cancelling an attempt is not
-    /// synchronous — an aborted probe can already be past its last await — so a
-    /// handshake can arrive here after the mount was torn down, after a
-    /// teardown paused the recovery, or after a replacement attempt took this
-    /// one's place. Each of those buries the new connection instead of
-    /// installing it, which is what keeps a mount from ever holding two live
-    /// sessions and splitting its callbacks across them, and what stops a
-    /// superseded attempt from clearing the handle its replacement is cancelled
-    /// through.
+    /// The core says whether this attempt may install at all — a torn-down
+    /// mount, a paused recovery and a superseded attempt each answer no — and a
+    /// connection it refuses is buried instead, which is what keeps a mount
+    /// from ever holding two live sessions and splitting its callbacks across
+    /// them.
     fn install(&self, established: Established, probe: u64) {
         let Established { connection, reader } = established;
         let connection = Arc::new(connection);
         {
             let mut state = self.lock();
-            let wanted = matches!(
-                state.phase,
-                Phase::Reconnecting { .. } | Phase::Degraded { .. }
-            );
-            if state.recovery != Recovery::Running || !wanted || !state.owns(probe) {
+            if !state.machine.install(probe, connection.generation()) {
                 connection.bury(Death::Closed);
                 return;
             }
             self.max_frame_len
                 .store(connection.max_frame_len(), Ordering::Relaxed);
-            state.phase = Phase::Connected(Arc::clone(&connection));
+            state.connection = Some(Arc::clone(&connection));
+            state.reason = None;
             state.probe = None;
             self.announce(&mut state);
         }
@@ -1093,66 +988,77 @@ impl Client {
 
     /// The generation the next connection carries.
     fn take_generation(&self) -> u64 {
-        let mut state = self.lock();
-        let generation = state.next_generation;
-        state.next_generation += 1;
-        generation
+        self.lock().machine.take_generation()
     }
 
     /// How long `probe`'s next attempt may take, or `None` when there is
     /// nothing left for it to do: the mount is serving again, it has ended, a
     /// teardown took the recovery away, or this attempt has been superseded.
     fn attempt_bound(&self, probe: u64) -> Option<Duration> {
-        let state = self.lock();
-        if !state.owns(probe) {
-            return None;
-        }
-        match &state.phase {
-            // The window's remainder bounds a stalling attempt, so a peer that
-            // accepts the socket and never finishes the handshake cannot hold
-            // the mount past the deadline.
-            Phase::Reconnecting { deadline, .. } => {
-                Some(deadline.saturating_duration_since(Instant::now()))
-            }
-            Phase::Degraded { .. } => Some(DEGRADED_ATTEMPT_BOUND),
-            Phase::Connected(_) | Phase::Closed => None,
-        }
+        self.lock().machine.attempt_bound(probe, self.now())
     }
 
-    /// Whether the stall window has already closed.
-    fn is_degraded(&self) -> bool {
-        matches!(self.lock().phase, Phase::Degraded { .. })
+    /// The next delay between reconnect attempts, off the mount's own seeded
+    /// schedule and the schedule the phase calls for.
+    fn backoff(&self) -> Duration {
+        let mut state = self.lock();
+        let schedule = state.machine.schedule();
+        state.backoff.next(schedule)
     }
 
-    /// Starts the single reconnect task, if one is not already running and the
-    /// mount is still in a position to want one.
+    /// Starts the schedule over, which the probe does when it crosses out of
+    /// the stall window: the delay reached inside it says nothing about the one
+    /// a degraded mount waits.
+    fn restart_backoff(&self) {
+        self.lock().backoff.restart();
+    }
+
+    /// Starts the single reconnect task, if the core says the mount wants one.
     ///
-    /// A teardown holds the bar ([`Machine::recovery`]) and an ended mount is
-    /// past recovering, so neither starts a task here — which is what stops a
-    /// connection dying mid-unmount from putting a dialler behind the teardown.
-    fn start_probe(&self, state: &mut MutexGuard<'_, Machine>) {
-        if state.recovery != Recovery::Running
-            || state.probe.is_some()
-            || matches!(state.phase, Phase::Closed)
-        {
-            return;
+    /// A teardown holds the bar and an ended mount is past recovering, so
+    /// neither gets a task here — which is what stops a connection dying
+    /// mid-unmount from putting a dialler behind the teardown.
+    fn start_probe(&self, state: &mut MutexGuard<'_, State>) {
+        if let Some(token) = state.machine.start_probe() {
+            self.spawn_probe(state, token);
         }
-        let Some(me) = self.weak() else { return };
-        let token = state.next_probe;
-        state.next_probe += 1;
-        state.probe = Some(Probe {
-            token,
-            handle: self.runtime.spawn(reconnect(me, token)).abort_handle(),
-        });
+    }
+
+    /// Spawns the attempt the core has just handed out a token for.
+    fn spawn_probe(&self, state: &mut MutexGuard<'_, State>, token: u64) {
+        let Some(me) = self.weak() else {
+            // A client whose own weak reference is not set yet cannot spawn a
+            // task that outlives the call, so the token is given straight back
+            // and the bar goes up: nothing dials. Unreachable in a mount that
+            // exists — the reference is set the moment the client is built,
+            // before anything can lose a connection.
+            state.machine.pause_recovery();
+            return;
+        };
+        // A fresh attempt is a fresh outage as far as the schedule is
+        // concerned; the jitter source keeps advancing across all of them.
+        state.backoff.restart();
+        state.probe = Some(self.runtime.spawn(reconnect(me, token)).abort_handle());
     }
 
     /// Publishes a phase change to everyone stalled on one.
     ///
     /// Done under the state lock, which is what lets a caller subscribe under
     /// that same lock and be sure it cannot miss the next one.
-    fn announce(&self, state: &mut MutexGuard<'_, Machine>) {
+    fn announce(&self, state: &mut MutexGuard<'_, State>) {
         state.tick += 1;
         let _ = self.changes.send(state.tick);
+    }
+
+    /// The instant the session core reasons about, from this mount's clock.
+    fn now(&self) -> Instant {
+        Instant::from_nanos(u64::try_from(self.base.elapsed().as_nanos()).unwrap_or(u64::MAX))
+    }
+
+    /// The runtime instant a core deadline names, so a wait can be bounded by
+    /// it.
+    fn wall(&self, instant: Instant) -> tokio::time::Instant {
+        self.base + Duration::from_nanos(instant.as_nanos())
     }
 
     /// A weak reference to this client, for a task that outlives the call that
@@ -1198,7 +1104,7 @@ impl Client {
             }
             *routed = Some(sink.clone());
         }
-        if let Phase::Connected(connection) = &self.lock().phase {
+        if let Some(connection) = self.current() {
             connection.route_notifications(sink);
         }
         true
@@ -1217,7 +1123,7 @@ impl Client {
             .unwrap_or_else(|poison| poison.into_inner()) = None;
     }
 
-    fn lock(&self) -> MutexGuard<'_, Machine> {
+    fn lock(&self) -> MutexGuard<'_, State> {
         self.state
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
@@ -1244,7 +1150,6 @@ impl Drop for Client {
 /// makes is gated on it still being the current one, because an abort only
 /// takes effect at the next await and this task may already be past its last.
 async fn reconnect(client: Weak<Client>, token: u64) {
-    let mut previous: Option<Duration> = None;
     loop {
         let Some(client) = client.upgrade() else {
             return;
@@ -1258,12 +1163,13 @@ async fn reconnect(client: Weak<Client>, token: u64) {
             // The window has closed; the next pass runs under the degraded
             // schedule instead of dialling with no time at all.
             client.expire();
-            previous = None;
+            client.restart_backoff();
             continue;
         }
 
         let generation = client.take_generation();
-        match tokio::time::timeout(bound, Connection::dial(&client.target, generation)).await {
+        let dial = Connection::dial(&client.target, generation, client.capacity);
+        match tokio::time::timeout(bound, dial).await {
             Ok(Ok(established)) => {
                 // The deadline is the authority even when the handshake and the
                 // timer come ready in the same instant: `timeout` polls the dial
@@ -1289,8 +1195,7 @@ async fn reconnect(client: Weak<Client>, token: u64) {
         }
         client.expire();
 
-        let wait = backoff(previous, client.is_degraded());
-        previous = Some(wait);
+        let wait = client.backoff();
         // Let go of the mount while sleeping, so a client nobody else holds is
         // dropped at once, not at the end of a five-second backoff.
         drop(client);
@@ -1298,39 +1203,18 @@ async fn reconnect(client: Weak<Client>, token: u64) {
     }
 }
 
-/// The next backoff delay, capped and jittered.
+/// The seed the mount's backoff jitter is expanded from.
 ///
-/// Two schedules, because the two phases mean different things: inside the
-/// stall window a guest is *waiting*, so retries are quick; once degraded
-/// nothing waits on the probe, so it slows to the design's 500 ms-to-5 s.
-fn backoff(previous: Option<Duration>, degraded: bool) -> Duration {
-    let (initial, max) = if degraded {
-        (DEGRADED_INITIAL_BACKOFF, DEGRADED_MAX_BACKOFF)
-    } else {
-        (STALL_INITIAL_BACKOFF, STALL_MAX_BACKOFF)
-    };
-    let delay = match previous {
-        None => initial,
-        Some(previous) => (previous * 2).clamp(initial, max),
-    };
-    delay - jitter(delay)
-}
+/// Taken from the operating system once per mount, as the extraction contract
+/// requires, and threaded into the core as data. Nothing about it needs to be
+/// unpredictable — only uncorrelated between two mounts that lost the same
+/// server, so they do not retry in lockstep — and the hash builder the standard
+/// library seeds from the system is exactly that much randomness with no
+/// dependency behind it.
+fn seed() -> u64 {
+    use std::hash::{BuildHasher as _, Hasher as _, RandomState};
 
-/// How much to shorten a delay by: up to a quarter of it, from the clock's
-/// nanoseconds.
-///
-/// Nothing here needs to be unpredictable — only uncorrelated between mounts
-/// that lost the same server, which the sub-microsecond digits of the wall
-/// clock already are. It buys a dependency-free spread instead of a random
-/// number generator the crate would otherwise not have.
-fn jitter(delay: Duration) -> Duration {
-    let spread = delay / JITTER_DIVISOR;
-    let nanos = std::time::SystemTime::UNIX_EPOCH
-        .elapsed()
-        .map_or(0, |elapsed| elapsed.subsec_nanos());
-    spread
-        .checked_mul(nanos % 1000)
-        .map_or(Duration::ZERO, |scaled| scaled / 1000)
+    RandomState::new().build_hasher().finish()
 }
 
 /// Whether a failed handshake is the server refusing this mount *for
@@ -1494,49 +1378,70 @@ pub enum ConnectError {
     },
 }
 
+impl From<HandshakeError> for ConnectError {
+    /// The mount error each of the core's handshake classes surfaces as.
+    ///
+    /// Three classes have a mount error of their own, because an operator
+    /// acting on them acts differently: a refusal names the server's own
+    /// answer, and the two announcements name what was announced. The rest —
+    /// a version this client does not speak, reserved bits set, a reply to
+    /// another request, a frame that is not a handshake at all — are one thing
+    /// to an operator: the peer is not speaking this protocol.
+    fn from(error: HandshakeError) -> Self {
+        match error {
+            HandshakeError::Refused { status } => Self::Refused { status },
+            HandshakeError::FrameBound { announced, minimum } => {
+                Self::FrameBound { announced, minimum }
+            }
+            HandshakeError::RootNodeId {
+                announced,
+                expected,
+            } => Self::RootNodeId {
+                announced,
+                expected,
+            },
+            other => Self::Protocol {
+                reason: other.to_string(),
+            },
+        }
+    }
+}
+
+impl From<TooLong> for ConnectError {
+    fn from(error: TooLong) -> Self {
+        Self::TooLong { max: error.max }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    /// The mount's table is sized by its own engines and nothing else, and
+    /// every prompt request has room the bulk windows cannot take.
     #[test]
-    fn the_replay_discipline_is_the_contracts() {
-        // A queued request provably never reached the server, whatever it is.
+    fn the_table_capacity_is_the_engines_plus_the_prompt_allowance() {
+        let engines = Concurrency::default();
         assert_eq!(
-            Replay::Idempotent.decide(Sent::Queued),
-            Decision::Resend,
-            "a queued idempotent request is sent as it is"
+            engines.capacity(),
+            DEFAULT_CHUNKS_PER_MOUNT.get()
+                + readahead::MAX_INFLIGHT_PER_MOUNT
+                + Concurrency::METADATA_ALLOWANCE
         );
+        assert!(
+            engines.capacity() - engines.write_chunks_per_mount - engines.readahead_per_mount
+                >= Concurrency::METADATA_ALLOWANCE,
+            "bulk traffic cannot reach the prompt allowance"
+        );
+        // A mount that widens its write window widens the table with it.
+        let wide = Concurrency {
+            write_chunks_per_mount: 512,
+            ..engines
+        };
         assert_eq!(
-            Replay::Once.decide(Sent::Queued),
-            Decision::Resend,
-            "a queued mutation cannot have been applied, so it is sent as it is"
+            wide.capacity(),
+            engines.capacity() + 512 - engines.write_chunks_per_mount
         );
-        // A written one may have been dispatched.
-        assert_eq!(Replay::Idempotent.decide(Sent::Written), Decision::Resend);
-        assert_eq!(
-            Replay::Once.decide(Sent::Written),
-            Decision::Fail,
-            "a written mutation must not risk a second application"
-        );
-        // A moot request's referent died with the session either way.
-        assert_eq!(Replay::Moot.decide(Sent::Written), Decision::Moot);
-        assert_eq!(Replay::Moot.decide(Sent::Queued), Decision::Moot);
-    }
-
-    #[test]
-    fn the_backoff_doubles_to_its_cap_under_both_schedules() {
-        // Jitter only ever shortens, so each delay stays inside its schedule.
-        let stalling = backoff(None, false);
-        assert!(stalling <= STALL_INITIAL_BACKOFF && stalling * 2 >= STALL_INITIAL_BACKOFF);
-        assert!(backoff(Some(STALL_INITIAL_BACKOFF), false) <= STALL_MAX_BACKOFF);
-        assert!(backoff(Some(STALL_MAX_BACKOFF), false) <= STALL_MAX_BACKOFF);
-
-        let degraded = backoff(None, true);
-        assert!(degraded <= DEGRADED_INITIAL_BACKOFF && degraded * 2 >= DEGRADED_INITIAL_BACKOFF);
-        assert!(backoff(Some(DEGRADED_MAX_BACKOFF), true) <= DEGRADED_MAX_BACKOFF);
-        // Crossing into the degraded schedule never shortens the delay below
-        // its own floor, however small the stalling one had been.
-        assert!(backoff(Some(STALL_INITIAL_BACKOFF), true) * 2 >= DEGRADED_INITIAL_BACKOFF);
     }
 
     #[test]
@@ -1589,36 +1494,6 @@ mod tests {
             ),
             "an unknown namespace only comes back through the configuration"
         );
-    }
-
-    #[tokio::test]
-    async fn only_the_current_probe_owns_the_recovery() {
-        let idle = tokio::spawn(std::future::pending::<()>());
-        let mut machine = Machine {
-            phase: Phase::Closed,
-            next_generation: 2,
-            probe: None,
-            next_probe: 1,
-            recovery: Recovery::Running,
-            tick: 0,
-        };
-        assert!(
-            !machine.owns(1),
-            "a mount with no probe running owns no attempt"
-        );
-        machine.probe = Some(Probe {
-            token: 7,
-            handle: idle.abort_handle(),
-        });
-        assert!(machine.owns(7));
-        // What an `EBUSY` unmount leaves behind: attempt 6 was aborted and its
-        // handle dropped, but an abort is not synchronous, so the task may
-        // still be running. Only the replacement may transition the mount.
-        assert!(
-            !machine.owns(6),
-            "a superseded attempt may not transition the mount that replaced it"
-        );
-        idle.abort();
     }
 
     #[test]

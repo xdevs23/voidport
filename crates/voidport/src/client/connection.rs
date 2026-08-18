@@ -2,13 +2,17 @@
 //! requests.
 //!
 //! A mount outlives its connections. Everything that belongs to *one* socket —
-//! the writer that serializes frames onto it, the table of requests waiting for
-//! replies, the request-id counter the wire contract scopes per connection, the
-//! frame bound that connection negotiated — lives here, behind a **generation
-//! number**. The [`Client`](super::Client) above holds at most one of these at a
-//! time and replaces it wholesale when the server comes back, which is what
-//! makes a late frame, reply or error of an old generation harmless: it is
-//! addressed to an object nothing points at any more.
+//! the writer that serializes frames onto it, the storage its request table
+//! runs over, the frame bound that connection negotiated — lives here, behind a
+//! **generation number**. The [`Client`](super::Client) above holds at most one
+//! of these at a time and replaces it wholesale when the server comes back,
+//! which is what makes a late frame, reply or error of an old generation
+//! harmless: it is addressed to an object nothing points at any more.
+//!
+//! What this module does *not* decide is the session itself. The handshake's
+//! validation, the request ids, the fixed-capacity request table and the replay
+//! classification are [`voidport_session`]'s, and this module is the I/O around
+//! them: it dials, it writes, it reads, and it wakes.
 //!
 //! **A protocol fault is connection loss.** An invalid frame, a response id
 //! nobody is waiting for, the wrong opcode for an outstanding id, a mid-frame
@@ -34,55 +38,26 @@
 //! prompt class is passed by that one chunk at most, never by the window
 //! behind it.
 
-use std::collections::HashMap;
 use std::fmt;
 use std::io;
 use std::os::fd::OwnedFd;
 use std::sync::Mutex;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use tokio::io::{AsyncRead, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::sync::oneshot;
-use voidport_proto::PROTOCOL_VERSION;
 use voidport_proto::error::FramingError;
-use voidport_proto::frame::{FRAME_HEADER_LEN, Frame, FrameKind, FrameWriter, MAX_HELLO_FRAME_LEN};
+use voidport_proto::frame::{FRAME_HEADER_LEN, Frame, FrameKind, FrameWriter};
 use voidport_proto::message::{
-    RESPONSE_HEAD_LEN, RequestBody, RequestHead, ResponseHead, ResponseOutcome, is_error_status,
+    RESPONSE_HEAD_LEN, RequestBody, RequestHead, ResponseHead, is_error_status,
 };
 use voidport_proto::opcode::Opcode;
-use voidport_proto::ops::handshake::{HelloReply, HelloRequest};
+use voidport_session::handshake::{self, MAX_FRAME_LEN as MAX_HANDSHAKE_FRAME_LEN, Negotiated};
+use voidport_session::replay::{self, Decision, OpenFlags, Sent};
+use voidport_session::table::{Answer, Requests, Slot, Ticket};
 use zerocopy::FromBytes as _;
-use zerocopy::byteorder::little_endian::U32;
 
 use super::transport::{ReadHalf, Stream, WriteHalf};
 use super::{Caller, ConnectError, Death, Target};
-
-/// The request id the handshake carries.
-///
-/// It is the first id of every connection, and the data-request counter starts
-/// after it, so "allocated monotonically and never reused" holds across the
-/// whole connection, not only after the handshake. Request ids are
-/// per-connection by the wire contract, so a replacement connection starts them
-/// over.
-pub const HELLO_REQUEST_ID: u64 = 1;
-
-/// The smallest frame bound a session can be served under.
-///
-/// `max_frame_len` is the server's announcement, and everything the client
-/// sizes — a read chunk, a write chunk, a directory batch — is derived from it.
-/// A bound below the pre-handshake one leaves no room for a request plus a
-/// usable payload: the read chunk saturates to zero and every nonempty file
-/// would read as empty with no error anywhere. A mount is refused instead.
-pub const MIN_MAX_FRAME_LEN: u32 = MAX_HELLO_FRAME_LEN;
-
-/// The node id the mount root must have.
-///
-/// The kernel names the root of a FUSE mount `FUSE_ROOT_ID`, which is 1, and
-/// nothing can change that; a server announcing another root node id is
-/// describing a mount this client cannot serve. It is also the one node id the
-/// server's generation-disjoint allocator never hands out, which is what lets a
-/// stale mount heal by walking from the root.
-pub const ROOT_NODE_ID: u64 = 1;
 
 /// The read buffer one connection holds.
 ///
@@ -113,7 +88,12 @@ pub struct Connection {
     /// connection down without queueing behind an in-flight write.
     socket: OwnedFd,
     state: Mutex<State>,
-    next_request_id: AtomicU64,
+    /// Woken whenever a request table slot frees, so a caller parked at a full
+    /// table asks again. The table's capacity is the mount's concurrency bound
+    /// and the bulk engines are bounded below it, so this is a wait that
+    /// practically never happens — and when it does it is a wait, exactly as
+    /// queueing at the writer over a back-pressuring socket is.
+    free: tokio::sync::Notify,
     max_frame_len: u32,
     /// Where server-initiated notification frames go, when the mount above has
     /// somewhere to put them.
@@ -128,34 +108,18 @@ pub struct Connection {
 /// What the reader task and the callers share.
 #[derive(Debug)]
 struct State {
-    /// Response-expecting requests, by id. A `forget` never appears here.
-    pending: HashMap<u64, Waiter>,
+    /// The session core's request table, over storage this connection owns. A
+    /// `forget` never appears in it: it expects no reply and holds no slot.
+    requests: Table,
     /// Set once, by whatever ended the connection.
     death: Option<Death>,
 }
 
-/// One caller waiting for its reply.
-#[derive(Debug)]
-struct Waiter {
-    /// The opcode the response must echo. A response carrying any other is a
-    /// protocol fault, not a surprise for the caller to puzzle over.
-    opcode: Opcode,
-    reply: oneshot::Sender<Vec<u8>>,
-}
+/// The request table of one connection, sized at the handshake.
+type Table = Requests<Waiter, Vec<Slot<Waiter>>>;
 
-/// How far a request got before its connection died: the replay contract's
-/// linearization point, recorded where the frame is actually written.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum Sent {
-    /// The complete frame reached the socket. The server may have received it,
-    /// dispatched it, and applied it — so only an idempotent request may be
-    /// sent again.
-    Written,
-    /// Nothing, or only part of the frame, reached a socket that is now shut
-    /// down. The server never dispatches a frame it has not received whole, so
-    /// this request provably did not take effect and may be sent as it is.
-    Queued,
-}
+/// How a caller waiting for its reply is woken.
+type Waiter = oneshot::Sender<Vec<u8>>;
 
 /// Which of the send path's two request classes a frame belongs to.
 ///
@@ -272,7 +236,15 @@ impl Connection {
     ///
     /// Returns [`ConnectError`] for a refused connection, a transport failure,
     /// a malformed reply, or the errno the server refused the mount with.
-    pub async fn dial(target: &Target, generation: u64) -> Result<Established, ConnectError> {
+    ///
+    /// `capacity` is how many requests may be outstanding on it at once — the
+    /// mount's concurrency bound, which sizes the request table once and for
+    /// the connection's whole life.
+    pub async fn dial(
+        target: &Target,
+        generation: u64,
+        capacity: usize,
+    ) -> Result<Established, ConnectError> {
         let endpoint = &target.endpoint;
         let stream = Stream::connect(endpoint)
             .await
@@ -292,17 +264,17 @@ impl Connection {
         // socket for a second read syscall.
         let mut reader = BufReader::with_capacity(READ_BUFFER_BYTES, reader);
 
-        let hello = encode_hello(target.namespace.as_bytes(), &target.subpath)?;
-        writer.write_all(&hello).await.map_err(transport)?;
+        let mut buffer = [0u8; MAX_HANDSHAKE_FRAME_LEN as usize];
+        let hello = handshake::request(&mut buffer, target.namespace.as_bytes(), &target.subpath)?;
+        writer.write_all(hello).await.map_err(transport)?;
 
-        let protocol = |fault: Fault| ConnectError::Protocol {
-            reason: fault.to_string(),
-        };
-        let bytes = read_frame(&mut reader, MAX_HELLO_FRAME_LEN)
+        let bytes = read_frame(&mut reader, MAX_HANDSHAKE_FRAME_LEN)
             .await
             .map_err(|error| match error {
                 ReadError::Transport(error) => transport(error),
-                ReadError::Fault(fault) => protocol(fault),
+                ReadError::Fault(fault) => ConnectError::Protocol {
+                    reason: fault.to_string(),
+                },
             })?
             .ok_or_else(|| {
                 transport(io::Error::new(
@@ -310,51 +282,22 @@ impl Connection {
                     "the server closed the connection during the handshake",
                 ))
             })?;
-        let frame = Frame::parse(&bytes, MAX_HELLO_FRAME_LEN)
-            .map_err(|fault| protocol(Fault::Framing(fault)))?;
-        // The handshake is matched to its request exactly like every later
-        // reply, not as the one frame exempt from that discipline.
-        if frame.request_id() != HELLO_REQUEST_ID {
-            return Err(ConnectError::Protocol {
-                reason: format!(
-                    "it answers request {}, and the handshake is request {HELLO_REQUEST_ID}",
-                    frame.request_id()
-                ),
-            });
-        }
-        let reply = match frame
-            .response::<HelloReply>()
-            .map_err(|fault| protocol(Fault::Framing(fault)))?
-        {
-            ResponseOutcome::Success(reply) => *reply.body(),
-            ResponseOutcome::Error(status) => return Err(ConnectError::Refused { status }),
-        };
-        let max_frame_len = reply.max_frame_len.get();
-        if max_frame_len < MIN_MAX_FRAME_LEN {
-            return Err(ConnectError::FrameBound {
-                announced: max_frame_len,
-                minimum: MIN_MAX_FRAME_LEN,
-            });
-        }
-        let root_node_id = reply.root_node_id.get();
-        if root_node_id != ROOT_NODE_ID {
-            return Err(ConnectError::RootNodeId {
-                announced: root_node_id,
-                expected: ROOT_NODE_ID,
-            });
-        }
+        // Every judgement about the reply is the session core's, including the
+        // two v1 never made: the version and the flag bits it answers with.
+        let Negotiated { max_frame_len, .. } = handshake::reply(&bytes)?;
 
+        let mut slots = Vec::new();
+        slots.resize_with(capacity, Slot::vacant);
         Ok(Established {
             connection: Self {
                 generation,
                 send: SendPath::new(writer),
                 socket,
                 state: Mutex::new(State {
-                    pending: HashMap::new(),
+                    requests: Requests::new(slots),
                     death: None,
                 }),
-                // The handshake already used the connection's first id.
-                next_request_id: AtomicU64::new(HELLO_REQUEST_ID + 1),
+                free: tokio::sync::Notify::new(),
                 max_frame_len,
                 notifications: Mutex::new(None),
             },
@@ -380,44 +323,71 @@ impl Connection {
         self.lock().death.clone()
     }
 
+    /// Takes a request table slot for one request of `opcode`, waiting while
+    /// the table is full.
+    ///
+    /// The core answers "no slot" and this waits: a full table is
+    /// backpressure and never an error, and the capacity is the mount's
+    /// concurrency bound, so a prompt request always finds a slot in practice.
+    /// The ticket carries the id the frame is encoded under.
+    pub async fn claim(&self, opcode: Opcode, open: OpenFlags) -> Ticket {
+        let replay = replay::of(opcode, open);
+        loop {
+            // Registered *before* the table is asked, so a slot freed between
+            // the question and the wait wakes this caller anyway.
+            let free = self.free.notified();
+            tokio::pin!(free);
+            free.as_mut().enable();
+            // The lock is taken and released here, never held across the wait.
+            let claimed = self.lock().requests.claim(opcode, replay);
+            if let Some(ticket) = claimed {
+                return ticket;
+            }
+            free.await;
+        }
+    }
+
+    /// Gives a claimed slot back without sending anything on it.
+    ///
+    /// The request that could not be encoded under this connection's bound.
+    pub fn release(&self, ticket: Ticket) {
+        self.lock().requests.abandon(ticket);
+        self.free.notify_waiters();
+    }
+
+    /// The next request id, for a request that expects no reply.
+    ///
+    /// It retires the moment the frame reaches the transport, so it takes no
+    /// slot and gives none back.
+    pub fn take_request_id(&self) -> u64 {
+        self.lock().requests.take_request_id()
+    }
+
     /// Sends one request of `class` and waits for its reply.
     ///
-    /// `Ok(bytes)` is the reply frame. `Err(sent)` means the connection died
-    /// first, and says how far the request got — which is exactly what the
-    /// replay discipline needs to decide whether sending it again is safe.
+    /// `Ok(bytes)` is the reply frame. `Err(decision)` means the connection
+    /// died first, and carries what the core's discipline makes of that: the
+    /// class the ticket holds, against how far the frame got.
     pub async fn call(
         &self,
-        request_id: u64,
-        opcode: Opcode,
+        ticket: Ticket,
         frame: &[u8],
         class: Class,
-    ) -> Result<Vec<u8>, Sent> {
+    ) -> Result<Vec<u8>, Decision> {
         let (sender, receiver) = oneshot::channel();
-        let sent = self
-            .transmit(
-                frame,
-                class,
-                Some((
-                    request_id,
-                    Waiter {
-                        opcode,
-                        reply: sender,
-                    },
-                )),
-            )
-            .await;
-        if sent == Sent::Queued {
-            return Err(Sent::Queued);
+        if self.transmit(frame, class, Some((ticket, sender))).await == Sent::Queued {
+            self.release(ticket);
+            return Err(ticket.decide(Sent::Queued));
         }
-        // A dropped sender is the connection dying under us.
-        receiver.await.map_err(|_| Sent::Written)
+        // A dropped sender is the connection dying under us, and the frame was
+        // written before it did.
+        receiver.await.map_err(|_| ticket.decide(Sent::Written))
     }
 
     /// Sends one request that has no reply.
     ///
-    /// Its id retires the moment the frame reaches the transport, so it is
-    /// never registered as outstanding. Nothing sent this way carries bulk
-    /// payload — a `forget` is a request head and no more — so it is prompt.
+    /// Nothing sent this way carries bulk payload — a `forget` is a request
+    /// head and no more — so it is prompt.
     pub async fn send(&self, frame: &[u8]) -> Sent {
         self.transmit(frame, Class::Prompt, None).await
     }
@@ -436,15 +406,15 @@ impl Connection {
     ///
     /// `class` decides only how this frame queues for the serialization point
     /// ([`SendPath`]); every frame is written the same way once it holds it.
-    async fn transmit(&self, frame: &[u8], class: Class, waiter: Option<(u64, Waiter)>) -> Sent {
+    async fn transmit(&self, frame: &[u8], class: Class, waiter: Option<(Ticket, Waiter)>) -> Sent {
         let mut stream = self.send.take(class).await;
         {
             let mut state = self.lock();
             if state.death.is_some() {
                 return Sent::Queued;
             }
-            if let Some((request_id, waiter)) = waiter {
-                state.pending.insert(request_id, waiter);
+            if let Some((ticket, waiter)) = waiter {
+                state.requests.arm(ticket, waiter);
             }
         }
         // A death recorded while this write is in flight shuts the socket down
@@ -473,7 +443,8 @@ impl Connection {
     /// an error, instead of putting a frame on a connection the client has
     /// given up on.
     ///
-    /// Dropping a waiter's sender is what wakes its caller.
+    /// Dropping a waiter's sender is what wakes its caller, which then asks
+    /// its ticket what the discipline makes of the attempt it made.
     pub fn bury(&self, death: Death) {
         // ENOTCONN is the normal answer for a peer that has already gone.
         let _ = rustix::net::shutdown(&self.socket, rustix::net::Shutdown::Both);
@@ -482,7 +453,12 @@ impl Connection {
             tracing::debug!(generation = self.generation, %death, "the data connection ended");
             state.death = Some(death);
         }
-        state.pending.clear();
+        state.requests.bury(drop);
+        drop(state);
+        // Nothing will ever be answered on this connection again, but a caller
+        // parked at the table is woken all the same: it finds the death on the
+        // next attempt instead of waiting for a slot that would never come.
+        self.free.notify_waiters();
     }
 
     /// Routes one reply to the caller waiting for it.
@@ -507,19 +483,23 @@ impl Connection {
             FrameKind::Request => return Err(Fault::RequestFromServer),
         }
         let request_id = frame.request_id();
-        // Removing here is also the duplicate check: a second response for one
-        // id finds nothing outstanding.
-        let waiter = self
-            .lock()
-            .pending
-            .remove(&request_id)
-            .ok_or(Fault::UnknownResponseId { request_id })?;
-        if frame.raw_opcode() != waiter.opcode.as_u16() {
-            return Err(Fault::Framing(FramingError::OpcodeMismatch {
-                expected: waiter.opcode.as_u16(),
-                found: frame.raw_opcode(),
-            }));
-        }
+        let raw_opcode = frame.raw_opcode();
+        // The core matches the reply to its request and checks the opcode it
+        // echoes, because the table is what knows which opcode that id was
+        // sent under — raw, so an opcode this client cannot even name still
+        // mismatches against the real expectation.
+        let answer = self.lock().requests.answer(request_id, raw_opcode);
+        self.free.notify_waiters();
+        let waiter = match answer {
+            Answer::Deliver(waiter) => waiter,
+            Answer::Unknown => return Err(Fault::UnknownResponseId { request_id }),
+            Answer::Mismatch { expected } => {
+                return Err(Fault::Framing(FramingError::OpcodeMismatch {
+                    expected: expected.as_u16(),
+                    found: raw_opcode,
+                }));
+            }
+        };
         let (head, _) = ResponseHead::ref_from_prefix(frame.body()).map_err(|_| {
             Fault::Framing(FramingError::BodyTooShort {
                 needed: RESPONSE_HEAD_LEN,
@@ -531,7 +511,7 @@ impl Connection {
             return Err(Fault::Framing(FramingError::InvalidStatus { status }));
         }
         // A caller that gave up is not an error: its receiver is simply gone.
-        let _ = waiter.reply.send(bytes);
+        let _ = waiter.send(bytes);
         Ok(())
     }
 
@@ -563,12 +543,6 @@ impl Connection {
                 tracing::debug!(opcode = ?bytes.get(4..6), "ignoring an unsolicited notification");
             }
         }
-    }
-
-    /// The next request id. Monotonic, so an id is never outstanding twice on
-    /// this connection.
-    pub fn take_request_id(&self) -> u64 {
-        self.next_request_id.fetch_add(1, Ordering::Relaxed)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, State> {
@@ -739,42 +713,10 @@ pub fn encode<Q: RequestBody>(
     Ok(buffer)
 }
 
-/// Encodes the handshake frame.
-fn encode_hello(namespace: &[u8], subpath: &[u8]) -> Result<Vec<u8>, ConnectError> {
-    let body = HelloRequest {
-        protocol_version: U32::new(PROTOCOL_VERSION),
-        flags: U32::ZERO,
-        namespace_len: U32::new(len_of(namespace)?),
-        subpath_len: U32::new(len_of(subpath)?),
-        auth_len: U32::ZERO,
-    };
-    let mut payload = namespace.to_vec();
-    payload.extend_from_slice(subpath);
-    // The handshake carries the request head zeroed: it names no node and no
-    // caller, and uniformity beats a special case.
-    encode(
-        HELLO_REQUEST_ID,
-        Caller::default(),
-        0,
-        &body,
-        &payload,
-        MAX_HELLO_FRAME_LEN,
-    )
-    .map_err(|_| ConnectError::TooLong {
-        max: MAX_HELLO_FRAME_LEN,
-    })
-}
-
-/// The length of a handshake field, refused if it cannot be one.
-fn len_of(field: &[u8]) -> Result<u32, ConnectError> {
-    u32::try_from(field.len()).map_err(|_| ConnectError::TooLong {
-        max: MAX_HELLO_FRAME_LEN,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use voidport_proto::frame::MAX_HELLO_FRAME_LEN;
 
     /// One small error-response frame, as the server writes them.
     fn frame(request_id: u64) -> Vec<u8> {

@@ -17,6 +17,12 @@ exec nix develop path:. -c bash -c '
   set -euo pipefail
   cargo fmt --all --check
   cargo clippy --workspace --all-targets -- -D warnings
+  # The session core is std-free, and this rung proves it: the core compiles
+  # for a 64-bit target that has no standard library and no allocator at all.
+  # The sysroot the flake provisions for that target is reached through the
+  # flag, so the host build above is untouched by it.
+  RUSTFLAGS="--sysroot=$VOIDPORT_NO_STD_SYSROOT" \
+    cargo check -p voidport-session --target "$VOIDPORT_NO_STD_TARGET"
   cargo test --workspace "$@"
   # The write suite runs a second time with the streaming engine off — the
   # ordinary run tests the shipped default, which streams, so the serial
