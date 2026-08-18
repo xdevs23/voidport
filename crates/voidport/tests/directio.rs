@@ -57,9 +57,9 @@ const PAGE: usize = 4096;
 
 /// Mount options with the metadata timeouts pinned, direct I/O as asked.
 ///
-/// The chunk unit is the run's ([`support::write_stream_bytes`]): zero for
-/// every ordinary run, and whatever the run named for the pass that puts this
-/// suite through the write-streaming engine.
+/// The chunk unit is the run's ([`support::write_stream_bytes`]): the shipped
+/// streaming default for every ordinary run, and zero for the pinned pass
+/// that holds this suite to the serial path.
 fn options(direct_io: bool) -> MountOptions {
     MountOptions {
         attr_timeout: NEVER,

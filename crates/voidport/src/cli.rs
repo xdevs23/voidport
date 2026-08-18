@@ -3,9 +3,10 @@
 //! Its own module, and deliberately self-contained: the binary parses it, and
 //! `build.rs` compiles this same file to generate `voidport.1`, so the manual
 //! page and the `--help` output cannot drift apart. A build script cannot use
-//! the crate it builds, which is why the two defaults that also live in
-//! [`voidport::mount`](crate::mount) are restated here and checked against it by
-//! a test in `main.rs`.
+//! the crate it builds, which is why the defaults that also live in the
+//! library — in [`voidport::mount`](crate::mount) and `voidport::client` —
+//! are restated here and every one is checked against its source by a test
+//! in `main.rs`.
 
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
@@ -38,8 +39,22 @@ pub const DEFAULT_READAHEAD_MIB: u64 = 256;
 ///
 /// The same value as `voidport::mount::DEFAULT_WRITE_STREAM_BYTES`, in the unit
 /// the command line takes it in; restated for the reason in the module docs.
-/// Zero is the engine off.
-pub const DEFAULT_WRITE_STREAM_KIB: u64 = 0;
+/// Zero is the engine off; the default is the measured one.
+pub const DEFAULT_WRITE_STREAM_KIB: u64 = 256;
+
+/// How many streamed chunks one handle may have on the wire at once.
+///
+/// The same value as `voidport::client::DEFAULT_CHUNKS_PER_HANDLE`, restated
+/// for the reason in the module docs.
+pub const DEFAULT_WRITE_STREAM_PER_HANDLE: NonZeroUsize =
+    NonZeroUsize::new(8).expect("8 is not zero");
+
+/// How many streamed chunks one mount may have on the wire at once.
+///
+/// The same value as `voidport::client::DEFAULT_CHUNKS_PER_MOUNT`, restated
+/// for the reason in the module docs.
+pub const DEFAULT_WRITE_STREAM_PER_MOUNT: NonZeroUsize =
+    NonZeroUsize::new(32).expect("32 is not zero");
 
 /// The voidport guest client: mounts a namespace over FUSE.
 #[derive(Debug, Parser)]
@@ -119,16 +134,27 @@ pub enum Command {
         #[arg(long, value_name = "MIB", default_value_t = DEFAULT_READAHEAD_MIB)]
         readahead: u64,
         /// Cut each guest write into chunks of this many KiB and send them to
-        /// the server together, so the round trips inside one write overlap
-        /// instead of following one another. Zero, the default, sends each
-        /// write as it arrived. A write still returns only once every chunk of
-        /// it has been answered, so nothing is acknowledged before the server
-        /// has it; what changes is that a write which fails partway leaves
-        /// some subset of its chunks applied instead of a prefix. It applies
-        /// only under --direct-io, and never to appending, O_SYNC, O_DSYNC or
-        /// O_DIRECT handles, which keep sending one chunk at a time.
+        /// the server together, so the transfer of one chunk overlaps the
+        /// server applying the last. Zero sends each write as it arrived. A
+        /// write still returns only once every chunk of it has been answered,
+        /// so nothing is acknowledged before the server has it; what changes
+        /// is that a write which fails partway leaves some subset of its
+        /// chunks applied instead of a prefix. It applies only under
+        /// --direct-io, and never to appending, O_SYNC, O_DSYNC or O_DIRECT
+        /// handles, which keep sending one chunk at a time.
         #[arg(long, value_name = "KIB", default_value_t = DEFAULT_WRITE_STREAM_KIB)]
         write_stream: u64,
+        /// How many chunks of streamed writes one file handle may have on the
+        /// wire at once. One level of the window that bounds --write-stream;
+        /// it does nothing without it. Sized at mount and fixed thereafter.
+        #[arg(long, value_name = "CHUNKS", default_value_t = DEFAULT_WRITE_STREAM_PER_HANDLE)]
+        write_stream_per_handle: NonZeroUsize,
+        /// How many chunks of streamed writes the whole mount may have on the
+        /// wire at once, across every handle. The window's other level; the
+        /// server allows one connection 64 requests in flight and that budget
+        /// is shared with readahead and metadata, so leave headroom.
+        #[arg(long, value_name = "CHUNKS", default_value_t = DEFAULT_WRITE_STREAM_PER_MOUNT)]
+        write_stream_per_mount: NonZeroUsize,
     },
     /// Unmount a voidport mountpoint. A busy mountpoint stays mounted.
     Umount {

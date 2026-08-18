@@ -45,7 +45,8 @@ use rustix::fs::OFlags;
 use rustix::io::Errno;
 use support::{Fixture, preflight};
 use voidport::client::{
-    CHUNKS_PER_HANDLE, Caller, Client, Resilience, WriteStream, WriteStreamStats,
+    Caller, Client, DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT, Resilience, WriteStream,
+    WriteStreamStats,
 };
 use voidport::mount::MountOptions;
 use voidport::url::Endpoint;
@@ -61,6 +62,9 @@ use zerocopy::byteorder::little_endian::{U32, U64};
 
 /// The frame bound the recording server announces, as the real one does.
 const MAX_FRAME_LEN: u32 = 1024 * 1024;
+
+/// The default per-handle depth, as a count the arms size their payloads by.
+const CHUNKS_PER_HANDLE: usize = DEFAULT_CHUNKS_PER_HANDLE.get();
 
 /// The chunk unit every arm here streams in.
 ///
@@ -443,7 +447,7 @@ fn stream_with(policy: Policy, data: &[u8], strip: bool) -> Streamed {
         )
         .await
         .expect("the handshake succeeds");
-        let engine = WriteStream::new(UNIT);
+        let engine = WriteStream::new(UNIT, DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT);
         engine.activate(true);
 
         let outcome = engine
@@ -1191,10 +1195,20 @@ fn a_connection_lost_mid_write_fails_the_write_with_eio() {
 
 /// A chunk answered zero bytes without an error ends the write as a short
 /// success at the answered prefix — the serial loop's own break — and nothing
-/// more is cut or sent, while chunks already in flight may have applied.
+/// more is cut or sent once the zero answer is seen, while chunks already in
+/// flight may have applied.
+///
+/// The buffer is sized so the assertion discriminates: a permit is released
+/// when its chunk's task completes, not when the engine joins the answer, so
+/// on the worst legitimate schedule every first-window task completes before
+/// the zero answer is joined and the send phase refills the whole window once
+/// — two windows of chunks at most, since the server answers in arrival order
+/// and no refill's answer can precede the zero answer that stops the cutting.
+/// Three windows of chunks sit above that ceiling, so "every chunk was sent"
+/// can only mean the cutting never stopped.
 #[test]
 fn a_zero_answer_ends_the_write_as_a_short_success() {
-    let chunks = CHUNKS_PER_HANDLE + 4;
+    let chunks = 3 * CHUNKS_PER_HANDLE;
     let expected = payload(chunks * UNIT);
     let streamed = stream(
         Policy {

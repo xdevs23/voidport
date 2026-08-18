@@ -60,13 +60,15 @@ window**:
   for example, eight 128 KiB chunks in flight at once), which
   overlaps the per-chunk fixed costs and the round trips inside
   one request. The chunk unit is a mount option with a measured
-  default — **open**, settled by the W2 matrix, which must show
-  where sub-frame chunking beats the single frame (the fixed
-  per-request cost is duplicated per chunk, so the win must be
-  measured, not assumed; the depth evidence that exists — the
-  server's request bound of 64, where 1024 measured 19% worse on
-  a different workload — is recorded as adjacent evidence, not as
-  this design's measurement).
+  default — **measured, 256 KiB** (the W2 matrix, 2026-08-18; the
+  record is the "What W2 measured" section below). The matrix
+  answered the question this clause left open both ways at once:
+  sub-frame chunking beats the single frame by 7–31% where the
+  round trip is cheap — the win is the transfer of one chunk
+  overlapping the server's apply of the last — and merely equals
+  it, never beats it, where the round trip is the cost, because
+  the request boundary is a barrier either way and one request is
+  one round trip on both paths.
 - **Concurrent writers and asynchronous guest I/O** pipeline
   naturally on both clients through parallel direct writes, with
   that capability's honest bound restated, not dropped: the guest
@@ -123,12 +125,11 @@ no future home claimed for it.
   server's per-connection bound of 64 in-flight requests is a
   shared budget — readahead's chunks, metadata traffic and write
   chunks all draw on it — so the write window's default leaves
-  the other classes their measured shares (provisionally eight
-  chunks per handle and thirty-two per mount, W2 replacing both;
-  disposition 2026-08-18: the count depths ship as build
-  constants until W2's measurements pick the defaults, and the
-  operator-facing surface for them arrives with those numbers —
-  the byte level's mount option ships in W1),
+  the other classes their measured shares (eight chunks per
+  handle and thirty-two per mount — first provisional, then kept
+  by the W2 matrix, which measured the cliff below cover and
+  nothing above it; both counts are mount options now, the
+  operator-facing surface that was owed with the numbers),
   and a window that met the ceiling would stall the connection's
   read loop for everyone. The operator's existing per-session
   in-flight override is the WAN dial; the mount's window option
@@ -163,8 +164,11 @@ no future home claimed for it.
   after a partial apply. The one semantic change this contract
   makes is therefore the failure-time file state — a byte-range
   subset instead of a prefix — confined to writes that fail
-  partway, absent entirely on the success path, and priced
-  against the serial alternative in W2. One further answer state
+  partway, absent entirely on the success path, and priced by the
+  W2 matrix: at the shipped defaults the divergence buys 7–31%
+  at native latency and costs nothing at any measured latency —
+  the cells that measured below serial are windows sized under
+  cover, which the defaults are not. One further answer state
   is named for completeness (added 2026-08-18): a chunk answered
   zero bytes without an error ends the write as a short success
   at the answered prefix, exactly as the serial loop breaks on a
@@ -199,7 +203,14 @@ no future home claimed for it.
   window of in-flight chunks drains inside the bounded settle or
   fails with the teardown's rules — the window depth must be
   sized so a full window can drain inside that bound at the
-  mount's measured throughput, and W2 records the check.
+  mount's measured throughput. The recorded check: the default
+  window's ceiling is 8 MiB in flight (thirty-two chunks at the
+  256 KiB unit), the slowest measured point moved 9.4 MiB/s, and
+  a full window at that pace drains in under a second against a
+  two-second settle bound. The bound binds only below ~4 MiB/s of
+  effective throughput, where the sizing rule above is the
+  operator's — window bytes at most the settle bound times the
+  link's pace.
 - **Invalidation.** The readahead contract's write-wise bracket
   survives untouched: the client invalidates the file's cached
   blocks around the whole write — all chunks — never per chunk,
@@ -222,9 +233,94 @@ and the virtio queue identically. A writable arena, if D3 ever
 opens one, would be specified in that document against this one's
 contract.
 
+## What W2 measured
+
+The matrix, run 2026-08-18 on the development guest (32 vCPUs,
+tmpfs-backed server so the disk never enters the numbers):
+sequential 1 MiB write syscalls through a direct mount, every
+streamed cell against the serial baseline of the same transport,
+latency and syscall size; latency injected with netem on the
+loopback device (round trip = twice the one-way delay; queue
+limit raised so drops never masquerade as transport behaviour);
+eight repetitions after the first pass showed native-latency
+throughput lands in one of two modes per run and three could not
+say which mode a number was from — medians of eight, with the
+spread kept in the raw records.
+
+**The unit sweep** (window 8×32, ratios are streamed p50 against
+the paired serial p50):
+
+| unit    | unix native | vsock native | tcp native | tcp 1–50 ms RTT |
+|---------|-------------|--------------|------------|-----------------|
+| 64 KiB  | 1.18×       | 1.19×        | 0.64×      | 0.68–0.70×      |
+| 128 KiB | 1.15×       | 1.22×        | 1.11×      | 1.00–1.01×      |
+| 256 KiB | 1.13×       | 1.31×        | 1.07×      | 0.97–1.01×      |
+| 512 KiB | 1.11×       | 1.27×        | 1.07×      | 0.98–1.00×      |
+| 1 MiB   | 0.99×       | 1.01×        | 0.98×      | 0.94–1.00×      |
+
+The shape, stated plainly:
+
+- **The win is real and it lives at native latency**: 7–31% at
+  units of 128–512 KiB on every transport, strongest on vsock.
+  It is the transfer/apply overlap, not round-trip hiding — under
+  injected latency every covered unit measured exactly even,
+  because a request is one round trip on both paths and the
+  syscall boundary is a barrier on both paths. The serial
+  round-trip floor for a single-threaded writer stands exactly as
+  the opening section states it.
+- **The one cliff is a window smaller than the request**: under
+  injected latency, the depth sweep at 128 KiB measured 0.42×
+  serial at a quarter of the request covered (2×8), 0.68× at half
+  (4×16), and even at cover (8×32) — and nothing above cover, to
+  the server's whole budget (16×48 and 32×64 measured identical
+  to 8×32). At native latency an under-covered window still wins
+  (1.17× at 2×8 on unix), because the cliff is round trips
+  multiplied and the round trip there is cheap — the rule guards
+  the deployments with distance in them. The
+  per-handle depth rule is therefore *cover the request*:
+  unit × depth at least max_write. Sixty-four KiB units sit
+  under the fixed-cost break-even on tcp (0.64× native) and
+  under cover at depth eight (0.68× at latency), which is why
+  the default unit is not the smallest one measured.
+- **A unit at the request bound is even everywhere** (0.94–1.01×):
+  one chunk per request, and the engine's own path — the copy,
+  the task, the send-class turn — costs nothing the medians can
+  see. The same holds for writes of one chunk or less (the
+  128 KiB-syscall pair: 0.96–1.00×), so streaming-on does not tax
+  the writes it cannot help.
+- **The defaults**: unit 256 KiB, window 8 per handle and 32 per
+  mount, streaming on by default on the mounts it applies to at
+  all (direct-io stays opt-in). 256 is vsock's measured best and
+  within a few points of the best unit on unix and tcp
+  (128 KiB leads both by 0.02–0.04×), it is the furthest covered
+  unit from the fixed-cost cliff below 128, and it
+  covers the request at depth eight with
+  a factor-two margin against a frame bound renegotiated down,
+  and leaves the per-mount window at 8 MiB in flight. The serial
+  path stays one flag away (`--write-stream 0`) and byte for
+  byte what it was, and `./check` now runs the write suites both
+  ways with the polarity the default implies: the ordinary run
+  tests the shipped posture, the pinned run tests serial.
+- **Methodology note, recorded so nobody re-derives it**: at
+  native latency this guest's throughput is bimodal per run
+  (roughly 500 against 900 MiB/s modes, reps within a run tight);
+  three-rep cells sampled single modes and first read as a unix
+  regression and a vsock unit-bound anomaly — both vanished at
+  eight reps. Native-latency medians below eight repetitions are
+  not to be trusted on this rig.
+
+The deferred simplification is **decided — the tail-slicing
+machinery stays**. The measurements kept multi-chunk windows as
+the shipped default (four chunks per request at the default
+unit), short answers remain real host behaviour the resume path
+serves, and the reduction's price — the first-failed-by-offset
+assertion going timing-dependent — is a contract clause's test
+losing its determinism. Seventy-three lines do not buy that.
+
 ## Phasing
 
-1. **W1 — the userspace engine.** Sub-frame chunking behind the
+1. **W1 — the userspace engine. DONE 2026-08-18.**
+   Sub-frame chunking behind the
    existing write path, window accounting with the per-handle
    reservation, the send-queue class rule, failure gathering with
    the documented partial-application semantics. Criteria: the
@@ -238,17 +334,17 @@ contract.
    probe-then-assert short-write arm on ext4 and btrfs; the
    torture harness gains a streamed-write storm arm here, not
    later.
-2. **W2 — measurement.** The chunk-unit and depth matrix on
-   unix, vsock and TCP with injected latency across the table's
-   points, against the rig's paired serial baseline; defaults set
-   from the numbers; the teardown-drain check recorded; the
-   sub-frame win or its absence stated plainly either way. One
-   deferred simplification is decided here too (deferred
-   2026-08-18): replacing the engine's tail-slicing machinery
-   with per-chunk range placement — a real reduction whose cost
-   is a failure-ordering assertion becoming timing-dependent —
-   waits for W2's numbers, because the measurements may reshape
-   the chunking it would simplify.
+2. **W2 — measurement. DONE 2026-08-18.** The chunk-unit and
+   depth matrix on unix, vsock and TCP with injected latency
+   across the table's points, against the paired serial baseline
+   — run, and recorded in "What W2 measured" above: the sub-frame
+   win stated plainly (real at native latency, exactly even under
+   it), the defaults set from the numbers (256 KiB, 8×32,
+   streaming on where it applies), the window counts opened as
+   mount options, the teardown-drain check recorded in the
+   barriers clause, and the deferred tail-slicing simplification
+   decided — the machinery stays, for the reasons recorded with
+   the matrix.
 3. **W3 — the kernel client's engine.** The same contract inside
    the kernel provider's write path, chunking at and below the
    frame bound from whole syscalls, sharing the session core's

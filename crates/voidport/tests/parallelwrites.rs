@@ -74,11 +74,12 @@ const FILL: u8 = b'w';
 
 /// A direct mount: the only mode that announces the capability.
 ///
-/// The chunk unit is the run's ([`support::write_stream_bytes`]): zero for
-/// every ordinary run, and whatever the run named for the pass that puts this
-/// suite through the write-streaming engine — where the census assertions
-/// below say something extra, since streaming is below the syscall and must
-/// leave what the guest kernel has in flight exactly as it was.
+/// The chunk unit is the run's ([`support::write_stream_bytes`]): the shipped
+/// streaming default for every ordinary run, and zero for the pinned pass
+/// that holds this suite to the serial path — under streaming the census
+/// assertions below say something extra, since streaming is below the
+/// syscall and must leave what the guest kernel has in flight exactly as it
+/// was.
 fn direct() -> MountOptions {
     MountOptions {
         attr_timeout: NEVER,

@@ -70,7 +70,9 @@ mod writestream;
 
 pub use ops::{AttrChange, Lock, LockKind, TimeChange, XattrNames, XattrValue};
 pub use readahead::{CHUNK_BYTES, DEFAULT_POOL_BYTES, ReadData, Readahead, ReadaheadStats};
-pub use writestream::{CHUNKS_PER_HANDLE, WriteStream, WriteStreamStats};
+pub use writestream::{
+    DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT, WriteStream, WriteStreamStats,
+};
 
 use std::fmt;
 use std::io;

@@ -137,6 +137,65 @@ fn the_binary_mounts_and_unmounts() {
     );
 }
 
+/// The write-streaming options are reachable from the command line an operator
+/// types, not just from the library — and a mount that takes them serves the
+/// namespace exactly as one that does not.
+///
+/// They reach the manual page by the same route the other flags do: `src/cli.rs`
+/// is compiled into this binary and into the build script that renders
+/// `voidport.1`, so a flag `--help` accepts is a flag the page documents.
+#[test]
+fn the_binary_mounts_with_the_write_stream_options() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = Fixture::start("cli-write-stream");
+    let mountpoint = fixture.directory.directory("mnt-write-stream");
+    let url = fixture.tcp_url("project", "/project");
+
+    let mounted = Mounted::start_with(
+        &url,
+        &mountpoint,
+        &mountpoint.join("file.txt"),
+        &[
+            "--direct-io",
+            "--write-stream",
+            "128",
+            "--write-stream-per-handle",
+            "4",
+            "--write-stream-per-mount",
+            "16",
+        ],
+    );
+    // Into the worked example's read-write directory, and larger than the
+    // named unit, so the write the options govern is really a streamed one.
+    let payload = vec![b'w'; 512 * 1024];
+    std::fs::write(mountpoint.join("foo/streamed.bin"), &payload)
+        .expect("a streamed write applies");
+    assert_eq!(
+        std::fs::read(mountpoint.join("foo/streamed.bin")).expect("the mount serves it back"),
+        payload
+    );
+
+    let umount = voidport()
+        .arg("umount")
+        .arg(&mountpoint)
+        .output()
+        .expect("the binary runs");
+    assert!(
+        umount.status.success(),
+        "umount failed: {}",
+        String::from_utf8_lossy(&umount.stderr)
+    );
+    let output = mounted.finish();
+    assert!(
+        output.status.success(),
+        "the mount process exited with {}: {}",
+        output.status,
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
 /// `--direct-io` is reachable from the command line an operator types, not just
 /// from the library — and a mount that takes it serves the namespace exactly as
 /// one that does not.

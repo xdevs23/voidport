@@ -223,15 +223,19 @@ and restores strictly wire-immediate reads. It does nothing without
 `--direct-io`: a page-cached mount is already served by the guest kernel's own
 readahead.
 
-`--write-stream` (KiB, default 0 = off) turns on the write-streaming engine:
-a write larger than the given chunk unit is cut into chunks that fly
-concurrently under a bounded window, and the syscall still returns only when
-every chunk is answered — durability, barriers and error delivery are exactly
-the serial path's. What it buys is the round trips: the chunks of one write
-overlap instead of queueing one behind another. A metadata request is never
-made to wait behind a window of chunks, and a mount that leaves the flag at
-zero keeps the serial write path byte for byte. The numbers that pick a good
-unit are measured in the next phase; until then the flag ships off.
+`--write-stream` (KiB, default 256, measured; 0 = off) sizes the
+write-streaming engine: a write larger than the chunk unit is cut into chunks
+that fly concurrently under a bounded window, and the syscall still returns
+only when every chunk is answered — durability, barriers and error delivery
+are exactly the serial path's. What it buys is overlap: while the server
+applies one chunk the next is already in transfer, which measured 7–31%
+faster sequential writes at native latency across the three transports, and
+exactly even with the serial path everywhere else — under injected latency,
+and on writes of one chunk or less. `--write-stream 0` keeps the serial write
+path byte for byte, and `--write-stream-per-handle` /
+`--write-stream-per-mount` size the window (defaults 8 and 32, also
+measured). It does nothing without `--direct-io`. The matrix behind the
+numbers is recorded in `docs/WRITESTREAM.md`.
 
 ### Following what a namespace shares
 

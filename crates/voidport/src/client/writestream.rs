@@ -17,8 +17,9 @@
 //!
 //! ## The window
 //!
-//! In-flight chunks are bounded in count and in bytes, per handle
-//! ([`CHUNKS_PER_HANDLE`]) and per mount ([`CHUNKS_PER_MOUNT`]), with a
+//! In-flight chunks are bounded in count and in bytes, per handle and per
+//! mount — both counts are mount options, defaulting to
+//! [`DEFAULT_CHUNKS_PER_HANDLE`] and [`DEFAULT_CHUNKS_PER_MOUNT`] — with a
 //! per-handle reservation ([`RESERVED_FIRST_CHUNK`]) so one large write cannot
 //! take the mount's whole window and hold another handle at nothing in flight.
 //! Both levels are sized when the mount is made and fixed for its life. A full
@@ -41,8 +42,8 @@
 //!
 //! The engine runs on mounts whose **negotiated** data caching is direct (a
 //! page-cached mount's writes go through the guest page cache and keep the v1
-//! path byte for byte), and it is off entirely unless the mount named a chunk
-//! unit. Three kinds of handle are excluded on their own semantics and keep
+//! path byte for byte), and a chunk unit of zero turns it off entirely.
+//! Three kinds of handle are excluded on their own semantics and keep
 //! the serial path whatever the mount asked for: `O_APPEND` (the offset is not
 //! the placement), `O_SYNC` and `O_DSYNC` (per-write durability ordering), and
 //! a guest handle opened `O_DIRECT` (which asked for unbuffered, uncoalesced
@@ -67,6 +68,7 @@
 //! the write fails. Nothing is replayed.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::num::NonZeroUsize;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
@@ -76,21 +78,26 @@ use tokio::task::JoinSet;
 
 use super::{Caller, Client};
 
-/// How many chunks one handle may have on the wire at once.
+/// How many chunks one handle may have on the wire at once, by default.
 ///
-/// Provisional, and the W2 matrix replaces it: the number is the readahead
-/// engine's measured per-handle depth, which is the nearest measured shape this
-/// client has.
-pub const CHUNKS_PER_HANDLE: usize = 8;
+/// The default of a mount option, **kept at eight by measurement** (the W2
+/// matrix): the depth that matters is the one that lets a whole kernel-split
+/// request fly at once — a window smaller than the request multiplies its
+/// round trips, and the matrix measured that directly (0.42× serial at a
+/// quarter of the request, 0.68× at half, even at cover) — while depth beyond
+/// cover measured nothing anywhere. Eight covers the 1 MiB request bound at
+/// every unit of 128 KiB and above, with margin at the 256 KiB default.
+pub const DEFAULT_CHUNKS_PER_HANDLE: NonZeroUsize = NonZeroUsize::new(8).expect("8 is not zero");
 
-/// How many chunks one mount may have on the wire at once.
+/// How many chunks one mount may have on the wire at once, by default.
 ///
-/// Provisional for the same reason. The server's per-connection bound is 64
-/// requests in flight and it is a **shared** budget — prefetch reads, metadata
-/// traffic and write chunks all draw on it — so this leaves the other classes
-/// their measured shares instead of meeting the ceiling, which would stall the
-/// connection's read loop for everyone.
-pub const CHUNKS_PER_MOUNT: usize = 32;
+/// **Kept at thirty-two by measurement**: the matrix ran the mount level to
+/// sixty-four and measured nothing above thirty-two, and the server's
+/// per-connection bound of 64 in-flight requests is a **shared** budget —
+/// prefetch reads, metadata traffic and write chunks all draw on it — so this
+/// leaves the other classes their measured shares instead of meeting the
+/// ceiling, which would stall the connection's read loop for everyone.
+pub const DEFAULT_CHUNKS_PER_MOUNT: NonZeroUsize = NonZeroUsize::new(32).expect("32 is not zero");
 
 /// How many of the mount's slots only a handle's **first** chunk may take.
 ///
@@ -148,12 +155,16 @@ pub struct WriteStream {
 /// The window counts chunks; it does not count bytes, because every chunk is
 /// cut at or below the fixed chunk unit, so the count bound times the unit IS
 /// the byte bound, by construction — a second live counter could never fire.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Window {
     /// Chunks on the wire across the mount.
     inflight: usize,
     /// The same, per handle. A handle with nothing in flight holds no entry.
     handles: HashMap<u64, Held>,
+    /// The most chunks one handle may have on the wire.
+    per_handle: usize,
+    /// The most chunks the mount may have on the wire.
+    per_mount: usize,
 }
 
 /// What one handle holds of the window.
@@ -192,14 +203,15 @@ impl WriteStream {
     /// Builds a mount's engine.
     ///
     /// `chunk` is the chunk unit in bytes; zero is the default and leaves every
-    /// write on the v1 path.
+    /// write on the v1 path. `per_handle` and `per_mount` are the window's two
+    /// count bounds, sized here and fixed for the mount's life.
     #[must_use]
-    pub fn new(chunk: usize) -> Arc<Self> {
+    pub fn new(chunk: usize, per_handle: NonZeroUsize, per_mount: NonZeroUsize) -> Arc<Self> {
         let (room, _) = watch::channel(0);
         Arc::new(Self {
             chunk,
             active: AtomicBool::new(false),
-            window: Mutex::new(Window::default()),
+            window: Mutex::new(Window::new(per_handle, per_mount)),
             room,
             counters: Counters::default(),
         })
@@ -421,6 +433,16 @@ impl Drop for Permit {
 }
 
 impl Window {
+    /// An empty window with its two count bounds.
+    fn new(per_handle: NonZeroUsize, per_mount: NonZeroUsize) -> Self {
+        Self {
+            inflight: 0,
+            handles: HashMap::new(),
+            per_handle: per_handle.get(),
+            per_mount: per_mount.get(),
+        }
+    }
+
     /// Whether a chunk may go out for `handle` right now.
     ///
     /// Two count bounds and the reservation: the handle's count, the mount's
@@ -430,11 +452,11 @@ impl Window {
     /// below the fixed unit, so count times unit is the byte bound already.
     fn admits(&self, handle: u64) -> bool {
         let held = self.handles.get(&handle).copied().unwrap_or_default();
-        if held.inflight >= CHUNKS_PER_HANDLE || self.inflight >= CHUNKS_PER_MOUNT {
+        if held.inflight >= self.per_handle || self.inflight >= self.per_mount {
             return false;
         }
         held.inflight < RESERVED_FIRST_CHUNK
-            || self.inflight + RESERVED_FIRST_CHUNK < CHUNKS_PER_MOUNT
+            || self.inflight + RESERVED_FIRST_CHUNK < self.per_mount
     }
 
     /// Records one chunk as being on the wire.
@@ -625,14 +647,22 @@ mod tests {
 
     /// An engine with a chunk unit, told the mount negotiated direct caching.
     fn engine(chunk: usize) -> Arc<WriteStream> {
-        let engine = WriteStream::new(chunk);
+        let engine = WriteStream::new(chunk, DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT);
         engine.activate(true);
         engine
     }
 
+    /// The two count bounds are per handle and per mount, spelled as counts.
+    const PER_HANDLE: usize = DEFAULT_CHUNKS_PER_HANDLE.get();
+    const PER_MOUNT: usize = DEFAULT_CHUNKS_PER_MOUNT.get();
+
     #[test]
     fn the_engine_runs_only_in_direct_mode_and_only_with_a_chunk_unit() {
-        let paged = WriteStream::new(128 * 1024);
+        let paged = WriteStream::new(
+            128 * 1024,
+            DEFAULT_CHUNKS_PER_HANDLE,
+            DEFAULT_CHUNKS_PER_MOUNT,
+        );
         assert!(
             !paged.is_active(),
             "a mount is page-cached until the handshake says otherwise"
@@ -646,7 +676,7 @@ mod tests {
              to page caching, where the write path must not change"
         );
 
-        let off = WriteStream::new(0);
+        let off = WriteStream::new(0, DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT);
         off.activate(true);
         assert!(
             !off.is_active(),
@@ -686,17 +716,17 @@ mod tests {
         // stopping at its own bound.
         let mut permits: Vec<Permit> = Vec::new();
         for handle in 1..=3 {
-            for _ in 0..CHUNKS_PER_HANDLE {
+            for _ in 0..PER_HANDLE {
                 permits.push(engine.reserve(handle).expect("the handle's own window"));
             }
             assert!(
                 engine.reserve(handle).is_none(),
-                "a handle may hold {CHUNKS_PER_HANDLE} chunks and no more"
+                "a handle may hold {PER_HANDLE} chunks and no more"
             );
         }
         let stats = engine.stats();
-        assert_eq!(stats.inflight, 3 * CHUNKS_PER_HANDLE);
-        assert_eq!(stats.inflight_bytes, 3 * CHUNKS_PER_HANDLE * UNIT);
+        assert_eq!(stats.inflight, 3 * PER_HANDLE);
+        assert_eq!(stats.inflight_bytes, 3 * PER_HANDLE * UNIT);
         assert_eq!(stats.handles, 3);
 
         // A fourth streams into what is left and is stopped short of the last
@@ -707,19 +737,16 @@ mod tests {
             permits.push(permit);
             streamed += 1;
         }
-        assert_eq!(streamed, CHUNKS_PER_HANDLE - RESERVED_FIRST_CHUNK);
-        assert_eq!(
-            engine.stats().inflight,
-            CHUNKS_PER_MOUNT - RESERVED_FIRST_CHUNK
-        );
+        assert_eq!(streamed, PER_HANDLE - RESERVED_FIRST_CHUNK);
+        assert_eq!(engine.stats().inflight, PER_MOUNT - RESERVED_FIRST_CHUNK);
 
         // And the slot it was refused is exactly the one a handle with nothing
         // in flight is admitted into, which is what the reservation is for.
         let last = engine
             .reserve(5)
             .expect("a handle with nothing in flight is never starved");
-        assert_eq!(engine.stats().inflight, CHUNKS_PER_MOUNT);
-        assert_eq!(engine.stats().peak_inflight, CHUNKS_PER_MOUNT);
+        assert_eq!(engine.stats().inflight, PER_MOUNT);
+        assert_eq!(engine.stats().peak_inflight, PER_MOUNT);
         assert!(
             engine.reserve(6).is_none(),
             "and the mount's bound is still the mount's bound"
@@ -731,6 +758,39 @@ mod tests {
         assert_eq!(stats.inflight, 0);
         assert_eq!(stats.inflight_bytes, 0);
         assert_eq!(stats.handles, 0, "a handle holding nothing holds no entry");
+    }
+
+    /// The two count bounds are the mount's own, not the defaults: an engine
+    /// sized smaller binds at the size it was given.
+    #[test]
+    fn the_window_binds_at_the_counts_the_mount_was_sized_with() {
+        let sized = |count: usize| NonZeroUsize::new(count).expect("a test count is not zero");
+        let engine = WriteStream::new(1024, sized(2), sized(4));
+        engine.activate(true);
+
+        let mut permits: Vec<Permit> = Vec::new();
+        permits.push(engine.reserve(1).expect("the first chunk"));
+        permits.push(engine.reserve(1).expect("the second chunk"));
+        assert!(
+            engine.reserve(1).is_none(),
+            "two per handle was the size given, so two is the bound"
+        );
+        permits.push(engine.reserve(2).expect("another handle's first chunk"));
+        assert!(
+            engine.reserve(2).is_none(),
+            "the last of four mount slots is the reservation, and a handle \
+             already streaming may not take it"
+        );
+        permits.push(
+            engine
+                .reserve(3)
+                .expect("a first chunk takes the reserved slot"),
+        );
+        assert_eq!(engine.stats().inflight, 4);
+        assert!(
+            engine.reserve(4).is_none(),
+            "four across the mount was the size given, so four is the bound"
+        );
     }
 
     /// Chunks are cut at the bound, in order, and never overlap — including
@@ -919,7 +979,7 @@ mod tests {
     async fn a_full_window_makes_the_next_chunk_wait_instead_of_failing() {
         const UNIT: usize = 512;
         let engine = engine(UNIT);
-        let permits: Vec<Permit> = (0..CHUNKS_PER_HANDLE)
+        let permits: Vec<Permit> = (0..PER_HANDLE)
             .map(|_| engine.reserve(1).expect("the handle's own window"))
             .collect();
         assert!(engine.reserve(1).is_none());

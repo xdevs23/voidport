@@ -113,8 +113,8 @@ use rustix::io::Errno;
 use rustix::mount::UnmountFlags;
 
 use crate::client::{
-    Client, ConnectError, DEFAULT_POOL_BYTES, DEFAULT_RECONNECT_STALL, Readahead, Resilience,
-    WriteStream,
+    Client, ConnectError, DEFAULT_CHUNKS_PER_HANDLE, DEFAULT_CHUNKS_PER_MOUNT, DEFAULT_POOL_BYTES,
+    DEFAULT_RECONNECT_STALL, Readahead, Resilience, WriteStream,
 };
 use crate::fuse::{InFlight, VoidportFs};
 use crate::url::MountUrl;
@@ -146,11 +146,20 @@ pub const DEFAULT_DISPATCH_THREADS: NonZeroUsize = NonZeroUsize::new(1).expect("
 
 /// The chunk unit a mount streams its writes in, by default.
 ///
-/// **Zero: off.** The unit is an open number — the W2 measurement matrix has to
-/// show where cutting a request below the frame bound beats sending it as one
-/// frame, because the per-request cost is paid once per chunk — so until that
-/// is measured, no mount streams unless it was told to.
-pub const DEFAULT_WRITE_STREAM_BYTES: usize = 0;
+/// **256 KiB, by measurement** (the W2 matrix, 2026-08-18, recorded in
+/// `docs/WRITESTREAM.md`). Against the paired serial baseline, sequential
+/// 1 MiB writes through a direct mount gained 22–31% on vsock, 11–15% on unix
+/// and 7–11% on tcp at native latency at units of 128–512 KiB; under injected
+/// latency of 1–50 ms RTT on tcp, the injected transport, units of
+/// 128–512 KiB measured even with serial (0.97–1.01×), and writes at or below
+/// one chunk were even everywhere. The win is transfer overlapping the
+/// server's apply, so it lives where the round trip is cheap and vanishes to
+/// even where the round trip is the cost — provided the window covers the
+/// request, which these defaults do with a factor-two margin; a unit and
+/// depth whose product falls below max_write multiply the request's round
+/// trips instead, and that cliff is measured in the record too. Zero turns
+/// the engine off and leaves every write on the serial path.
+pub const DEFAULT_WRITE_STREAM_BYTES: usize = 256 * 1024;
 
 /// How long a signalled teardown gives the callbacks the kernel is owed.
 ///
@@ -272,20 +281,32 @@ pub struct MountOptions {
     /// served by the kernel's own readahead and the engine does not run there.
     pub readahead: usize,
     /// The unit, in bytes, one guest write is cut into for streaming; zero
-    /// leaves every write on the v1 path.
+    /// leaves every write on the serial path.
     ///
-    /// **Zero by default**, which is the whole engine off: the unit is a
-    /// measured number the W2 matrix has still to settle, and until it does,
-    /// a mount that does not ask for streaming writes exactly as it always
-    /// did. Setting it cuts a guest write into chunks of this size and sends
-    /// them together, bounded by a window that is sized here and fixed for the
-    /// mount's life; the write still returns only when every chunk has been
-    /// answered.
+    /// **256 KiB by default, by measurement** — see
+    /// [`DEFAULT_WRITE_STREAM_BYTES`] for the numbers. A write is cut into
+    /// chunks of this size and the chunks are sent together, bounded by a
+    /// window that is sized here and fixed for the mount's life; the write
+    /// still returns only when every chunk has been answered.
     ///
     /// Like [`readahead`](Self::readahead) it only matters where the
     /// negotiated data caching is **direct**, and it never applies to an
     /// appending, `O_SYNC`, `O_DSYNC` or guest-`O_DIRECT` handle.
     pub write_stream: usize,
+    /// How many chunks one handle may have on the wire at once.
+    ///
+    /// One level of the streaming window, sized here and fixed for the mount's
+    /// life; it only matters where [`write_stream`](Self::write_stream) is set.
+    /// The default is the measured one — kept by the W2 matrix, whose one rule
+    /// for this level is that unit times depth covers max_write.
+    pub write_stream_per_handle: NonZeroUsize,
+    /// How many chunks the whole mount may have on the wire at once.
+    ///
+    /// The window's other level. The server bounds one connection at 64
+    /// requests in flight and that budget is shared with prefetch reads and
+    /// metadata traffic, so this stays well inside it: a window that met the
+    /// ceiling would stall the connection's read loop for everything else.
+    pub write_stream_per_mount: NonZeroUsize,
 }
 
 impl Default for MountOptions {
@@ -302,6 +323,8 @@ impl Default for MountOptions {
             privileged_bits: true,
             readahead: DEFAULT_POOL_BYTES,
             write_stream: DEFAULT_WRITE_STREAM_BYTES,
+            write_stream_per_handle: DEFAULT_CHUNKS_PER_HANDLE,
+            write_stream_per_mount: DEFAULT_CHUNKS_PER_MOUNT,
         }
     }
 }
@@ -478,10 +501,14 @@ impl Mount {
         // is what keeps prefetching inside the coherence the mount already
         // promises.
         let readahead = Readahead::new(options.readahead, options.attr_timeout);
-        // Sized here and fixed for the mount's life, as the contract requires:
-        // the engine's window is derived from this unit and nothing renegotiates
-        // either of them afterwards.
-        let write_stream = WriteStream::new(options.write_stream);
+        // Sized here and fixed for the mount's life, as the contract
+        // requires: the unit and the window's two counts are the mount's own
+        // options, and nothing renegotiates any of them afterwards.
+        let write_stream = WriteStream::new(
+            options.write_stream,
+            options.write_stream_per_handle,
+            options.write_stream_per_mount,
+        );
         let inflight = Arc::<InFlight>::default();
         let filesystem = VoidportFs::new(
             Arc::clone(&client),

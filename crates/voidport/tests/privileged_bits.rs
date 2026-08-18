@@ -137,10 +137,11 @@ fn options(direct_io: bool) -> MountOptions {
         attr_timeout: Duration::ZERO,
         allow_other: true,
         direct_io,
-        // The run's chunk unit ([`support::write_stream_bytes`]): zero
-        // ordinarily, and set for the pass that puts this suite through the
-        // write-streaming engine — where the suid-kill mark has to ride every
-        // chunk of every write, which is exactly what this suite measures.
+        // The run's chunk unit ([`support::write_stream_bytes`]): the
+        // shipped streaming default ordinarily, and zero for the pinned
+        // serial pass. Streaming is where the suid-kill mark has to ride
+        // every chunk of every write, which is exactly what this suite
+        // measures.
         write_stream: support::write_stream_bytes(),
         ..MountOptions::default()
     }

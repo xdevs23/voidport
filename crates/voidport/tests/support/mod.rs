@@ -651,22 +651,29 @@ pub fn errno(error: &io::Error) -> i32 {
 
 /// The chunk unit the suites' direct mounts cut their writes into.
 ///
-/// **Zero** — the product's own default, and the posture every ordinary run
-/// takes — unless the run names one:
+/// The product's own default — the measured unit, streaming on — so the
+/// posture every ordinary run tests is the posture a mount ships with. A run
+/// that names a unit overrides it, and **zero** is the serial path:
 ///
 /// ```console
-/// $ VOIDPORT_TEST_WRITE_STREAM_KIB=128 cargo test -p voidport
+/// $ VOIDPORT_TEST_WRITE_STREAM_KIB=0 cargo test -p voidport
 /// ```
 ///
-/// puts the write-path suites through the streaming engine instead. That is how
-/// the engine is held to the v1 suite's own assertions — the same files, the
-/// same mounts, the same bytes — without a second copy of that suite drifting
-/// away from the first. Only the direct mounts consult it, because a
-/// page-cached mount's writes never reach the engine.
+/// holds the write-path suites to the serial engine-off path instead. That is
+/// how both ways stay covered by the v1 suite's own assertions — the same
+/// files, the same mounts, the same bytes — without a second copy of that
+/// suite drifting away from the first. Only the direct mounts consult it,
+/// because a page-cached mount's writes never reach the engine.
 #[must_use]
 pub fn write_stream_bytes() -> usize {
-    std::env::var("VOIDPORT_TEST_WRITE_STREAM_KIB")
-        .ok()
-        .and_then(|kib| kib.parse::<usize>().ok())
-        .map_or(0, |kib| kib.saturating_mul(1024))
+    match std::env::var("VOIDPORT_TEST_WRITE_STREAM_KIB") {
+        Err(std::env::VarError::NotPresent) => voidport::mount::DEFAULT_WRITE_STREAM_BYTES,
+        // A named unit that does not parse must not fall back quietly: the
+        // run would test the opposite polarity of the one it asked for.
+        Ok(kib) => kib
+            .parse::<usize>()
+            .unwrap_or_else(|_| panic!("VOIDPORT_TEST_WRITE_STREAM_KIB is not a count: {kib:?}"))
+            .saturating_mul(1024),
+        Err(error) => panic!("VOIDPORT_TEST_WRITE_STREAM_KIB is unreadable: {error}"),
+    }
 }

@@ -18,8 +18,9 @@ exec nix develop path:. -c bash -c '
   cargo fmt --all --check
   cargo clippy --workspace --all-targets -- -D warnings
   cargo test --workspace "$@"
-  # The write suite runs a second time with the streaming engine on, so the
-  # both-ways criterion has a receipt every run instead of a manual knob.
-  VOIDPORT_TEST_WRITE_STREAM_KIB=128 cargo test -p voidport \
+  # The write suite runs a second time with the streaming engine off — the
+  # ordinary run tests the shipped default, which streams, so the serial
+  # path is the one that needs its own receipt every run.
+  VOIDPORT_TEST_WRITE_STREAM_KIB=0 cargo test -p voidport \
     --test parallelwrites --test directio --test privileged_bits --test readahead
 ' bash "$@"

@@ -69,6 +69,8 @@ fn run(arguments: Cli) -> Result<()> {
             no_privileged_bits,
             readahead,
             write_stream,
+            write_stream_per_handle,
+            write_stream_per_mount,
         } => {
             let parsed = MountUrl::parse(&url).with_context(|| format!("cannot mount {url}"))?;
             let options = MountOptions {
@@ -83,6 +85,8 @@ fn run(arguments: Cli) -> Result<()> {
                 privileged_bits: !no_privileged_bits,
                 readahead: mebibytes(readahead),
                 write_stream: kibibytes(write_stream),
+                write_stream_per_handle,
+                write_stream_per_mount,
             };
             let mount = Mount::new(&parsed, &mountpoint, &options)
                 .with_context(|| format!("cannot mount {url}"))?;
@@ -191,9 +195,17 @@ mod tests {
             kibibytes(cli::DEFAULT_WRITE_STREAM_KIB),
             voidport::mount::DEFAULT_WRITE_STREAM_BYTES
         );
-        // And that default is off, which is what "streaming ships off until it
-        // is measured" means where an operator meets it.
-        assert_eq!(voidport::mount::DEFAULT_WRITE_STREAM_BYTES, 0);
+        // And that default is the measured one — the W2 matrix settled it,
+        // and `docs/WRITESTREAM.md` holds the numbers.
+        assert_eq!(voidport::mount::DEFAULT_WRITE_STREAM_BYTES, 256 * 1024);
+        assert_eq!(
+            cli::DEFAULT_WRITE_STREAM_PER_HANDLE,
+            voidport::client::DEFAULT_CHUNKS_PER_HANDLE
+        );
+        assert_eq!(
+            cli::DEFAULT_WRITE_STREAM_PER_MOUNT,
+            voidport::client::DEFAULT_CHUNKS_PER_MOUNT
+        );
     }
 
     #[test]
