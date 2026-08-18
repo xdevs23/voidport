@@ -1,168 +1,214 @@
 # Write streaming
 
-The authority document for v2 write streaming. Written 2026-08-18
-from the consolidated research record — the NFS, SMB and FUSE
-write-pipelining contracts, the bandwidth-delay arithmetic, and
-this project's own measurements and parked contract — under the
-evidence classes KERNEL.md defines: **measured**, **proven by
+The authority document for v2 write streaming. First written
+2026-08-18; rewritten the same day after its unbriefed review,
+which found the first draft's chunking inert on the client it
+shipped to first, its replay amendment unexecutable, and its
+failure clause false — the corrections are folded in below.
+Evidence classes are KERNEL.md's: **measured**, **proven by
 source**, **decided**, **open** (with the settling experiment
 named). This document decides the design and implements nothing.
 
-The problem, measured: writes through the share reach 172 MB/s
-because the write path pipelines nothing — every write is a full
-round trip, the mirror image of what readahead fixed on reads.
-The arithmetic is unforgiving: a serialized protocol moves exactly
-one chunk per round trip, which caps a 1 MiB chunk at 1 GiB/s at
-one millisecond of latency and at 20 MiB/s at fifty — no link
-speed changes that. Saturation needs in-flight data equal to the
-bandwidth-delay product, and the fleet decision has put
-arbitrary-latency constellations in scope.
+The problem, measured: the write path pipelines nothing — every
+write is one full round trip. The rig's paired baseline is
+369–410 MiB/s sequential; the field report saw 172 MB/s on a busy
+host. The arithmetic that bounds any serialized design: one chunk
+per round trip means a 1 MiB chunk caps at 1 GiB/s at one
+millisecond of effective latency and 20 MiB/s at fifty — no link
+speed changes it — and saturation requires in-flight data equal to
+the bandwidth-delay product, with arbitrary-latency constellations
+decided in scope. The in-document table (derivable arithmetic):
+
+| link, latency | in-flight needed | depth at 128 KiB | at 1 MiB |
+|---|---|---|---|
+| 10 Gb/s, 1 ms | 1.25 MB | 10 | 2 |
+| 10 Gb/s, 10 ms | 12.5 MB | 96 | 12 |
+| 1 Gb/s, 50 ms | 6.25 MB | 48 | 6 |
+| 40 Gb/s, 20 ms | 100 MB | 763 | 96 |
 
 ## The decision that shapes everything: no early acknowledgment
 
 The parked v1 contract bought throughput by acknowledging a write
-once its frame was queued, and then had to carry the consequences:
-a poisoned-handle failure mode with no external precedent, drains
-in front of node operations, an mmap invalidation split between
-acknowledgment and confirmation, and a direct contradiction of the
-live resilience rule that a written-but-unanswered write fails
-with EIO. Each was a fence around a hazard the early
-acknowledgment itself created.
+once its frame was queued, and every fence it carried — the
+poisoned-handle failure mode, the drains in front of node
+operations, the split mmap invalidation — fenced a hazard the
+early acknowledgment itself created. Decided: **streaming never
+acknowledges early.** A guest write returns only when every chunk
+of it has been answered, exactly as today. The hazards are not
+mitigated; they are unconstructable, because the window in which
+they lived does not exist.
 
-Decided: **streaming never acknowledges early.** A guest write
-returns only when every chunk of it has been answered by the
-server, exactly as today. What changes is only what happens
-*inside* the request: a large write splits at the frame bound and
-its chunks are sent concurrently under a bounded window, answers
-gathered, the syscall completing on the last one. Concurrent
-writers and asynchronous guest I/O pipeline naturally on top,
-because parallel direct writes already ship.
+## Where the concurrency comes from — stated per client
 
-Everything the parked contract fenced then never happens. A stat
-cannot observe a size the server has not applied, because nothing
-was acknowledged before apply. An mmap fault cannot cache
-pre-write bytes inside an acknowledgment window, because there is
-no such window. No handle is ever poisoned. No drain rule exists.
-Barriers keep their v1 meaning without amendment: by the time
-fsync can be issued on a handle, its writes have returned, and
-returned means answered. The hazards are not mitigated — they are
-unconstructable.
+**Proven by source, and decisive for the shape:** the userspace
+client cannot receive a large write. It announces its write budget
+to the FUSE kernel as max_write, the kernel splits every syscall
+to that size before the client sees it, and the kernel's own
+ceiling is 1 MiB — so a split at the frame bound never fires
+there, and a per-request mechanism keyed to "writes larger than a
+frame" would be inert on the client that ships first. The
+mechanism is therefore **sub-frame chunking with a concurrent
+window**:
+
+- **The kernel client** owns its write path and sees the whole
+  syscall; it chunks at the frame bound and below, and one large
+  write fills the window by itself.
+- **The userspace client** receives at most max_write per request
+  and chunks *below* the frame bound (a 1 MiB request becoming,
+  for example, eight 128 KiB chunks in flight at once), which
+  overlaps the per-chunk fixed costs and the round trips inside
+  one request. The chunk unit is a mount option with a measured
+  default — **open**, settled by the W2 matrix, which must show
+  where sub-frame chunking beats the single frame (the fixed
+  per-request cost is duplicated per chunk, so the win must be
+  measured, not assumed; the depth evidence that exists — the
+  server's request bound of 64, where 1024 measured 19% worse on
+  a different workload — is recorded as adjacent evidence, not as
+  this design's measurement).
+- **Concurrent writers and asynchronous guest I/O** pipeline
+  naturally on both clients through parallel direct writes, with
+  that capability's honest bound restated, not dropped: the guest
+  kernel still serializes append, size-extending, and ever-mmap'd
+  files under its exclusive lock, so the archetypal growing bulk
+  write is serialized at the source and gains only what
+  intra-request chunking gives it.
+
+**What no clause fixes, stated honestly**: a single-threaded
+writer issuing small writes still spans one round trip per
+syscall, because completing it early is exactly the early
+acknowledgment this design refuses. The only structural remover
+of that round trip is a guest-side writeback cache, which the
+decided coherence contract refuses; this stays out of scope with
+no future home claimed for it.
 
 ## The contract
 
-- **Scope.** Offset-addressed data writes on non-append handles.
-  Append handles, O_SYNC and O_DSYNC handles, and guest-side
-  O_DIRECT handles stream nothing and behave exactly as v1 —
-  append is not offset-addressed, and the sync flags promise
-  per-write durability ordering that concurrency would blur. The
-  kernel already serializes append and size-extending writes under
-  its exclusive lock, so the exclusion costs what it already cost.
-- **Chunking.** A write larger than the negotiated frame bound
-  splits into chunks at that bound, each an ordinary WriteRequest
-  carrying its own absolute offset — the wire is unchanged, and
-  every mature protocol's recurring lesson (the unit carries its
-  offset; short writes are first-class) is already this wire's
-  shape. Chunks of one write never overlap, so their apply order
-  is immaterial and the server needs no new rule. A short chunk
-  answer resumes from where the server stopped, as a local write
-  would.
-- **The window.** In-flight chunks are bounded in count and bytes,
-  two levels — per handle and per mount — the measured shape the
-  readahead engine already ships. Defaults sized from the
-  bandwidth-delay table and the run-ahead evidence (the server's
-  own bound is 64 in flight, and 1024 measured 19% worse, so depth
-  is not free); both levels configurable per mount for the WAN
-  constellations, negotiation with the server not required because
-  the server's run-ahead bound already backpressures the wire by
-  pausing the read loop. A full window backpressures the writer;
-  it never errors. **Open**: the default depth and whether
-  per-handle 8 matches the write side as it does the read side —
-  settled by the phase W2 measurements on unix, vsock and TCP with
-  injected latency.
-- **Failure.** The first failed chunk fails the write: its errno
-  is the syscall's errno, delivered once; chunks not yet sent are
-  abandoned; chunks in flight are awaited and their answers
-  discarded. The handle remains healthy — the guest sees exactly
-  what a local short-or-failed write shows.
-- **Retention and replay.** Every unanswered chunk is retained by
-  the client engine for the life of the request — the window
-  bounds this by construction, so retention is fixed-capacity in
-  the kernel core's terms, no overflow class. On reconnect inside
-  the stall window, retained chunks replay: an offset-addressed
-  data write applying twice writes the same bytes to the same
-  place, which is the idempotence the replay set requires. The
-  resilience contract's replay set is therefore **amended, not
-  overridden**: offset-addressed non-append data writes join the
-  idempotent class, with their retention the streaming window
-  itself; the EIO rule keeps governing everything the class
-  excludes, append above all. One recorded sharpening: replay is
-  per chunk against absolute offsets, so a partially answered
-  write replays only its unanswered chunks.
-- **Ordering.** All chunks of one handle's writes travel one
-  connection (handle affinity), so the per-connection serialized
-  frame stream orders whatever needed ordering; no sequence
-  numbers, no stream ids, no new wire surface — the taxonomy that
-  refused a smuggled stream id stays untouched. A future
-  multi-connection session streams different handles over
-  different connections and loses nothing, because nothing
-  cross-handle was ever ordered.
-
-## What this does not fix, stated honestly
-
-A single-threaded writer issuing small writes gains nothing: each
-syscall still spans a round trip, because completing it early is
-exactly the early acknowledgment this design refuses. Measured
-today that costs two round trips per write on FUSE mounts (the
-capability probe preceding each write); the kernel client halves
-that by never issuing the probe. The structural answer for the
-small-write single-thread case is the v4 caching layer, whose
-design opens with the durability contract such absorption
-requires — recorded there, not smuggled in here. The bulk cases —
-large writes, parallel writers, asynchronous I/O — are the cases
-the 172 MB/s number measured, and they are what this contract
-accelerates.
+- **Scope.** Offset-addressed data writes on direct-io mounts
+  (the mount default; a cached-fallback mount keeps v1's path
+  byte-identical). Excluded and unchanged from v1: append handles
+  (not offset-addressed), O_SYNC and O_DSYNC handles (per-write
+  durability ordering), and guest O_DIRECT handles (served by the
+  parallel-direct-writes surface, whose semantics stay exactly as
+  shipped).
+- **Chunking.** Each chunk is an ordinary WriteRequest carrying
+  its own absolute offset and the full write_flags of its parent
+  — PRIVILEGED_STRIP rides **every** chunk, as the shipped rule
+  requires. Chunks of one write never overlap. If the frame bound
+  renegotiates downward mid-write, unsent chunks re-slice at the
+  new bound, as the shipped client already does per attempt.
+- **The window.** In-flight chunks are bounded in count and
+  bytes, per handle and per mount, with a per-handle minimum
+  reservation so one large write cannot starve another handle's
+  progress. Both levels are sized at mount and fixed thereafter,
+  the retention they imply is the window itself — fixed-capacity,
+  allocation-free steady state, no overflow class, satisfying the
+  kernel core's constraints by construction and sized within the
+  request-table capacity that bounds the mount's concurrency. The
+  server's per-connection bound of 64 in-flight requests is the
+  depth ceiling a default mount meets; the operator's existing
+  per-session in-flight override is the WAN dial, and the mount's
+  window option must state it cannot exceed what the server
+  grants. A full window backpressures the writer; it never
+  errors.
+- **The send path.** Chunks are independent requests, so the
+  client's single serialization point releases between frames,
+  and the client's send queue admits pending non-write requests
+  ahead of queued chunks — the request-direction analog of the
+  server's two reply classes, so a metadata request never waits
+  behind a window of bulk frames.
+- **Failure, stated without pretense.** Chunks apply
+  concurrently, so a failed chunk does not stop later chunks that
+  were already in flight from applying: the bytes-on-disk state
+  of a failed streamed write is *some subset of its chunks*, not
+  the prefix a serial loop leaves. The syscall reports the
+  longest fully-answered prefix as a short write when that prefix
+  is nonempty, and the first chunk's errno otherwise; chunks
+  beyond the reported count may have applied, and this documented
+  divergence from v1's strict-prefix failure state is the one
+  semantic change this contract makes — confined to writes that
+  fail partway, absent entirely on the success path, and priced
+  against the serial alternative in W2. Unsent chunks are
+  abandoned; in-flight chunks are awaited before the syscall
+  returns, so nothing of the request outlives it.
+- **Connection loss.** The resilience contract applies verbatim
+  and unamended: a written-but-unanswered chunk fails the write
+  with EIO, queued-never-written chunks are moot, and nothing
+  replays — a replayed chunk would address a handle whose id died
+  with the generation, and the review record shows replay without
+  a fencing surface is a stale-write hazard besides. If session
+  continuity ever arrives (the parked attach-connection surface
+  is the only candidate), streamed-write replay may be revisited
+  in its terms; until then the contract's honest answer is v1's.
+- **Barriers and teardown.** fsync, fdatasync, flush and release
+  keep v1 semantics with nothing to add: a returned write is an
+  answered write. The concurrent-fsync case rests on the guest
+  kernel's inode locking (fsync excludes in-flight writers on the
+  same inode), an assumption stated here because the kernel
+  client's provider must re-establish it itself. Signalled
+  teardown owes the kernel only answered operations, and a
+  window of in-flight chunks drains inside the bounded settle or
+  fails with the teardown's rules — the window depth must be
+  sized so a full window can drain inside that bound at the
+  mount's measured throughput, and W2 records the check.
+- **Invalidation.** The readahead contract's write-wise bracket
+  survives untouched: the client invalidates the file's cached
+  blocks around the whole write — all chunks — never per chunk,
+  so no prefetch can cache bytes a later chunk is still
+  overwriting.
+- **Short chunks.** A short chunk answer resumes from where the
+  server stopped. The server's apply is a single unlooped pwrite,
+  so short answers are real host behavior — probed, then
+  asserted, on ext4 and btrfs both, per the standing rule that
+  filesystem-behavior assertions are exercised on more than one
+  filesystem.
 
 ## Interaction with the data plane
 
-None by design. The window is read-only toward the guest and the
-wire is the write path on every transport (DATAPLANE.md); the
-streaming engine lives in the client's write path on both clients
-— the userspace engine beside readahead, the kernel client inside
-its provider's write-through path — below the syscall boundary
-and above the transport seam, so it rides vsock, TCP, unix and
-the virtio queue identically.
+None by design: the window is read-only toward the guest
+(DATAPLANE.md), the wire is the write path on every transport,
+and the streaming engine sits below the syscall boundary and
+above the transport seam on both clients, riding vsock, TCP, unix
+and the virtio queue identically. A writable arena, if D3 ever
+opens one, would be specified in that document against this one's
+contract.
 
 ## Phasing
 
-1. **W1 — the client engine.** Chunked concurrent submission,
-   window accounting, retention, failure gathering; the userspace
-   client first, behind the existing write path; the replay-set
-   amendment lands in the shared session logic with its golden
-   tests. Criteria: byte-identical outcomes versus v1 under the
-   full v1 write suite, fault injection on every chunk position,
-   reconnect mid-write replaying exactly the unanswered chunks.
-2. **W2 — measurement.** Throughput versus v1 on unix, vsock and
-   TCP with injected latency across the BDP table's points;
-   window defaults set from the numbers; the open depth question
-   closed. The 172 MB/s number is the baseline the report leads
-   with.
+1. **W1 — the userspace engine.** Sub-frame chunking behind the
+   existing write path, window accounting with the per-handle
+   reservation, the send-queue class rule, failure gathering with
+   the documented partial-application semantics. Criteria: the
+   full v1 write suite green with streaming on and off;
+   fault-injection arms per chunk position asserting the
+   documented failure state (not v1's, and stated as such); the
+   probe-then-assert short-write arm on ext4 and btrfs; the
+   torture harness gains a streamed-write storm arm here, not
+   later.
+2. **W2 — measurement.** The chunk-unit and depth matrix on
+   unix, vsock and TCP with injected latency across the table's
+   points, against the rig's paired serial baseline; defaults set
+   from the numbers; the teardown-drain check recorded; the
+   sub-frame win or its absence stated plainly either way.
 3. **W3 — the kernel client's engine.** The same contract inside
-   the kernel provider when the kernel client's write phase
-   arrives, sharing the session core's replay machinery; the
-   ring-2 torture arm gains a streamed-write storm.
+   the kernel provider's write path, chunking at and below the
+   frame bound from whole syscalls, sharing the session core's
+   accounting; the ring-2 torture arm extends to it.
 
 ## Acceptance criteria — for this specification
 
-1. No clause weakens a durability or ordering promise v1 makes:
-   acknowledgment semantics, barrier semantics and error delivery
-   are v1's exactly.
-2. The replay-set amendment is stated as an amendment with its
-   idempotence argument, and everything outside the amended class
-   still follows the unmodified resilience contract.
-3. The window is fixed-capacity with backpressure and no error
-   path, satisfying the kernel core's constraints verbatim.
-4. The wire is unchanged: no new opcodes, fields, or flags, and
-   golden vectors stay green.
-5. Every open question names its settling experiment and phase,
-   and the stated non-goal (small serialized writes) is recorded
-   with its future home.
+1. The success path weakens nothing: acknowledgment, barrier and
+   durability semantics are v1's exactly, and the single
+   documented divergence (the failure-state subset) is stated
+   with its bound and its test arm.
+2. The resilience contract applies unamended, and the document
+   contains no replay clause.
+3. The window is fixed-capacity with backpressure, a per-handle
+   reservation, and no error path, and its sizing names both the
+   server's depth ceiling and the teardown-drain bound.
+4. The wire is unchanged: no new opcodes, fields or flags, and
+   the per-chunk write_flags rule is restated.
+5. Every open question names its settling experiment and phase;
+   every claim the first draft overstated (the client that never
+   sees large writes, the failure prefix, the two-round-trip
+   figure, the 172 MB/s workload shape) is corrected against its
+   authority.

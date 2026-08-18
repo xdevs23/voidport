@@ -1,214 +1,231 @@
 # The shared-memory data plane
 
-The authority document for v2's shared-memory data plane. Written
-2026-08-18 from the consolidated research record: the virtio-fs DAX
-window end to end (spec, guest implementation, the never-upstreamed
-QEMU side, and the generic mechanism that superseded it), the
-kernel's own statement of what may back guest memory, and this
-project's binding contracts. This document decides the design and
-implements nothing. Evidence classes are KERNEL.md's: **measured**,
-**compile-proven**, **proven by source**, **decided**, **open**
-(with the settling experiment named).
+The authority document for v2's shared-memory data plane. First
+written 2026-08-18 from the consolidated research record; rewritten
+the same day after its unbriefed review, which measured the first
+draft's lease-and-map discipline false eleven ways and is the
+evidence set behind the rejected alternative recorded below.
+Evidence classes are KERNEL.md's: **measured**, **compile-proven**,
+**proven by source**, **decided**, **open** (with the settling
+experiment named). This document decides the design and implements
+nothing.
 
-The decided v2 shape this document refines: a virtio device with a
-DAX-style shared-memory window — host page cache mapped into the
-guest, bulk data as zero-copy memory reads, control on a queue.
-The refinement below keeps that shape and decides what the
-precedent left broken.
+## The shape, and what it replaced
 
-## What the precedent proves
+**Decided: the window is a server-owned arena, not a view of
+backing files.** A sealed memory object created by the server
+(shrink-sealed, so nothing can pull pages out from under a
+mapping), exposed to the guest as one virtio shared-memory region,
+mapped **once** at device setup and never remapped. Inside it the
+server manages fixed-size slots in software: a slot holds a copy
+of a file range, placed there by the server through its ordinary
+read path, and the guest serves reads from granted slots at memory
+speed with no device exit and no round trip. The arena is a cache
+— exactly the readahead block cache's discipline, promoted into
+shared memory — and every rule about staleness, invalidation and
+loss is inherited from contracts that already exist instead of
+being invented here.
 
-Proven by source, from the research record. Mapping a host file's
-page cache into a guest is real and sanctioned: the kernel states
-that any object may back a guest memory slot, ordinary files
-included, with backing changes reflected immediately. The generic
-mechanism exists upstream since QEMU 11.1: a vhost-user device
-declares shared-memory regions, and the backend asks the VMM to map
-any mmap-able descriptor into one at a given offset. A custom
-device with a window plus queues is a precedented shape (virtio-fs,
-virtio-gpu's host-visible blobs, virtio-pmem).
-
-And the precedent's failure record, equally proven, is the design
-input: the virtio-fs DAX window performs well only while the data
-fits the window, and collapses under mapping churn; window-full is
-a hard stall in the guest fault path; reclaim is synchronous
-writeback plus a device round trip per fixed-size range; a host
-truncate under a live mapping has no error channel to the guest,
-which can spin in an infinite fault loop — the authors' own
-conclusion was that the mechanism suits non-shared filesystems
-only; each mapping under the generic mechanism costs a KVM memory
-slot, with the practical ceiling in the low hundreds; any device
-with a shared-memory region blocks VM migration today; and
-virtio-fs never shipped its cross-guest coherence half. Three of
-those — stall on full, spin on truncate, breakage under the
-concurrent host modification this project declares an expected
-workload — are impossible under this project's survival bar as
-shipped upstream. The design below removes them structurally.
+**The rejected alternative, recorded with its evidence.** The
+first draft mapped backing files themselves into the window (the
+DAX shape the original v2 decision sketched), fenced by host file
+leases. The review retired it on the record: leases are
+uid-scoped, so an ordinary-user server could map only files it
+owns; the kernel force-breaks a lease on a timer, so
+revocation-before-truncate is not race-free; the notification
+class carries no acknowledgment, so no quiesce protocol fits the
+wire's taxonomy; guest-pinned pages cannot be revoked on demand;
+the server's own truncate path never breaks its own lease; a
+lease is host-local while the fleet's ordinary deployment is a
+shared backend a thousand members write; two decided host-I/O
+postures bypass the host page cache the shape claimed to serve
+from; and the mapping mechanism rejects files whose size is not
+page-aligned. Each defect was structural. The direct-mapped shape
+also could not keep the one-cache property it existed for without
+per-inode divergence above the kernel client's provider boundary,
+which that document's own criterion forbids. **The one-cache
+property is therefore not achieved by this design and is not
+claimed**: the arena is a third copy beside the host page cache
+and the guest's own caching. What the window buys — decided, and
+what D3 must prove — is the removal of the per-read round trip
+and the device exit: a granted read costs a guest-local memory
+copy, nothing else.
 
 ## The law of the window
 
 **The window is an accelerator over the wire, never the truth.**
-Every operation has a wire path; the window only ever short-cuts
-reads whose bytes are already proven reachable that way. Losing
-the window — absence, fullness, revocation, device reset, session
-migration, an unsupported transport — degrades the affected reads
-to the wire and nothing else. A full window therefore never
-stalls a fault and never errors: the read that finds no mapping
-takes the wire, exactly as every read did before the window
-existed. This single rule is what makes the window compatible at
-once with the survival bar, the fleet decision, VM migration, and
-transports that have no shared memory at all.
-
-Consequences, stated so they cannot be unstated: the wire remains
-the semantic carrier of the protocol on every transport; the
-window carries no protocol state; no correctness property anywhere
-may depend on a mapping existing; and a member of the fleet with
-no window serves identically, only slower. Session migration
-needs no window handoff — mappings die with the device connection
-and the next member rebuilds them on demand or not at all.
+Every read has a wire path; a granted slot only short-cuts reads
+the wire already serves. Absence, fullness, revocation, staleness,
+device reset, reconnection, or a transport with no shared memory
+at all each degrade the affected reads to the wire and nothing
+else. A miss never stalls on the window: the read that finds no
+valid grant takes the wire while the server fills a slot in the
+background, or does not. No correctness property anywhere may
+depend on a grant existing. A wire-only member, transport, or
+deployment is whole, only slower.
 
 ## The device
 
-One virtio device, PCI and MMIO transports (the CCW transport has
-no shared-memory regions — proven by spec — and simply serves
-wire-only). The device carries two things and decides nothing:
+One virtio device **per mount**, PCI and MMIO transports (the CCW
+transport has no shared-memory regions — proven by spec — and
+serves wire-only). It carries two things and decides nothing:
 
-1. **A frame transport.** One virtqueue pair carrying the
-   existing wire protocol, unchanged — the session core already
-   takes its transport as data, and this queue is handed to it
-   exactly as vsock is today. Control of the data plane rides the
-   wire as ordinary requests; the device has no control registers
-   and puts nothing but mapped file bytes in the window, which is
-   also what the virtio spec's normative clause demands of
-   shared-memory regions.
+1. **A frame transport.** One virtqueue pair carrying the wire
+   protocol, handed to the session core as its transport exactly
+   as vsock is. Framing on a descriptor queue is stated, not
+   assumed: one wire frame per descriptor chain, chains bounded by
+   the negotiated frame bound, and the resilience contract's
+   linearization point re-derived as *the complete frame made
+   available to the device* — the queue analog of the complete
+   frame on the socket. Device→driver buffers are pre-posted at
+   the frame bound so notifications and replies always have a
+   landing place. A device-transport mount dials one member — the
+   backend its VMM was configured with — so "reconnect" on this
+   transport always means the same member, and fleet migration is
+   a wire-transport property; stated plainly, not implied.
 2. **The window.** One shared-memory region, read-only toward the
-   guest in this document's scope. Its size is fixed for the
-   device's lifetime (the transport rule), negotiated at VM
-   configuration; the guest learns it by enumeration.
+   guest, write-back cacheable (stated to the guest the way the
+   precedent that negotiates cache attributes does), size fixed at
+   VM configuration. The guest maps the region once; there is no
+   per-slot mapping, no memory-slot churn, and the memory-slot
+   budget question the direct-mapped shape had is moot at exactly
+   one slot for the region.
 
-The choice that the mapping lifecycle is wire requests — new
-request opcodes in the unassigned range, additive by the recorded
-ABI rules — and not a device-private protocol keeps one protocol
-authority. A server that does not know the opcodes answers ENOSYS
-and the client runs wire-only: discovery for free, skew-safe by
-the same rule every addition uses.
+The mapping-free design keeps all slot management in software:
+grants and invalidations are wire messages, the arena's contents
+are the server's memcpy, and no VMM interaction exists after
+setup. Contents of ungranted slots are undefined toward the guest
+and never read — the guest reads only through grants it holds.
 
-## Mappings — leased, bounded, revocable
+## Grants — the slot lifecycle
 
-A mapping is a whole-file range of the server's backing file
-placed into the window. Decided rules:
+A grant names (slot, node, range, generation, expiry). Decided
+rules:
 
-- **Mappings are established only under a host lease.** The
-  server takes a read lease on the backing file before mapping
-  it; a file whose lease cannot be taken (a concurrent host
-  writer holds it open) is served over the wire. When the lease
-  breaks — a host writer opens or truncates — the server revokes
-  the guest's mapping first (an invalidation notification on the
-  wire, an unmap toward the VMM), releases the lease, and the
-  host writer proceeds. The truncate-spin hazard is thereby
-  removed by construction: no live mapping can outlive the
-  server's right to the bytes under it. **Open**: whether a hole
-  punch breaks a read lease on the supported filesystems — the
-  settling experiment is a probe on ext4 and btrfs, run before
-  phase D2 closes, and a filesystem where it does not means hole
-  punching joins truncation in the class of operations the server
-  performs only through its own lease discipline.
-- **Mappings are few, large, and bounded.** One mapping per file,
-  whole-file, only for files past a size floor; the concurrent
-  mapping count is bounded well inside the memory-slot budget
-  (the practical ceiling is in the low hundreds — proven by the
-  maintainers' own statements — and the bound leaves at least
-  half of it free for the rest of the machine). Eviction is
-  LRU by mapping, asynchronous, and never on a fault path: the
-  read that misses takes the wire while eviction and mapping
-  proceed in the background. The size floor and the bound are
-  set by measurement in phase D3, not chosen here.
-- **Mappings are per session and policy-checked.** The server
-  maps only nodes the session's namespace policy admits reading;
-  the window is private to one guest's device, so the unit of
-  exposure equals the unit the wire already exposes. A policy or
-  posture change revokes affected mappings at the next
-  invalidation, exactly as it invalidates wire caches.
-- **Writes do not ride the window here.** The window is read-only
-  toward the guest in this document's scope; the write path is
-  WRITESTREAM.md's, on the wire, on every transport. A writable
-  window is recorded **open**, revisited only after the D3
-  measurements and the write-streaming contract are both facts —
-  the upstream record (extending writes deliberately routed away
-  from the mapped path; size growth not atomic with the write) is
-  the reason for the caution, and the wire write path keeps
-  invalidation coherent meanwhile: a write through any handle
-  drops the file's guest cache and its mapping revalidates
-  through the same attribute discipline as everything else.
+- **Granted on demand, once per range.** A guest read that misses
+  asks for a grant with an ordinary request (new opcodes in the
+  unassigned range — additive by the recorded ABI rules; a server
+  answering ENOSYS makes the mount wire-only, which is the
+  discovery story every addition uses). The reply carries the
+  grant or a wire-fallback refusal; the read itself proceeds on
+  the wire either way, so the grant round trip is never on a
+  read's critical path — it accelerates the next read, not this
+  one.
+- **Grants expire like attributes.** A grant's validity is the
+  attribute lifetime the mount already runs, and renewal rides
+  the attribute revalidation the client already performs — no new
+  timer, no new traffic class. A policy, posture or rule change
+  therefore bounds exposure by the same TTL that already bounds
+  every cache the client holds, with the invalidation
+  notification (below) as the accelerator of that bound, not its
+  guarantee.
+- **Invalidation inherits the readahead contract verbatim.** The
+  server refreshes or invalidates a slot when it applies a write
+  to the range, when the subscription machinery observes a host
+  change, and when the file's attributes change size or mtime;
+  the client drops its own file's grants on a local write exactly
+  as it drops readahead blocks. Invalidation notifications ride
+  the existing reserved-notification class fire-and-forget — safe
+  precisely because a stale slot is a stale *cache*, bounded by
+  the TTL like every other cache, never a fault and never
+  undefined memory. The quiesce protocol the direct-mapped shape
+  needed does not exist because nothing needs quiescing.
+- **Slots are fixed-size, the tables fixed-capacity.** Slot size
+  and count are set at mount from the arena size; the guest's
+  grant table is sized at mount and allocation-free in steady
+  state per the kernel core's constraints. Eviction is
+  server-driven (the server owns the arena), least-recently
+  granted first, revocation by notification; a revoked-but-read
+  slot race is harmless by the generation on the grant — the
+  guest validates the generation after the copy and retries on
+  the wire on mismatch, the one check the accelerator needs.
+- **Reconnection invalidates everything.** Grants are
+  generation-tagged; a new session generation invalidates every
+  grant the guest holds (ids die with the generation — the
+  resilience contract's rule, inherited). The arena mapping
+  itself survives, because it belongs to the device, not the
+  session; the slots refill on demand.
 
-## Coherence
+## What fills a slot
 
-Unchanged, and that is the point. Attribute and entry lifetimes,
-the auto-invalidation analog, writethrough writes, and the
-drop-on-change rules all keep governing; a mapped read serves
-bytes from the host page cache, which is the same cache the wire
-read serves from, so the window narrows the staleness story
-instead of widening it: for mapped ranges the guest reads the
-truth directly, and revocation covers the transitions the
-attribute discipline cannot see. Cross-member coherence stays a
-backend obligation per the fleet decision; the window never
-spans members.
+The server, through its ordinary read path: policy checked at the
+funnel every read passes, posture respected (an uncached-posture
+namespace fills slots through the same aligned-bounce site its
+wire reads use), and any future transform stage sits upstream of
+the copy exactly as it sits upstream of a wire reply — the v3
+hint stays alive with no further provision. The fill is the one
+host-side memory copy this design pays, and D3 measures what it
+buys against the round trip it replaces.
 
 ## The kernel client's seams, satisfied
 
-The provider boundary takes a second provider: the interim wire
-provider stands; the window provider serves a read by consuming a
-mapped range where one exists and delegating to the wire provider
-otherwise. Nothing above the boundary changes — criterion 3 of
-the kernel specification holds by construction. The transport
-seam takes the device's virtqueue as one more frame transport.
-The FUSE client gains nothing here (a userspace mount has no
-guest physical address space); the window is the kernel client's
-and the built-image case's.
+The provider boundary takes the window provider: it fills guest
+pages (or direct-io read buffers) from granted slots by memory
+copy, and delegates to the wire provider on any miss — the same
+fill-shaped contract the interim provider has, strictly below the
+boundary, no per-inode divergence, no new memory model in the
+guest. mmap needs nothing: mapped pages are ordinary guest page
+cache filled by the provider, whichever source filled them. The
+transport seam takes the device queue as one more frame
+transport. The FUSE client can consume the same grants through a
+userspace mapping of the region — recorded **open**, settled by a
+D3 experiment on whether the userspace copy path beats the wire
+enough to carry its complexity; nothing in the design depends on
+the answer.
 
 ## Deployment envelope, stated honestly
 
-Proven by source: the generic mapping mechanism needs QEMU 11.1;
-devices with shared-memory regions block migration today; the
-vhost-user model shares all guest memory with the backend; and
-confidential-VM compatibility is not determinable from the public
-record. None of these bind correctness — wire-only is always
-whole — but they bound where the accelerator may be turned on,
-and the flake's guest images pin the QEMU they were proven
-against. **Open**: whether the guest's mapped-range faults
-resolve to huge-page mappings against a file-backed host window —
-the settling experiment is a phase D3 measurement on the KVM
-ring; nothing in this design depends on the answer.
+Proven by source: the generic shared-memory plumbing this rides
+(region declaration and one fd-backed map at setup) is in QEMU
+from 11.1; the flake's current QEMU is older, so **the QEMU floor
+is a named precondition of phase D2**, checked by the ladder, not
+assumed. Any device with a shared-memory region blocks VM
+migration today — the blocker attaches to the device, so a
+migratable VM runs wire-only mounts; stated as the deployment
+rule. The vhost-user model shares all guest memory with the
+backend, which places the server inside that VM's trust boundary
+— THREAT-MODEL is owed a line for the device-transport deployment
+when implementation opens. Confidential-VM compatibility is not
+determinable from the public record; wire-only serves there too.
 
 ## Phasing
 
 1. **D1 — the device as transport.** The virtio device with its
    queue pair carries the wire; the kernel client mounts over it
-   in the KVM ring alongside vsock. No window use. Proves the
-   transport seam with a second real transport.
-2. **D2 — the read-only window.** Region enumeration, the mapping
-   opcodes, the lease discipline, revocation, the eviction rule;
-   the KVM ring proves mapped reads byte-identical to wire reads
-   under concurrent host modification, lease breaks, revocation
-   storms, and window exhaustion — the survival arms.
-3. **D3 — measurement.** Mapped versus wire reads across sizes
-   and patterns; the size floor and mapping bound set from the
-   numbers; the huge-page question answered; the writable-window
-   question opened or closed on evidence.
+   in the KVM ring beside vsock; the prototype rides the generic
+   test device upstream provides for exactly this, and a proper
+   device identity is this phase's deliverable. No window use.
+2. **D2 — the arena.** Region setup, seals, the grant opcodes,
+   TTL expiry, invalidation and revocation, generation checks;
+   the KVM ring proves granted reads byte-identical to wire reads
+   under concurrent host modification, revocation storms, slot
+   exhaustion, reconnection, and device reset — the survival
+   arms. Provisional slot size and count are set here from the
+   readahead engine's measured shape and marked as provisional.
+3. **D3 — measurement.** Granted versus wire reads across sizes,
+   patterns and postures; slot size, count and the size floor set
+   from the numbers; the userspace-mapping question answered; a
+   writable arena for the write path opened or closed on
+   evidence, in WRITESTREAM.md's terms.
 
 ## Acceptance criteria — for this specification
 
 1. Every capability claim carries its evidence class, and the
-   upstream failure record it designs against is cited, not
-   assumed away.
-2. The window is provably optional: every operation's wire path
-   is stated or inherited, and no clause makes a mapping
-   necessary for correctness.
-3. The three upstream failure modes — stall on full, spin on
-   truncate, churn collapse — each have a structural answer in
-   the design, not a mitigation.
-4. The design contradicts no decided contract: coherence,
-   resilience, fleet topology, policy enforcement, the kernel
-   client's provider and transport seams, and the ABI rules.
-5. Every open question names its settling experiment and the
-   phase that runs it.
+   rejected direct-mapped shape is recorded with the evidence
+   that retired it.
+2. The window is provably optional: every read's wire path is
+   stated or inherited, no clause makes a grant necessary for
+   correctness, and a wire-only deployment satisfies every other
+   contract untouched.
+3. The three failure modes of the direct-mapped precedent —
+   stall on full, spin on truncate, churn collapse — are
+   structurally impossible in the granted-arena shape, each shown
+   by construction, not mitigated.
+4. The design contradicts no decided contract: coherence and
+   invalidation, resilience and generations, fleet topology,
+   policy enforcement, the postures, the kernel client's provider
+   and transport seams, the kernel core's fixed-capacity rules,
+   and the ABI rules.
+5. Every open question names its settling experiment and phase,
+   and every deferred number (slot size, count, size floor) has a
+   provisional value with the phase that replaces it.

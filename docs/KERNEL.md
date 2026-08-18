@@ -227,10 +227,13 @@ and flush passing through as in v1, and memory-map writeback
 riding the same path: dirty pages a shared mapping produces reach
 the wire through the provider's page-writing hook, ported in the
 full-operation phase with the rest of the write set; the v2
-provider maps the shared-memory window so the same page cache
-pages ARE host memory — the DAX shape, which
-removes the duplication the interim accepts. Nothing above the
-boundary changes when the provider does. That boundary is the
+provider fills the same pages from the shared-memory window
+instead of the wire — a memory copy in place of a round trip,
+per DATAPLANE.md (amended 2026-08-18: the direct-mapped shape,
+where the pages themselves were host memory, was retired by its
+failure record; the double caching the interim accepts therefore
+stays, and what the window removes is the round trips). Nothing
+above the boundary changes when the provider does. That boundary is the
 criterion-3 answer: the successor data plane slots in as a provider
 swap, and this document forecloses nothing it needs.
 

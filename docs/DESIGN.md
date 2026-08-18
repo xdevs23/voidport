@@ -3101,6 +3101,13 @@ plane gives the throughput structurally — the guest writes host
 memory, the host kernel owns every coherence question this contract
 was accumulating guards for — and vsock, the one transport where
 client streaming pays, is exactly what that data plane replaces.
+(Amended 2026-08-18, when the v2 designs were written: the
+guest-writes-host-memory expectation belonged to the direct-mapped
+window shape, whose failure record retired it — the v2 window is
+read-only toward the guest, so the write path stays on the wire on
+every transport and WRITESTREAM.md is the throughput answer; the
+parked contract below remains the record of the rejected early-ack
+shape.)
 
 **What ships in v1 from this work**, each its own small increment:
 
