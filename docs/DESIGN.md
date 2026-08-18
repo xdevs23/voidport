@@ -4572,10 +4572,17 @@ a pending approval carrying a request ID; the operator approves
 it (`voidport-ctl auth approve --yes <request-id>`, or the TUI's
 approval dialog), and the server mints an ephemeral token with no
 expiry, valid for the rest of the server's lifetime, which both
-identifies and authenticates that client from then on. Open, to
-be settled with the remaining types: how a minted token behaves
-across fleet members, given that approval names one server while
-the fleet shape makes members interchangeable.
+identifies and authenticates that client from then on. Local-only
+transports keep the v1 trust model (decided 2026-08-18): a
+connection arriving over vsock, a unix socket, or loopback
+(127.0.0.*) requires no authentication regardless of the
+namespace's configured auth — the transport itself is the
+identity statement there, exactly as THREAT-MODEL.md records for
+v1 — and a namespace's auth requirement binds the non-local
+transports. Open, to be settled with the remaining types: how a
+minted token behaves across fleet members, given that approval
+names one server while the fleet shape makes members
+interchangeable.
 
 The design law above all for the kernel work (decided 2026-08-17;
 refined the same day): everything is designed robustly from the
