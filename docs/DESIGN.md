@@ -4662,7 +4662,55 @@ is removed outright the same day; no roadmap carries it.
   and two parity members, surviving any two member failures before
   data is lost. Members differ in protocol, latency and trust,
   which is what makes the composition layer an architecture design
-  of its own rehearsing nothing from single-backend v2.
+  of its own rehearsing nothing from single-backend v2. Its design
+  opens on the question the fleet principle cannot answer here:
+  parity stripes spanning several backends have no single backend
+  that owns their consistency, so this layer owns it — resync for
+  a rejoining member and intent journaling for partial-stripe
+  writes included.
+
+## v4 mandate — platforms, objects, blocks, caching (recorded 2026-08-18)
+
+Same sequencing law: v4 starts only when v3 is finished, by
+deliberate decision. Recorded early so the earlier phases keep
+their seams open.
+
+- **macOS.** voidport works on macOS. The wire is portable by
+  construction — explicit layout, explicit endianness — so the
+  platform-specific part is the mount machinery and the host I/O
+  layer; the client comes first, the server where its host
+  abstractions carry over, and the mount surface (macFUSE or the
+  platform's own filesystem extension API) is decided when the
+  item opens. The kernel module remains Linux. Obligation on
+  earlier work: platform specifics stay contained where they
+  already live, and nothing new grows Linux assumptions outside
+  those places.
+
+- **An S3 backend.** Object storage behind a namespace, through
+  the same pluggable-backend seam v2 builds and the same
+  capability-gap machinery v3's smb and nfs backends establish —
+  S3's capability set is narrower still (no rename atomicity, no
+  in-place partial write), which makes it the sharpest test that
+  machinery will face.
+
+- **Block devices as a resource kind.** A namespace's share can
+  contain a block device, exposed by the client as a real one —
+  in the kernel client, a node under /dev, mountable and usable
+  like any other. The source behind it is anything: a physical
+  device, a file on a filesystem, another backend. Obligation on
+  earlier work: the data plane must not assume file semantics are
+  the only semantics — block I/O is fixed-size, offset-addressed,
+  metadata-free — and the kernel client's provider boundary is
+  the natural attachment point for the device-shaped variant.
+
+- **A caching layer.** A hot tier that serves frequent reads and
+  absorbs dirty writes in front of slower backends. Absorbing
+  dirty writes means voidport temporarily owns durability — a
+  deliberate departure from writethrough coherence and from
+  coherence-owned-by-backends — so this item's design opens with
+  the durability contract: what survives a crash of the cache
+  holder, and what a client was promised the moment its write
+  returned.
 
 ## Roadmap
 
