@@ -56,11 +56,16 @@ const PATIENCE: Duration = Duration::from_secs(10);
 const PAGE: usize = 4096;
 
 /// Mount options with the metadata timeouts pinned, direct I/O as asked.
+///
+/// The chunk unit is the run's ([`support::write_stream_bytes`]): zero for
+/// every ordinary run, and whatever the run named for the pass that puts this
+/// suite through the write-streaming engine.
 fn options(direct_io: bool) -> MountOptions {
     MountOptions {
         attr_timeout: NEVER,
         entry_timeout: NEVER,
         direct_io,
+        write_stream: support::write_stream_bytes(),
         ..MountOptions::default()
     }
 }

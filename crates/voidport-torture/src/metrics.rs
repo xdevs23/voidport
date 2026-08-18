@@ -55,11 +55,15 @@ pub enum Class {
     /// Listener churn: data-plane listeners added and removed under load, with
     /// the sessions already on them proven to keep serving.
     Listeners,
+    /// Streamed-write storms: large writes through a mount that cuts each of
+    /// them into chunks and sends the chunks together, read back through the
+    /// same mount to prove a returned write is an answered write.
+    Stream,
 }
 
 impl Class {
     /// Every class, in the order a report lists them.
-    pub const ALL: [Self; 14] = [
+    pub const ALL: [Self; 15] = [
         Self::Walk,
         Self::List,
         Self::Churn,
@@ -74,6 +78,7 @@ impl Class {
         Self::Special,
         Self::Rules,
         Self::Listeners,
+        Self::Stream,
     ];
 
     /// The name the command line and the report spell it with.
@@ -94,6 +99,7 @@ impl Class {
             Self::Special => "special",
             Self::Rules => "rules",
             Self::Listeners => "listeners",
+            Self::Stream => "stream",
         }
     }
 
@@ -132,10 +138,14 @@ impl Class {
     /// allowed the most by far, because waiting for another owner to let go is
     /// the operation working correctly.
     ///
-    /// The four control classes are allowed what their operation contains: a
+    /// The control classes are allowed what their operation contains: a
     /// rule change is followed by a bounded poll for the policy to bind, a
     /// listener cycle by a handshake on a fresh endpoint, and a restart by a
-    /// whole stop, start and heal of every mount.
+    /// whole stop, start and heal of every mount. The streamed-write class is
+    /// allowed ten seconds, not the control classes' thirty: its steady
+    /// operation is one bounded write and read, so a stall must be visible at
+    /// the scale of the operation, while the allowance still covers the rare
+    /// operation that remounts against a server healing from a restart.
     #[must_use]
     pub fn latency_ceiling(self) -> Duration {
         Duration::from_millis(match self {
@@ -146,6 +156,7 @@ impl Class {
             | Self::Rename
             | Self::Contend
             | Self::Special => 5_000,
+            Self::Stream => 10_000,
             Self::Remount | Self::Rules | Self::Listeners => 30_000,
             Self::Locks => 60_000,
             Self::Restart => 120_000,

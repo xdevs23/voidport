@@ -114,6 +114,7 @@ use rustix::mount::UnmountFlags;
 
 use crate::client::{
     Client, ConnectError, DEFAULT_POOL_BYTES, DEFAULT_RECONNECT_STALL, Readahead, Resilience,
+    WriteStream,
 };
 use crate::fuse::{InFlight, VoidportFs};
 use crate::url::MountUrl;
@@ -142,6 +143,14 @@ pub const FSNAME: &str = "voidport";
 /// deployment whose per-operation cost is far lower than voidport's 75–95 µs,
 /// can reach the point where a single loop binds. Nothing here assumes one.
 pub const DEFAULT_DISPATCH_THREADS: NonZeroUsize = NonZeroUsize::new(1).expect("1 is not zero");
+
+/// The chunk unit a mount streams its writes in, by default.
+///
+/// **Zero: off.** The unit is an open number — the W2 measurement matrix has to
+/// show where cutting a request below the frame bound beats sending it as one
+/// frame, because the per-request cost is paid once per chunk — so until that
+/// is measured, no mount streams unless it was told to.
+pub const DEFAULT_WRITE_STREAM_BYTES: usize = 0;
 
 /// How long a signalled teardown gives the callbacks the kernel is owed.
 ///
@@ -262,6 +271,21 @@ pub struct MountOptions {
     /// kernel readahead in front of the wire. A page-cached mount is already
     /// served by the kernel's own readahead and the engine does not run there.
     pub readahead: usize,
+    /// The unit, in bytes, one guest write is cut into for streaming; zero
+    /// leaves every write on the v1 path.
+    ///
+    /// **Zero by default**, which is the whole engine off: the unit is a
+    /// measured number the W2 matrix has still to settle, and until it does,
+    /// a mount that does not ask for streaming writes exactly as it always
+    /// did. Setting it cuts a guest write into chunks of this size and sends
+    /// them together, bounded by a window that is sized here and fixed for the
+    /// mount's life; the write still returns only when every chunk has been
+    /// answered.
+    ///
+    /// Like [`readahead`](Self::readahead) it only matters where the
+    /// negotiated data caching is **direct**, and it never applies to an
+    /// appending, `O_SYNC`, `O_DSYNC` or guest-`O_DIRECT` handle.
+    pub write_stream: usize,
 }
 
 impl Default for MountOptions {
@@ -277,6 +301,7 @@ impl Default for MountOptions {
             direct_io: false,
             privileged_bits: true,
             readahead: DEFAULT_POOL_BYTES,
+            write_stream: DEFAULT_WRITE_STREAM_BYTES,
         }
     }
 }
@@ -406,6 +431,10 @@ pub struct Mount {
     /// adapter so that what it is holding can be asked about without going
     /// through the kernel.
     readahead: Arc<Readahead>,
+    /// The mount's write-streaming engine, held here as well as inside the
+    /// FUSE adapter for the same reason: what it has done can then be asked
+    /// about without going through the kernel.
+    write_stream: Arc<WriteStream>,
     /// The callbacks the kernel is owed a reply for, held here as well as
     /// inside the FUSE adapter because the teardown is what waits on them.
     inflight: Arc<InFlight>,
@@ -449,6 +478,10 @@ impl Mount {
         // is what keeps prefetching inside the coherence the mount already
         // promises.
         let readahead = Readahead::new(options.readahead, options.attr_timeout);
+        // Sized here and fixed for the mount's life, as the contract requires:
+        // the engine's window is derived from this unit and nothing renegotiates
+        // either of them afterwards.
+        let write_stream = WriteStream::new(options.write_stream);
         let inflight = Arc::<InFlight>::default();
         let filesystem = VoidportFs::new(
             Arc::clone(&client),
@@ -458,6 +491,7 @@ impl Mount {
             options.direct_io,
             crate::fuse::attr::Privileged::of(!options.privileged_bits),
             Arc::clone(&readahead),
+            Arc::clone(&write_stream),
             Arc::clone(&inflight),
         );
         let session = Session::new(filesystem, mountpoint, &options.config())
@@ -490,6 +524,7 @@ impl Mount {
             mountpoint: mountpoint.to_path_buf(),
             client,
             readahead,
+            write_stream,
             inflight,
             queue,
             session: Some(session),
@@ -518,6 +553,16 @@ impl Mount {
     #[must_use]
     pub fn readahead(&self) -> Arc<Readahead> {
         Arc::clone(&self.readahead)
+    }
+
+    /// The mount's write-streaming engine.
+    ///
+    /// Test support on the same terms as [`Mount::readahead`]: it is how a
+    /// suite asks how many chunks a write was cut into and how many are on the
+    /// wire, and it adds no control surface.
+    #[must_use]
+    pub fn write_stream(&self) -> Arc<WriteStream> {
+        Arc::clone(&self.write_stream)
     }
 
     /// Serves until the mountpoint is unmounted **or** this process is asked to

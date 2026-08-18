@@ -24,6 +24,15 @@
 //! never waits out a TCP retransmit timeout. The same shutdown is what makes a
 //! partly-written frame safe to re-send — the server never dispatches a frame
 //! it has not received whole, and the socket that held the fragment is gone.
+//!
+//! **The send path has two request classes** ([`SendPath`]): the request-side
+//! analog of the server's two reply classes. A streamed write's chunks are
+//! queued a window at a time, and on a link whose socket back-pressures the
+//! writer's own FIFO order would put a metadata request behind every chunk
+//! queued before it. The bulk class takes a single turn before it queues for
+//! the writer, so at most one chunk is ever waiting there: a request of the
+//! prompt class is passed by that one chunk at most, never by the window
+//! behind it.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -96,10 +105,10 @@ pub struct Connection {
     /// what tells a death observation whether it is describing the connection
     /// the mount currently holds or one already replaced.
     generation: u64,
-    /// The single serialization point: every frame is written while this is
-    /// held. Whether the connection is still usable is the death's business,
-    /// not this lock's.
-    writer: tokio::sync::Mutex<WriteHalf>,
+    /// The single serialization point, and the class rule in front of it:
+    /// every frame is written while it is held. Whether the connection is still
+    /// usable is the death's business, not this lock's.
+    send: SendPath<WriteHalf>,
     /// A duplicate of the socket descriptor, so the death path can shut the
     /// connection down without queueing behind an in-flight write.
     socket: OwnedFd,
@@ -146,6 +155,94 @@ pub enum Sent {
     /// down. The server never dispatches a frame it has not received whole, so
     /// this request provably did not take effect and may be sent as it is.
     Queued,
+}
+
+/// Which of the send path's two request classes a frame belongs to.
+///
+/// Internal scheduling only: not one byte of any frame changes with it, and the
+/// server cannot tell the classes apart.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Class {
+    /// Everything a guest is waiting on by itself — metadata, locks, reads, and
+    /// the writes of the serial path. It queues for the writer directly.
+    Prompt,
+    /// One chunk of a streamed write. Chunks are queued a window at a time, so
+    /// this is the class that yields.
+    Bulk,
+}
+
+/// The connection's single serialization point, with the class rule in front of
+/// it.
+///
+/// Every frame is written while the writer is held, so two frames never
+/// interleave on the socket. What the classes add is **who queues for it**. The
+/// writer is a fair FIFO, so without a rule a metadata request handed to a
+/// connection that already holds a window of queued chunks is written only
+/// after every one of them — on a link whose socket back-pressures, that is the
+/// whole window's transfer time. A bulk frame therefore takes a single turn
+/// before it queues for the writer, and holds the turn until its frame is
+/// written: at most one chunk is ever waiting at the writer, so a prompt frame
+/// is passed by that one chunk at most and by no part of the window behind it.
+///
+/// Bulk is not starved by the rule. The writer's queue is FIFO, so a chunk
+/// waiting in it is passed only by prompt frames that were already waiting,
+/// never by ones issued afterwards.
+#[derive(Debug)]
+struct SendPath<W> {
+    /// Held for the whole of one frame's write.
+    writer: tokio::sync::Mutex<W>,
+    /// The one turn a bulk frame takes before it may queue for the writer.
+    bulk: tokio::sync::Semaphore,
+}
+
+/// The serialization point, held for one frame.
+///
+/// **The field order is the release order**: fields are dropped in the order
+/// they are declared, so the writer is released before the turn. The chunk that
+/// takes the turn next therefore finds the writer free or a prompt frame
+/// already in front of it, never a second chunk queued at it.
+#[derive(Debug)]
+struct Sending<'a, W> {
+    writer: tokio::sync::MutexGuard<'a, W>,
+    _turn: Option<tokio::sync::SemaphorePermit<'a>>,
+}
+
+impl<W> SendPath<W> {
+    fn new(writer: W) -> Self {
+        Self {
+            writer: tokio::sync::Mutex::new(writer),
+            bulk: tokio::sync::Semaphore::new(1),
+        }
+    }
+
+    /// Takes the serialization point for one frame of `class`.
+    async fn take(&self, class: Class) -> Sending<'_, W> {
+        let turn = match class {
+            // A closed semaphore is unreachable — nothing ever closes this
+            // one — and a frame that could not take a turn is still a frame
+            // this connection owes the caller, so it queues without one.
+            Class::Bulk => self.bulk.acquire().await.ok(),
+            Class::Prompt => None,
+        };
+        Sending {
+            writer: self.writer.lock().await,
+            _turn: turn,
+        }
+    }
+}
+
+impl<W> std::ops::Deref for Sending<'_, W> {
+    type Target = W;
+
+    fn deref(&self) -> &W {
+        &self.writer
+    }
+}
+
+impl<W> std::ops::DerefMut for Sending<'_, W> {
+    fn deref_mut(&mut self) -> &mut W {
+        &mut self.writer
+    }
 }
 
 /// The buffered read half a connection's replies arrive on.
@@ -250,7 +347,7 @@ impl Connection {
         Ok(Established {
             connection: Self {
                 generation,
-                writer: tokio::sync::Mutex::new(writer),
+                send: SendPath::new(writer),
                 socket,
                 state: Mutex::new(State {
                     pending: HashMap::new(),
@@ -283,7 +380,7 @@ impl Connection {
         self.lock().death.clone()
     }
 
-    /// Sends one request and waits for its reply.
+    /// Sends one request of `class` and waits for its reply.
     ///
     /// `Ok(bytes)` is the reply frame. `Err(sent)` means the connection died
     /// first, and says how far the request got — which is exactly what the
@@ -293,11 +390,13 @@ impl Connection {
         request_id: u64,
         opcode: Opcode,
         frame: &[u8],
+        class: Class,
     ) -> Result<Vec<u8>, Sent> {
         let (sender, receiver) = oneshot::channel();
         let sent = self
             .transmit(
                 frame,
+                class,
                 Some((
                     request_id,
                     Waiter {
@@ -317,9 +416,10 @@ impl Connection {
     /// Sends one request that has no reply.
     ///
     /// Its id retires the moment the frame reaches the transport, so it is
-    /// never registered as outstanding.
+    /// never registered as outstanding. Nothing sent this way carries bulk
+    /// payload — a `forget` is a request head and no more — so it is prompt.
     pub async fn send(&self, frame: &[u8]) -> Sent {
-        self.transmit(frame, None).await
+        self.transmit(frame, Class::Prompt, None).await
     }
 
     /// Writes one frame, registering its waiter first.
@@ -333,8 +433,11 @@ impl Connection {
     /// failed part-way — is [`Sent::Queued`], because the death path shuts the
     /// socket down and the server never dispatches a frame it did not receive
     /// whole.
-    async fn transmit(&self, frame: &[u8], waiter: Option<(u64, Waiter)>) -> Sent {
-        let mut stream = self.writer.lock().await;
+    ///
+    /// `class` decides only how this frame queues for the serialization point
+    /// ([`SendPath`]); every frame is written the same way once it holds it.
+    async fn transmit(&self, frame: &[u8], class: Class, waiter: Option<(u64, Waiter)>) -> Sent {
+        let mut stream = self.send.take(class).await;
         {
             let mut state = self.lock();
             if state.death.is_some() {
@@ -753,5 +856,91 @@ mod tests {
             read_frame(&mut stream, FRAME_HEADER_LEN as u32).await,
             Err(ReadError::Fault(Fault::Framing(_))),
         ));
+    }
+
+    /// How long a class-rule assertion gives a task to reach its wait.
+    const SETTLE: std::time::Duration = std::time::Duration::from_millis(50);
+
+    /// The bulk class queues one frame at a time at the writer, and the prompt
+    /// class never waits for the bulk turn at all.
+    #[tokio::test]
+    async fn a_bulk_frame_takes_the_turn_and_a_prompt_frame_takes_none() {
+        let path = SendPath::new(());
+        let turn = path.bulk.acquire().await.expect("the turn");
+
+        // The writer is free, so a prompt frame is served whatever the bulk
+        // class is holding.
+        drop(
+            tokio::time::timeout(SETTLE, path.take(Class::Prompt))
+                .await
+                .expect("a prompt frame waits for no turn"),
+        );
+        assert!(
+            tokio::time::timeout(SETTLE, path.take(Class::Bulk))
+                .await
+                .is_err(),
+            "a second chunk waits for the turn instead of queueing at the writer"
+        );
+
+        drop(turn);
+        drop(
+            tokio::time::timeout(SETTLE, path.take(Class::Bulk))
+                .await
+                .expect("the turn is free"),
+        );
+    }
+
+    /// The rule itself: a prompt frame issued behind a window of chunks is
+    /// written after the one chunk on the socket, not after the window.
+    ///
+    /// Without the class rule all five frames below would queue at the writer,
+    /// whose order is a fair FIFO, and the prompt frame would be written last.
+    #[tokio::test]
+    async fn a_prompt_frame_is_written_ahead_of_a_window_of_queued_chunks() {
+        const CHUNKS: usize = 4;
+
+        let path = std::sync::Arc::new(SendPath::new(()));
+        let written = std::sync::Arc::new(Mutex::new(Vec::new()));
+        // The frame on the socket: it holds the writer, so everything issued
+        // below queues.
+        let sending = path.take(Class::Bulk).await;
+
+        let mut window = Vec::new();
+        for _ in 0..CHUNKS {
+            let (path, written) = (path.clone(), written.clone());
+            window.push(tokio::spawn(async move {
+                let _sending = path.take(Class::Bulk).await;
+                written
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push("chunk");
+            }));
+        }
+        tokio::time::sleep(SETTLE).await;
+
+        let prompt = {
+            let (path, written) = (path.clone(), written.clone());
+            tokio::spawn(async move {
+                let _sending = path.take(Class::Prompt).await;
+                written
+                    .lock()
+                    .unwrap_or_else(|poison| poison.into_inner())
+                    .push("metadata");
+            })
+        };
+        tokio::time::sleep(SETTLE).await;
+
+        drop(sending);
+        prompt.await.expect("the metadata request is written");
+        for chunk in window {
+            chunk.await.expect("every chunk is written");
+        }
+        let written = written.lock().unwrap_or_else(|poison| poison.into_inner());
+        assert_eq!(
+            written.first().copied(),
+            Some("metadata"),
+            "the metadata request passed the whole window: {written:?}"
+        );
+        assert_eq!(written.len(), CHUNKS + 1);
     }
 }

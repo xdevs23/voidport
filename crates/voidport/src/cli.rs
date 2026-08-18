@@ -34,6 +34,13 @@ pub const DEFAULT_RECONNECT_STALL_SECONDS: f64 = 5.0;
 /// command line takes it in; restated for the reason in the module docs.
 pub const DEFAULT_READAHEAD_MIB: u64 = 256;
 
+/// The chunk unit a mount streams its writes in, in KiB.
+///
+/// The same value as `voidport::mount::DEFAULT_WRITE_STREAM_BYTES`, in the unit
+/// the command line takes it in; restated for the reason in the module docs.
+/// Zero is the engine off.
+pub const DEFAULT_WRITE_STREAM_KIB: u64 = 0;
+
 /// The voidport guest client: mounts a namespace over FUSE.
 #[derive(Debug, Parser)]
 #[command(name = "voidport", version, about)]
@@ -111,6 +118,17 @@ pub enum Command {
         /// never staler.
         #[arg(long, value_name = "MIB", default_value_t = DEFAULT_READAHEAD_MIB)]
         readahead: u64,
+        /// Cut each guest write into chunks of this many KiB and send them to
+        /// the server together, so the round trips inside one write overlap
+        /// instead of following one another. Zero, the default, sends each
+        /// write as it arrived. A write still returns only once every chunk of
+        /// it has been answered, so nothing is acknowledged before the server
+        /// has it; what changes is that a write which fails partway leaves
+        /// some subset of its chunks applied instead of a prefix. It applies
+        /// only under --direct-io, and never to appending, O_SYNC, O_DSYNC or
+        /// O_DIRECT handles, which keep sending one chunk at a time.
+        #[arg(long, value_name = "KIB", default_value_t = DEFAULT_WRITE_STREAM_KIB)]
+        write_stream: u64,
     },
     /// Unmount a voidport mountpoint. A busy mountpoint stays mounted.
     Umount {

@@ -73,11 +73,18 @@ const MIN_SPEEDUP: f64 = 1.5;
 const FILL: u8 = b'w';
 
 /// A direct mount: the only mode that announces the capability.
+///
+/// The chunk unit is the run's ([`support::write_stream_bytes`]): zero for
+/// every ordinary run, and whatever the run named for the pass that puts this
+/// suite through the write-streaming engine — where the census assertions
+/// below say something extra, since streaming is below the syscall and must
+/// leave what the guest kernel has in flight exactly as it was.
 fn direct() -> MountOptions {
     MountOptions {
         attr_timeout: NEVER,
         entry_timeout: NEVER,
         direct_io: true,
+        write_stream: support::write_stream_bytes(),
         ..MountOptions::default()
     }
 }

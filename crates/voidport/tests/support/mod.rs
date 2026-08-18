@@ -189,9 +189,21 @@ impl Fixture {
     /// an operator would write it, not inside the last listener's table.
     #[must_use]
     pub fn start_with(label: &str, extra: &str) -> Self {
+        Self::start_over(label, extra, None)
+    }
+
+    /// The same, with one more namespace — `image` — grafting `graft` at
+    /// `/fs`.
+    ///
+    /// It is how a suite puts a **host filesystem of its own choosing** behind
+    /// a mount: the fixture's own tree lives on whatever the scratch root is,
+    /// and an assertion about a filesystem's behaviour has to name the
+    /// filesystem it is about.
+    #[must_use]
+    pub fn start_over(label: &str, extra: &str, graft: Option<&Path>) -> Self {
         let directory = TempDir::new(label);
         build_tree(directory.path());
-        let state = state_file(directory.path(), extra);
+        let state = state_file(directory.path(), extra, graft);
         let state_file = directory.write("state.toml", &state);
 
         // The real invoking identity, not a pinned one: the ownership
@@ -348,6 +360,13 @@ impl Guest {
         self.mount.readahead()
     }
 
+    /// The mount's write-streaming engine, for asking how a write was cut and
+    /// what of it is on the wire.
+    #[must_use]
+    pub fn write_stream(&self) -> std::sync::Arc<voidport::client::WriteStream> {
+        self.mount.write_stream()
+    }
+
     /// Unmounts, reporting what the kernel said, with no allowance made.
     ///
     /// # Errors
@@ -491,8 +510,22 @@ fn make(path: &Path, kind: Kind, mode: u32) {
 }
 
 /// The state file, with the fixture's absolute paths and listeners.
-fn state_file(root: &Path, extra: &str) -> String {
+fn state_file(root: &Path, extra: &str, graft: Option<&Path>) -> String {
     let socket = root.join("data.sock");
+    let image = graft.map_or_else(String::new, |target| {
+        format!(
+            r#"
+[[namespaces]]
+name = "image"
+
+[[namespaces.rules]]
+path = "/fs"
+mode = "rw"
+target = "{target}"
+"#,
+            target = target.display(),
+        )
+    });
     format!(
         r#"
 [server]
@@ -561,7 +594,7 @@ target = "tree"
 path = "/readonly"
 mode = "ro"
 target = "tree"
-"#,
+{image}"#,
         socket = socket.display(),
     )
 }
@@ -614,4 +647,26 @@ pub fn eventually(patience: Duration, mut condition: impl FnMut() -> bool) -> bo
 #[must_use]
 pub fn errno(error: &io::Error) -> i32 {
     error.raw_os_error().unwrap_or_default()
+}
+
+/// The chunk unit the suites' direct mounts cut their writes into.
+///
+/// **Zero** — the product's own default, and the posture every ordinary run
+/// takes — unless the run names one:
+///
+/// ```console
+/// $ VOIDPORT_TEST_WRITE_STREAM_KIB=128 cargo test -p voidport
+/// ```
+///
+/// puts the write-path suites through the streaming engine instead. That is how
+/// the engine is held to the v1 suite's own assertions — the same files, the
+/// same mounts, the same bytes — without a second copy of that suite drifting
+/// away from the first. Only the direct mounts consult it, because a
+/// page-cached mount's writes never reach the engine.
+#[must_use]
+pub fn write_stream_bytes() -> usize {
+    std::env::var("VOIDPORT_TEST_WRITE_STREAM_KIB")
+        .ok()
+        .and_then(|kib| kib.parse::<usize>().ok())
+        .map_or(0, |kib| kib.saturating_mul(1024))
 }

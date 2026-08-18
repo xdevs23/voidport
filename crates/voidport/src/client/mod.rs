@@ -66,9 +66,11 @@ mod connection;
 mod ops;
 mod readahead;
 mod transport;
+mod writestream;
 
 pub use ops::{AttrChange, Lock, LockKind, TimeChange, XattrNames, XattrValue};
 pub use readahead::{CHUNK_BYTES, DEFAULT_POOL_BYTES, ReadData, Readahead, ReadaheadStats};
+pub use writestream::{CHUNKS_PER_HANDLE, WriteStream, WriteStreamStats};
 
 use std::fmt;
 use std::io;
@@ -88,7 +90,7 @@ use voidport_proto::message::{
 use voidport_proto::opcode::Opcode;
 
 use crate::url::Endpoint;
-use connection::{Connection, Established, Sent, encode, read_replies};
+use connection::{Class, Connection, Established, Sent, encode, read_replies};
 pub use connection::{MIN_MAX_FRAME_LEN, ROOT_NODE_ID};
 
 /// How long the mount stalls before it starts answering `EIO`.
@@ -735,6 +737,14 @@ impl Client {
     /// Sends one request and returns its reply, replaying per the discipline.
     ///
     /// `Ok(None)` is the moot answer, and only [`Replay::Moot`] can produce it.
+    ///
+    /// `class` says how the frame queues for the connection's serialization
+    /// point, and nothing else: it survives a replay unchanged, because a
+    /// re-sent chunk is still a chunk.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one wire request, described by the fields the frame carries"
+    )]
     async fn exchange<Q: RequestBody>(
         &self,
         caller: Caller,
@@ -743,6 +753,7 @@ impl Client {
         payload: &[u8],
         opcode: Opcode,
         replay: Replay,
+        class: Class,
     ) -> Result<Option<(Arc<Connection>, Vec<u8>)>, Errno> {
         // A request is *retained* across the gap once it has waited on one: it
         // was accepted under the frame bound of a connection that no longer
@@ -771,7 +782,7 @@ impl Client {
                 // the gap it could not be carried across.
                 Err(error) => return Err(unencodable(error, retained)),
             };
-            match connection.call(request_id, opcode, &frame).await {
+            match connection.call(request_id, opcode, &frame, class).await {
                 Ok(bytes) => return Ok(Some((connection, bytes))),
                 Err(sent) => {
                     self.lost(&connection);
@@ -786,6 +797,10 @@ impl Client {
     }
 
     /// Sends one request and waits for its reply.
+    ///
+    /// Every request that reaches here is of the send path's prompt class. Only
+    /// a streamed write's chunks are bulk, and they take
+    /// [`Self::call_on`](Self::call_on) with the class themselves.
     ///
     /// # Errors
     ///
@@ -805,9 +820,17 @@ impl Client {
         Q: RequestBody,
         R: ResponseBody,
     {
-        self.call_on::<Q, R, T>(caller, node_id, body, payload, replay, extract)
-            .await
-            .map(|(value, _)| value)
+        self.call_on::<Q, R, T>(
+            caller,
+            node_id,
+            body,
+            payload,
+            replay,
+            Class::Prompt,
+            extract,
+        )
+        .await
+        .map(|(value, _)| value)
     }
 
     /// The same, reporting which connection answered.
@@ -826,6 +849,10 @@ impl Client {
     /// # Errors
     ///
     /// As [`Self::call`].
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "one wire request, described by the fields the frame carries"
+    )]
     async fn call_on<Q, R, T>(
         &self,
         caller: Caller,
@@ -833,6 +860,7 @@ impl Client {
         body: &Q,
         payload: &[u8],
         replay: Replay,
+        class: Class,
         extract: impl FnOnce(&R, &[u8]) -> Result<T, FramingError>,
     ) -> Result<(T, u64), Errno>
     where
@@ -840,7 +868,7 @@ impl Client {
         R: ResponseBody,
     {
         let answered = self
-            .exchange(caller, node_id, body, payload, R::OPCODE, replay)
+            .exchange(caller, node_id, body, payload, R::OPCODE, replay, class)
             .await?;
         // Only `Replay::Moot` answers without a reply, and it takes
         // `call_moot`; a caller here that somehow reaches this arm has lost its
@@ -881,7 +909,15 @@ impl Client {
             return Ok(());
         }
         match self
-            .exchange(caller, node_id, body, payload, R::OPCODE, Replay::Moot)
+            .exchange(
+                caller,
+                node_id,
+                body,
+                payload,
+                R::OPCODE,
+                Replay::Moot,
+                Class::Prompt,
+            )
             .await?
         {
             Some((connection, bytes)) => interpret::<R, ()>(&connection, &bytes, |_, _| Ok(())),

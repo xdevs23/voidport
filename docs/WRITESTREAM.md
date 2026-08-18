@@ -106,9 +106,16 @@ no future home claimed for it.
   renegotiates downward mid-write, unsent chunks re-slice at the
   new bound, as the shipped client already does per attempt.
 - **The window.** In-flight chunks are bounded in count and
-  bytes, per handle and per mount, with a per-handle minimum
-  reservation so one large write cannot starve another handle's
-  progress. Both levels are sized at mount and fixed thereafter,
+  bytes, per handle and per mount — the byte level held by
+  construction, not by a second counter (stated 2026-08-18):
+  every chunk is cut at or below the fixed unit, so the count
+  bound times the unit is the byte bound, and a live byte counter
+  could never fire. The reservation is one mount slot only a
+  handle's first chunk may take (restated 2026-08-18 to the built
+  shape, same effect as first worded), so a saturated window
+  always has room for another handle's progress and one large
+  write cannot starve it. Both levels are sized at mount and
+  fixed thereafter,
   the retention they imply is the window itself — fixed-capacity,
   allocation-free steady state, no overflow class, satisfying the
   kernel core's constraints by construction and sized within the
@@ -117,7 +124,11 @@ no future home claimed for it.
   shared budget — readahead's chunks, metadata traffic and write
   chunks all draw on it — so the write window's default leaves
   the other classes their measured shares (provisionally eight
-  chunks per handle and thirty-two per mount, W2 replacing both),
+  chunks per handle and thirty-two per mount, W2 replacing both;
+  disposition 2026-08-18: the count depths ship as build
+  constants until W2's measurements pick the defaults, and the
+  operator-facing surface for them arrives with those numbers —
+  the byte level's mount option ships in W1),
   and a window that met the ceiling would stall the connection's
   read loop for everyone. The operator's existing per-session
   in-flight override is the WAN dial; the mount's window option
@@ -126,11 +137,17 @@ no future home claimed for it.
   and this contract adds no wire surface. A full window
   backpressures the writer; it never errors.
 - **The send path.** Chunks are independent requests, so the
-  client's single serialization point releases between frames,
-  and the send queue this engine introduces admits pending
-  non-write requests ahead of queued chunks — the
-  request-direction analog of the server's two reply classes, so
-  a metadata request never waits behind a window of bulk frames.
+  client's single serialization point releases between frames.
+  The rule that keeps metadata prompt lives at that serialization
+  point (restated 2026-08-18 to the shape actually built, same
+  effect as first worded): frames carry one of two classes, a
+  bulk-class frame takes a single turn before it may queue for
+  the writer and holds it until its frame is written, so at most
+  one chunk ever waits at the writer and a prompt-class request
+  is passed by that one chunk at most, never by the window behind
+  it — the request-direction analog of the server's two reply
+  classes. Bulk is not starved: the writer is fair, so a waiting
+  chunk is passed only by prompt frames already waiting.
   One ordering assumption is stated the way the fsync one is:
   a release, flush or forget naming the same handle or node
   cannot be issued while the write is in flight, because the
@@ -147,7 +164,14 @@ no future home claimed for it.
   makes is therefore the failure-time file state — a byte-range
   subset instead of a prefix — confined to writes that fail
   partway, absent entirely on the success path, and priced
-  against the serial alternative in W2. A chunk answered short
+  against the serial alternative in W2. One further answer state
+  is named for completeness (added 2026-08-18): a chunk answered
+  zero bytes without an error ends the write as a short success
+  at the answered prefix, exactly as the serial loop breaks on a
+  zero answer, and chunks at higher offsets may already have
+  applied — the byte-range-subset state on a nominally successful
+  return, practically unreachable for a regular-file write and
+  recorded so the wording claims nothing it cannot hold. A chunk answered short
   while the write is otherwise healthy resumes from the answered
   byte with a follow-up chunk; once any chunk has failed, no
   resume is attempted. Unsent chunks are abandoned; in-flight

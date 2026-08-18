@@ -68,6 +68,7 @@ fn run(arguments: Cli) -> Result<()> {
             direct_io,
             no_privileged_bits,
             readahead,
+            write_stream,
         } => {
             let parsed = MountUrl::parse(&url).with_context(|| format!("cannot mount {url}"))?;
             let options = MountOptions {
@@ -81,6 +82,7 @@ fn run(arguments: Cli) -> Result<()> {
                 direct_io,
                 privileged_bits: !no_privileged_bits,
                 readahead: mebibytes(readahead),
+                write_stream: kibibytes(write_stream),
             };
             let mount = Mount::new(&parsed, &mountpoint, &options)
                 .with_context(|| format!("cannot mount {url}"))?;
@@ -154,6 +156,12 @@ fn mebibytes(value: u64) -> usize {
     usize::try_from(value.saturating_mul(1024 * 1024)).unwrap_or(usize::MAX)
 }
 
+/// A count of kibibytes as a count of bytes, saturating for the same reason
+/// [`mebibytes`] does.
+fn kibibytes(value: u64) -> usize {
+    usize::try_from(value.saturating_mul(1024)).unwrap_or(usize::MAX)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -179,6 +187,13 @@ mod tests {
             mebibytes(cli::DEFAULT_READAHEAD_MIB),
             voidport::client::DEFAULT_POOL_BYTES
         );
+        assert_eq!(
+            kibibytes(cli::DEFAULT_WRITE_STREAM_KIB),
+            voidport::mount::DEFAULT_WRITE_STREAM_BYTES
+        );
+        // And that default is off, which is what "streaming ships off until it
+        // is measured" means where an operator meets it.
+        assert_eq!(voidport::mount::DEFAULT_WRITE_STREAM_BYTES, 0);
     }
 
     #[test]

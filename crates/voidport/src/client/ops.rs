@@ -49,7 +49,7 @@ use voidport_proto::ops::xattr::{
 };
 use zerocopy::byteorder::little_endian::{U32, U64};
 
-use super::{Caller, Client, DirEntry, Entry, Replay};
+use super::{Caller, Class, Client, DirEntry, Entry, Replay};
 
 /// A time a `setattr` sets.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -627,6 +627,66 @@ impl Client {
         data: &[u8],
         strip_privileged: bool,
     ) -> Result<u32, Errno> {
+        self.write_framed(
+            Class::Prompt,
+            caller,
+            node_id,
+            handle,
+            offset,
+            data,
+            strip_privileged,
+        )
+        .await
+    }
+
+    /// Writes one chunk of a streamed write.
+    ///
+    /// The same request as [`Self::write`] in every wire byte — the server
+    /// cannot tell the two apart, and no clause of the contract distinguishes
+    /// them. What differs is the send path's class: a window of chunks is
+    /// queued at once, so a chunk is **bulk** and queues one at a time at the
+    /// connection's serialization point, which is what admits a pending
+    /// metadata request ahead of the rest of the window.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::write`].
+    pub async fn write_streamed(
+        &self,
+        caller: Caller,
+        node_id: u64,
+        handle: u64,
+        offset: u64,
+        data: &[u8],
+        strip_privileged: bool,
+    ) -> Result<u32, Errno> {
+        self.write_framed(
+            Class::Bulk,
+            caller,
+            node_id,
+            handle,
+            offset,
+            data,
+            strip_privileged,
+        )
+        .await
+    }
+
+    /// The one write request both entry points send, in the class each names.
+    #[allow(
+        clippy::too_many_arguments,
+        reason = "the wire request's own fields, and the class that carries it"
+    )]
+    async fn write_framed(
+        &self,
+        class: Class,
+        caller: Caller,
+        node_id: u64,
+        handle: u64,
+        offset: u64,
+        data: &[u8],
+        strip_privileged: bool,
+    ) -> Result<u32, Errno> {
         let body = WriteRequest {
             handle: U64::new(handle),
             offset: U64::new(offset),
@@ -639,10 +699,17 @@ impl Client {
             }),
             reserved: U32::ZERO,
         };
-        self.call::<_, WriteResponse, _>(caller, node_id, &body, data, Replay::Once, |body, _| {
-            Ok(body.written.get())
-        })
+        self.call_on::<_, WriteResponse, _>(
+            caller,
+            node_id,
+            &body,
+            data,
+            Replay::Once,
+            class,
+            |body, _| Ok(body.written.get()),
+        )
         .await
+        .map(|(written, _)| written)
     }
 
     /// Releases a handle.
@@ -1015,6 +1082,7 @@ impl Client {
             &body,
             &[],
             Replay::Idempotent,
+            Class::Prompt,
             |_, _| Ok(()),
         )
         .await

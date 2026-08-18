@@ -54,6 +54,11 @@ fn direct(readahead: usize, attr_timeout: Duration) -> MountOptions {
         entry_timeout: attr_timeout,
         direct_io: true,
         readahead,
+        // The run's chunk unit ([`support::write_stream_bytes`]): zero
+        // ordinarily, and set for the pass that streams this suite's writes —
+        // where the invalidation bracket has to hold around a whole write's
+        // chunks, which is what this suite is watching.
+        write_stream: support::write_stream_bytes(),
         ..MountOptions::default()
     }
 }

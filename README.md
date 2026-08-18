@@ -223,6 +223,16 @@ and restores strictly wire-immediate reads. It does nothing without
 `--direct-io`: a page-cached mount is already served by the guest kernel's own
 readahead.
 
+`--write-stream` (KiB, default 0 = off) turns on the write-streaming engine:
+a write larger than the given chunk unit is cut into chunks that fly
+concurrently under a bounded window, and the syscall still returns only when
+every chunk is answered — durability, barriers and error delivery are exactly
+the serial path's. What it buys is the round trips: the chunks of one write
+overlap instead of queueing one behind another. A metadata request is never
+made to wait behind a window of chunks, and a mount that leaves the flag at
+zero keeps the serial write path byte for byte. The numbers that pick a good
+unit are measured in the next phase; until then the flag ships off.
+
 ### Following what a namespace shares
 
 A guest that wants to mount directories as the operator adds them cannot work

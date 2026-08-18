@@ -17,10 +17,11 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, Read as _, Seek as _, SeekFrom, Write as _};
 use std::net::{SocketAddr, TcpListener};
-use std::os::unix::fs::MetadataExt as _;
+use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
+use voidport::mount::MountOptions;
 use voidport::url::{Endpoint, MountUrl};
 use voidport_control::{
     Client, ErrorCode, Listener, NamespaceName, Reply, Request, Response, Rule, ShareMode,
@@ -38,6 +39,21 @@ const APPEND_RECORD: usize = 128;
 
 /// The block a churn or contention worker writes.
 const BLOCK: usize = 4096;
+
+/// The block a streamed-write worker writes and reads back in one operation.
+///
+/// Several chunk units, so every operation of the class really is a window of
+/// chunks on the wire and not a single one wearing the name.
+const STREAM_BLOCK: usize = 512 * 1024;
+
+/// The chunk unit the streamed-write class mounts with.
+///
+/// The readahead engine's measured chunk, which is the nearest measured number
+/// this client has until the write matrix sets its own.
+const STREAM_UNIT: usize = 128 * 1024;
+
+/// How many blocks a streamed-write worker cycles its file through.
+const STREAM_BLOCKS: u64 = 4;
 
 /// How many owners one lock-storm worker stacks on the shared file.
 ///
@@ -217,8 +233,23 @@ pub enum State {
     /// removed. A cycle the server died in the middle of leaves one, and the
     /// next cycle takes it out.
     Listeners(Vec<String>),
+    /// The streamed-write arm's own mount, and where it is writing next.
+    Stream(Box<Streaming>),
     /// Nothing to carry.
     Empty,
+}
+
+/// One streamed-write worker's mount and its place in the file.
+///
+/// The mount is the worker's own because the engine runs in one posture only —
+/// direct data caching, with a chunk unit — and the run's own mounts carry the
+/// defaults. It is made on the first operation and kept for the rest of the
+/// run, and it is let go whenever an operation fails, so the next one works
+/// through a mount that was made against whatever server is there now.
+#[derive(Debug, Default)]
+pub struct Streaming {
+    mount: Option<TortureMount>,
+    counter: u64,
 }
 
 impl State {
@@ -236,6 +267,7 @@ impl State {
             | Class::Special
             | Class::Rules => Self::Counter(0),
             Class::Listeners => Self::Listeners(Vec::new()),
+            Class::Stream => Self::Stream(Box::default()),
             Class::Restart => Self::Restarts {
                 due: None,
                 performed: 0,
@@ -472,6 +504,7 @@ pub fn step(class: Class, site: &Site<'_>, state: &mut State) -> io::Result<()> 
         Class::Special => special(site, state),
         Class::Rules => rules(site, state),
         Class::Listeners => listeners(site, state),
+        Class::Stream => streamed_write(site, state),
     }
 }
 
@@ -867,6 +900,105 @@ fn contend(site: &Site<'_>, state: &mut State) -> io::Result<()> {
     let mut block = vec![0u8; BLOCK];
     file.read_exact(&mut block)?;
     fs::metadata(&theirs)?;
+    Ok(())
+}
+
+/// The mount the streamed-write class works through.
+///
+/// Direct data caching, because that is the only mode the engine runs in, and a
+/// chunk unit below the frame bound, because a mount without one streams
+/// nothing. Everything else is what every other mount in the run carries.
+fn streamed_mount() -> MountOptions {
+    MountOptions {
+        direct_io: true,
+        write_stream: STREAM_UNIT,
+        ..MountOptions::default()
+    }
+}
+
+/// One large write through a streaming mount, read back through the same
+/// mount.
+///
+/// The read is the assertion, and it is made with nothing flushed and nothing
+/// synced: the write returned, so every chunk of it was answered, so the bytes
+/// are the server's — and on a direct mount the read that fetches them crosses
+/// the wire instead of a cache that could be agreeing with the writer. It also
+/// puts the invalidation bracket under the whole harness's load, which is where
+/// a bracket taken per chunk instead of per write would show.
+fn streamed_write(site: &Site<'_>, state: &mut State) -> io::Result<()> {
+    let State::Stream(streaming) = state else {
+        unreachable!("a streamed-write worker carries its own mount");
+    };
+    if streaming.mount.is_none() {
+        streaming.mount = Some(
+            site.fleet
+                .mount_with(
+                    &format!("stream-{}", site.index),
+                    site.url(),
+                    &streamed_mount(),
+                )
+                .map_err(io::Error::other)?,
+        );
+    }
+    let outcome = one_streamed_write(site, streaming);
+    if let Err(error) = &outcome {
+        // A mount is let go only on the errnos that say the mount itself may
+        // be gone, exactly as a lock-storm worker lets go of its session. The
+        // errnos the harness calls the filesystem working under concurrent
+        // load — a name already unlinked, a thing already there, a mountpoint
+        // busy — keep the mount: churning a whole FUSE mount per benign errno
+        // would spend the class's time on mounts instead of writes.
+        let benign = [
+            rustix::io::Errno::NOENT,
+            rustix::io::Errno::EXIST,
+            rustix::io::Errno::BUSY,
+        ]
+        .iter()
+        .any(|errno| error.raw_os_error() == Some(errno.raw_os_error()));
+        if !benign {
+            streaming.mount = None;
+        }
+    }
+    outcome
+}
+
+/// The operation itself, once the worker has a mount.
+fn one_streamed_write(site: &Site<'_>, streaming: &mut Streaming) -> io::Result<()> {
+    let root = streaming
+        .mount
+        .as_ref()
+        .ok_or_else(|| io::Error::other("this worker has no mount"))?
+        .root()
+        .to_path_buf();
+    let scratch = root.join(site.scratch_name(Class::Stream));
+    fs::create_dir_all(&scratch)?;
+    streaming.counter = streaming.counter.wrapping_add(1);
+    let counter = streaming.counter;
+
+    // Bytes whose value depends on where they are and on which round wrote
+    // them, so a chunk placed at the wrong offset — or a stale one served
+    // back — fails the comparison instead of looking plausible.
+    let block: Vec<u8> = (0..STREAM_BLOCK)
+        .map(|at| ((at + counter as usize) % 251 + 1) as u8)
+        .collect();
+    let offset = (counter % STREAM_BLOCKS) * STREAM_BLOCK as u64;
+    let path = scratch.join("streamed.bin");
+
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&path)?;
+    file.write_all_at(&block, offset)?;
+    let mut read = vec![0u8; STREAM_BLOCK];
+    file.read_exact_at(&mut read, offset)?;
+    if read != block {
+        return Err(io::Error::other(format!(
+            "{} read back differently at {offset} right after the write returned",
+            path.display()
+        )));
+    }
     Ok(())
 }
 

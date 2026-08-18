@@ -61,7 +61,7 @@ use fuser::{
 use voidport_proto::ops::dir::rename_flags;
 use voidport_proto::ops::xattr::setxattr_flags;
 
-use crate::client::{AttrChange, Caller, Client, Lock, LockKind, Readahead};
+use crate::client::{AttrChange, Caller, Client, Lock, LockKind, Readahead, WriteStream};
 use crate::fuse::attr::{
     PRIVILEGED_MASK, Privileged, entry_attr, node_attr, time_change, timespec,
 };
@@ -272,6 +272,13 @@ pub struct VoidportFs {
     /// that is the mode with no kernel readahead in front of it. Shared for the
     /// same reason the directories are, and mutated only through its own lock.
     readahead: Arc<Readahead>,
+    /// The mount's write-streaming engine.
+    ///
+    /// Dormant on the same answer the readahead engine keys on, and for the
+    /// same reason: a page-cached mount's writes go through the guest page
+    /// cache and keep the v1 path. A mount that named no chunk unit leaves it
+    /// off whatever the handshake settled.
+    write_stream: Arc<WriteStream>,
     /// The callbacks this adapter has taken and not yet replied to. Held here
     /// as well as by the mount, which is what waits on it when it tears down.
     inflight: Arc<InFlight>,
@@ -283,9 +290,10 @@ impl VoidportFs {
     /// `direct_io` is a *request*: whether it is honoured is decided in `init`,
     /// against the kernel's capabilities, and until then the mount caches the
     /// way every mount always has. `readahead` is the mount's prefetch engine,
-    /// which `init` activates on the same answer. `inflight` is where the
-    /// callbacks the kernel is owed a reply for are counted, for the teardown
-    /// that has to wait them out.
+    /// which `init` activates on the same answer. `write_stream` is the mount's
+    /// write-streaming engine, activated on that same answer. `inflight` is
+    /// where the callbacks the kernel is owed a reply for are counted, for the
+    /// teardown that has to wait them out.
     #[must_use]
     #[allow(
         clippy::too_many_arguments,
@@ -299,6 +307,7 @@ impl VoidportFs {
         direct_io: bool,
         privileged: Privileged,
         readahead: Arc<Readahead>,
+        write_stream: Arc<WriteStream>,
         inflight: Arc<InFlight>,
     ) -> Self {
         Self {
@@ -311,6 +320,7 @@ impl VoidportFs {
             caching: DataCaching::Page,
             directories: Arc::default(),
             readahead,
+            write_stream,
             inflight,
         }
     }
@@ -389,6 +399,11 @@ impl fuser::Filesystem for VoidportFs {
         // the flag and falls back to page caching, and prefetching underneath
         // the kernel's own readahead would buffer the same bytes twice.
         self.readahead.activate(self.caching == DataCaching::Direct);
+        // The write-streaming engine keys on the resolved mode for the reason
+        // its own scope states: a page-cached mount's writes are the guest page
+        // cache's, and this client's write path there stays what it was.
+        self.write_stream
+            .activate(self.caching == DataCaching::Direct);
 
         // A write has to fit one frame, so the kernel is told how much it may
         // send before it sends it.
@@ -736,7 +751,16 @@ impl fuser::Filesystem for VoidportFs {
         });
     }
 
-    /// Writes, looping until the whole buffer is placed.
+    /// Writes, looping until the whole buffer is placed — or, where the mount
+    /// enabled write streaming, sending the buffer's chunks together and
+    /// returning when every one of them has been answered.
+    ///
+    /// The streamed path is taken only for a write the engine
+    /// [serves](crate::client::WriteStream::serves): the mount named a chunk
+    /// unit, the handshake settled on direct data caching, and the handle is
+    /// none of the excluded kinds — which is why the kernel's own open flags
+    /// are read here and not ignored. Everything else takes the loop below,
+    /// unchanged.
     ///
     /// The kernel is told a maximum write that fits one frame, so this is one
     /// round trip in practice; a short host write is still finished here, not
@@ -773,7 +797,7 @@ impl fuser::Filesystem for VoidportFs {
         offset: u64,
         data: &[u8],
         write_flags: WriteFlags,
-        _flags: OpenFlags,
+        flags: OpenFlags,
         _lock_owner: Option<LockOwner>,
         reply: ReplyWrite,
     ) {
@@ -785,37 +809,27 @@ impl fuser::Filesystem for VoidportFs {
         // case the kernel cannot do itself, because the bits are recorded on
         // the server and its host backing does not carry them.
         let strip = write_flags.contains(WriteFlags::FUSE_WRITE_KILL_SUIDGID);
-        let data = data.to_vec();
+        let data = Arc::new(data.to_vec());
         let readahead = Arc::clone(&self.readahead);
+        // The bracket is write-wise and stays so under streaming: it is taken
+        // around the whole write, all of its chunks together, and never around
+        // one of them.
         readahead.invalidate(ino.0);
+        let stream = Arc::clone(&self.write_stream);
+        let streamed = stream.serves(flags.0 as u32);
         self.spawn(async move {
-            let mut written = 0usize;
-            while written < data.len() {
-                // Read per attempt, not once: the budget belongs to whichever
-                // connection is installed when this slice goes out.
-                let chunk = client.write_chunk() as usize;
-                let end = data.len().min(written.saturating_add(chunk.max(1)));
-                match client
-                    .write(
-                        caller,
-                        ino.0,
-                        fh.0,
-                        offset + written as u64,
-                        &data[written..end],
-                        strip,
-                    )
+            let placed = if streamed {
+                stream
+                    .write(&client, caller, ino.0, fh.0, offset, &data, strip)
                     .await
-                {
-                    Ok(0) => break,
-                    Ok(count) => written += count as usize,
-                    Err(error) => {
-                        readahead.invalidate(ino.0);
-                        return reply.error(errno(error));
-                    }
-                }
-            }
+            } else {
+                serial_write(&client, caller, ino.0, fh.0, offset, &data, strip).await
+            };
             readahead.invalidate(ino.0);
-            reply.written(u32::try_from(written).unwrap_or(u32::MAX));
+            match placed {
+                Ok(written) => reply.written(written),
+                Err(error) => reply.error(errno(error)),
+            }
         });
     }
 
@@ -1307,6 +1321,47 @@ const TERMINAL_IOCTL: u32 = b'T' as u32;
 /// size, type, number — the type is the third byte.
 const fn ioctl_type(cmd: u32) -> u32 {
     (cmd >> 8) & 0xff
+}
+
+/// Places one guest write a slice at a time, each awaited before the next.
+///
+/// The v1 write, unchanged and still the path every mount takes by default: a
+/// short host write is finished here instead of being reported as a short write
+/// to the guest, an errno stops the loop and is reported with whatever was
+/// placed before it, and the slices of one write reach the server in order —
+/// which is what an `O_APPEND` handle's placement depends on.
+async fn serial_write(
+    client: &Client,
+    caller: Caller,
+    node_id: u64,
+    handle: u64,
+    offset: u64,
+    data: &[u8],
+    strip: bool,
+) -> Result<u32, rustix::io::Errno> {
+    let mut written = 0usize;
+    while written < data.len() {
+        // Read per attempt, not once: the budget belongs to whichever
+        // connection is installed when this slice goes out.
+        let chunk = client.write_chunk() as usize;
+        let end = data.len().min(written.saturating_add(chunk.max(1)));
+        match client
+            .write(
+                caller,
+                node_id,
+                handle,
+                offset + written as u64,
+                &data[written..end],
+                strip,
+            )
+            .await
+        {
+            Ok(0) => break,
+            Ok(count) => written += count as usize,
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(u32::try_from(written).unwrap_or(u32::MAX))
 }
 
 /// Answers a callback that has nothing to return but success.

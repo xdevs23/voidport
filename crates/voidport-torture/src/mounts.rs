@@ -157,10 +157,29 @@ impl Fleet {
     ///
     /// Returns the failure to create the mountpoint or to mount on it.
     pub fn mount(&self, label: &str, url: &MountUrl) -> anyhow::Result<TortureMount> {
+        self.mount_with(label, url, &MountOptions::default())
+    }
+
+    /// The same, with the options the caller's class needs.
+    ///
+    /// The default is what the run's own mounts carry, so a class that needs
+    /// another posture — the streamed-write class needs direct data caching and
+    /// a chunk unit, because that is the only posture its engine runs in — says
+    /// so here instead of changing what every other class works through.
+    ///
+    /// # Errors
+    ///
+    /// As [`Fleet::mount`].
+    pub fn mount_with(
+        &self,
+        label: &str,
+        url: &MountUrl,
+        options: &MountOptions,
+    ) -> anyhow::Result<TortureMount> {
         let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
         let mountpoint = self.root.join(format!("mnt-{label}-{sequence}"));
         std::fs::create_dir_all(&mountpoint)?;
-        let mount = Mount::new(url, &mountpoint, &MountOptions::default())?;
+        let mount = Mount::new(url, &mountpoint, options)?;
         Ok(TortureMount {
             mount: Some(mount),
             mountpoint,
