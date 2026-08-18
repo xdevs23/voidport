@@ -4611,16 +4611,30 @@ fully before built:
   conversation as that account. The recorded use it exists for: a
   permissionless filesystem (a FAT removable drive) served as a
   namespace with per-user protection instead of world-open
-  permissions. Two constraints recorded with it: authenticating
-  arbitrary accounts through PAM requires a privileged helper
-  beside the ordinary-user server, and a PAM conversation must
-  never cross a network in the clear, so the type binds to local
-  transports until transport encryption exists.
-- **Open, raised by every remote type:** the wire would carry
-  bearer tokens and PAM conversations; plaintext TCP makes both
-  interceptable, so transport encryption — or binding remote auth
-  types to encrypted transports only — is a v2 design question
-  the auth foundation answers before any remote type ships.
+  permissions. Its constraint, corrected 2026-08-18: there is no
+  privileged helper — the PAM type requires voidportd itself to
+  run as root or as a user with the capability to perform PAM
+  authentication, and a server without that capability simply
+  cannot offer the type. A PAM conversation additionally never
+  crosses a wire in the clear, which the encryption policy below
+  makes automatic.
+
+**Transport encryption (decided 2026-08-18).** The policy:
+encryption is **mandatory** on any connection whose auth type
+carries tokens or passwords across the wire; **optional**
+elsewhere, where it can be turned off for performance; and **off
+by default on vsock and unix sockets**. Two mechanisms are
+recorded for evaluation, settled when the auth foundation is
+specified: **TLS** — the web servers' kind, a memory-safe
+implementation of the sort caddy-class servers ride on, with
+traditional server-certificate TLS as the default shape (the auth
+layer authenticates the client, so the channel only needs to
+prove the server and encrypt; mutual TLS stays an optional
+hardening, and client-certificate auth is a possible future auth
+type of its own) — and **the Noise family** — the WireGuard
+shape, which is not TLS: a fixed static-keypair handshake with no
+certificate machinery, suited to machine pairs with
+pre-registered keys, the fleet-internal case included.
 
 The design law above all for the kernel work (decided 2026-08-17;
 refined the same day): everything is designed robustly from the
