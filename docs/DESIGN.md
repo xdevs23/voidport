@@ -4190,7 +4190,11 @@ These are settled; a change here requires a new recorded decision.
   mandate: a virtio device with a DAX-style shared-memory window (host
   page cache mapped into the guest, bulk data as zero-copy memory reads,
   control on a queue) — explicitly not SCSI or generic PCIe, whose block
-  semantics cannot express per-file policy.
+  semantics cannot express per-file policy. (Refined 2026-08-18 and
+  affirmed the same day: the direct page-cache mapping was retired by
+  its failure record, and the window is the server-owned granted arena
+  DATAPLANE.md specifies — the device-plus-window-plus-queue shape and
+  the policy rationale stand unchanged.)
 - Pattern rules (2026-08-15): a field report — a tool inside a
   guest writes state to sibling directories of the shared project
   directory, which the share does not cover, so a relaunch erases

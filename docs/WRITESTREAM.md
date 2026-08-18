@@ -7,7 +7,8 @@ shipped to first, its replay amendment unexecutable, and its
 failure clause false — the corrections are folded in below.
 Evidence classes are KERNEL.md's: **measured**, **proven by
 source**, **decided**, **open** (with the settling experiment
-named). This document decides the design and implements nothing.
+named). The design was affirmed 2026-08-18, and implementation is
+open from that affirmation.
 
 The problem, measured: the write path pipelines nothing — every
 write is one full round trip. The rig's paired baseline is

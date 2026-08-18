@@ -7,8 +7,10 @@ draft's lease-and-map discipline false eleven ways and is the
 evidence set behind the rejected alternative recorded below.
 Evidence classes are KERNEL.md's: **proven by source**,
 **decided**, **open** (with the settling experiment named) —
-measured claims arrive with phase D3, and none is made here. This
-document decides the design and implements nothing.
+measured claims arrive with phase D3, and none is made here. The
+pivot from the originally decided direct-mapped wording to the
+arena below was affirmed 2026-08-18, and implementation is open
+from that affirmation.
 
 ## The shape, and what it replaced
 
