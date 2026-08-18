@@ -4828,6 +4828,21 @@ their seams open.
   holder, and what a client was promised the moment its write
   returned.
 
+- **Five more served protocols** (added 2026-08-18): an S3
+  server (the object API over namespaces), an FTPS server, an
+  SFTP server, rsync compatibility (the rsync daemon protocol),
+  and an HTTP file server. They extend the served-protocol family
+  v3 opens with smb and nfs — namespaces mapping to what each
+  protocol calls its unit, configurably — and they compose with
+  the rest of the record where it already answers them: the
+  per-namespace auth types cover their credentials, the
+  ACME-backed TLS covers FTPS and HTTP, and the per-namespace
+  domains give each served namespace its own name. Hint to
+  earlier work: the v3 served-protocol seam can treat the
+  protocol as a pluggable frontend the way backends are pluggable
+  behind, so a sixth protocol is an addition and never a
+  restructuring.
+
 ## Roadmap
 
 1. ~~Scaffold: workspace, flake, this document.~~
