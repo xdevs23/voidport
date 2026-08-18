@@ -242,7 +242,13 @@ contract.
    unix, vsock and TCP with injected latency across the table's
    points, against the rig's paired serial baseline; defaults set
    from the numbers; the teardown-drain check recorded; the
-   sub-frame win or its absence stated plainly either way.
+   sub-frame win or its absence stated plainly either way. One
+   deferred simplification is decided here too (deferred
+   2026-08-18): replacing the engine's tail-slicing machinery
+   with per-chunk range placement — a real reduction whose cost
+   is a failure-ordering assertion becoming timing-dependent —
+   waits for W2's numbers, because the measurements may reshape
+   the chunking it would simplify.
 3. **W3 — the kernel client's engine.** The same contract inside
    the kernel provider's write path, chunking at and below the
    frame bound from whole syscalls, sharing the session core's
