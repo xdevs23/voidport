@@ -205,7 +205,11 @@ contract.
    the documented partial-application semantics. Criteria: the
    full v1 write suite green with streaming on and off;
    fault-injection arms per chunk position asserting the
-   documented failure state (not v1's, and stated as such); the
+   documented failure state (not v1's, and stated as such);
+   streaming ships off by default until W2 sets the defaults, and
+   a W2 verdict of no sub-frame win sets the chunk unit to the
+   frame bound, which makes the engine chunk nothing and the
+   failure-state divergence vanish with it; the
    probe-then-assert short-write arm on ext4 and btrfs; the
    torture harness gains a streamed-write storm arm here, not
    later.

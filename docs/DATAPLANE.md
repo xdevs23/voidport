@@ -50,9 +50,12 @@ which that document's own criterion forbids. **The one-cache
 property is therefore not achieved by this design and is not
 claimed**: the arena is a third copy beside the host page cache
 and the guest's own caching. What the window buys — decided, and
-what D3 must prove — is the removal of the per-read round trip
-and the device exit: a granted read costs a guest-local memory
-copy, nothing else.
+what D3 must prove — is the removal of the round trip and the
+device exit from every read after a range's first: a granted read
+costs a guest-local memory copy, nothing else, and the first read
+of a range pays the wire exactly as today. Whether the server
+fills ahead of the first read is **open**, settled by D3's
+measurement design.
 
 ## The law of the window
 
@@ -79,7 +82,7 @@ collapsed upstream is never exercised at all.
 ## The device
 
 One virtio device **per mount**, PCI and MMIO transports (the CCW
-transport has no shared-memory regions — proven by spec — and
+transport has no shared-memory regions — proven by source — and
 serves wire-only). It carries two things and decides nothing:
 
 1. **A frame transport.** One virtqueue pair carrying the wire
@@ -108,12 +111,14 @@ serves wire-only). It carries two things and decides nothing:
 The mapping-free design keeps all slot management in software:
 grants and invalidations are wire messages, the arena's contents
 are the server's memcpy, and no VMM interaction exists after
-setup. Contents of ungranted slots are undefined toward the guest
-and never read — the guest reads only through grants it holds.
+setup. Contents of ungranted slots are undefined toward the guest and
+never served — a discarded seqlock copy may have touched them,
+served bytes come only from grants the guest holds.
 
 ## Grants — the slot lifecycle
 
-A grant names (slot, node, range, generation, expiry). Decided
+A grant names (slot, sequence, node, range, generation, expiry).
+Decided
 rules:
 
 - **Granted on demand, once per range.** A guest read that misses
@@ -242,9 +247,10 @@ confidential-VM compatibility; wire-only serves there too.
    from the numbers (the floor — the file size below which a
    grant is never asked for because the wire read is already
    cheap — runs provisionally at one slot's size until then);
-   the userspace-mapping question answered; a writable arena for
-   the write path opened or closed on evidence, in
-   WRITESTREAM.md's terms.
+   the userspace-mapping question answered; and the writable-arena
+   question put to the design record — opening it would amend the
+   main design's dated read-only decision, so D3's numbers argue
+   it and the amendment decides it, in WRITESTREAM.md's terms.
 
 ## Acceptance criteria — for this specification
 

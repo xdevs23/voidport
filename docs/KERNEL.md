@@ -220,8 +220,8 @@ instead of pretending otherwise (amended 2026-08-18: the retiring
 of the direct-mapped window makes this permanent, not interim; the
 v2 window removes the round trips, not the duplication).
 
-**The v2 seam is exactly here, and it is why the trade is
-acceptable.** The data path sits behind one provider boundary in
+**The v2 seam is exactly here, and the round trips it removes
+are why the trade is acceptable.** The data path sits behind one provider boundary in
 the kernel-Rust layer: the interim provider fills pages from the
 wire and writes through them to the wire — writethrough, no
 writeback cache, per the decided coherence contract, with fsync
