@@ -5,19 +5,22 @@ written 2026-08-18 from the consolidated research record; rewritten
 the same day after its unbriefed review, which measured the first
 draft's lease-and-map discipline false eleven ways and is the
 evidence set behind the rejected alternative recorded below.
-Evidence classes are KERNEL.md's: **measured**, **compile-proven**,
-**proven by source**, **decided**, **open** (with the settling
-experiment named). This document decides the design and implements
-nothing.
+Evidence classes are KERNEL.md's: **proven by source**,
+**decided**, **open** (with the settling experiment named) —
+measured claims arrive with phase D3, and none is made here. This
+document decides the design and implements nothing.
 
 ## The shape, and what it replaced
 
 **Decided: the window is a server-owned arena, not a view of
 backing files.** A sealed memory object created by the server
-(shrink-sealed, so nothing can pull pages out from under a
-mapping), exposed to the guest as one virtio shared-memory region,
-mapped **once** at device setup and never remapped. Inside it the
-server manages fixed-size slots in software: a slot holds a copy
+(shrink-sealed — proven by source, the seal class exists exactly
+for a peer that must not shrink a shared object — so nothing can
+pull pages out from under a mapping), exposed to the guest as one
+virtio shared-memory region, mapped **once** at device setup and
+never remapped. Inside it the server manages fixed-size slots in
+software: a small index table at the arena's start carries one
+sequence word per slot, and the slots follow. A slot holds a copy
 of a file range, placed there by the server through its ordinary
 read path, and the guest serves reads from granted slots at memory
 speed with no device exit and no round trip. The arena is a cache
@@ -64,6 +67,15 @@ background, or does not. No correctness property anywhere may
 depend on a grant existing. A wire-only member, transport, or
 deployment is whole, only slower.
 
+Against the direct-mapped precedent's three recorded failure
+modes, each impossible here by construction: **stall on full** —
+a full arena refuses grants and the read takes the wire, there is
+no fault path to stall; **spin on truncate** — the arena is a
+sealed copy the server owns, no host file operation can invalidate
+its pages; **churn collapse** — there is exactly one mapping for
+the device's lifetime, so the per-mapping machinery whose churn
+collapsed upstream is never exercised at all.
+
 ## The device
 
 One virtio device **per mount**, PCI and MMIO transports (the CCW
@@ -72,24 +84,26 @@ serves wire-only). It carries two things and decides nothing:
 
 1. **A frame transport.** One virtqueue pair carrying the wire
    protocol, handed to the session core as its transport exactly
-   as vsock is. Framing on a descriptor queue is stated, not
-   assumed: one wire frame per descriptor chain, chains bounded by
-   the negotiated frame bound, and the resilience contract's
-   linearization point re-derived as *the complete frame made
-   available to the device* — the queue analog of the complete
-   frame on the socket. Device→driver buffers are pre-posted at
-   the frame bound so notifications and replies always have a
-   landing place. A device-transport mount dials one member — the
+   as vsock is. Framing on a descriptor queue is decided here,
+   not assumed: one wire frame per descriptor chain, chains
+   bounded by the negotiated frame bound, and the resilience
+   contract's linearization point re-derived as *the complete
+   frame made available to the device* — the queue analog of the
+   complete frame on the socket. Device→driver buffers are
+   pre-posted at the frame bound so notifications and replies
+   always have a landing place. A device-transport mount dials one member — the
    backend its VMM was configured with — so "reconnect" on this
    transport always means the same member, and fleet migration is
    a wire-transport property; stated plainly, not implied.
 2. **The window.** One shared-memory region, read-only toward the
-   guest, write-back cacheable (stated to the guest the way the
-   precedent that negotiates cache attributes does), size fixed at
-   VM configuration. The guest maps the region once; there is no
-   per-slot mapping, no memory-slot churn, and the memory-slot
-   budget question the direct-mapped shape had is moot at exactly
-   one slot for the region.
+   guest, write-back cacheable — decided, and stated to the guest
+   the way the precedent that negotiates cache attributes does —
+   size fixed at VM configuration. Region enumeration on the PCI
+   and MMIO transports is the virtio spec's own machinery, proven
+   by source in the research record. The guest maps the region
+   once; there is no per-slot mapping, no memory-slot churn, and
+   the memory-slot budget question the direct-mapped shape had is
+   moot at exactly one slot for the region.
 
 The mapping-free design keeps all slot management in software:
 grants and invalidations are wire messages, the arena's contents
@@ -112,33 +126,53 @@ rules:
   read's critical path — it accelerates the next read, not this
   one.
 - **Grants expire like attributes.** A grant's validity is the
-  attribute lifetime the mount already runs, and renewal rides
-  the attribute revalidation the client already performs — no new
-  timer, no new traffic class. A policy, posture or rule change
-  therefore bounds exposure by the same TTL that already bounds
-  every cache the client holds, with the invalidation
-  notification (below) as the accelerator of that bound, not its
-  guarantee.
-- **Invalidation inherits the readahead contract verbatim.** The
-  server refreshes or invalidates a slot when it applies a write
-  to the range, when the subscription machinery observes a host
-  change, and when the file's attributes change size or mtime;
-  the client drops its own file's grants on a local write exactly
-  as it drops readahead blocks. Invalidation notifications ride
-  the existing reserved-notification class fire-and-forget — safe
-  precisely because a stale slot is a stale *cache*, bounded by
-  the TTL like every other cache, never a fault and never
-  undefined memory. The quiesce protocol the direct-mapped shape
-  needed does not exist because nothing needs quiescing.
+  attribute lifetime the mount already runs, and the renewal rule
+  is stated: an attribute revalidation that observes unchanged
+  size and mtime extends the file's grants to a fresh lifetime —
+  a client-side rule over traffic that already flows, no new
+  timer, no field added to any message. A mount running a zero
+  attribute TTL therefore holds only expired grants and is
+  wire-only in effect, stated so the relation is never
+  rediscovered. A policy, posture or rule change bounds exposure
+  by the same TTL that already bounds every cache the client
+  holds, with the invalidation notification (below) as the
+  accelerator of that bound, not its guarantee. The mount gains
+  an off switch for the window mirroring the readahead engine's,
+  for the operator whose posture intent excludes serving reads
+  from any TTL-bounded copy.
+- **Invalidation inherits the client's own cache discipline.**
+  On the userspace client that is the readahead contract's rules;
+  on the page-cached kernel client it is the attribute-driven
+  drop rules its specification states — in both, the client drops
+  its own file's grants on a local write, and staleness from
+  host-side change is bounded by the attribute TTL, which the
+  main design already records as the bound for every client
+  cache. The server refreshes or invalidates a slot when it
+  applies a write to the range and when the attributes it serves
+  change size or mtime; no host-change watcher exists or is
+  assumed. Invalidation notifications ride the existing
+  reserved-notification class fire-and-forget — safe precisely
+  because a stale slot is a stale *cache*, bounded by the TTL
+  like every other cache, never a fault and never undefined
+  memory. The quiesce protocol the direct-mapped shape needed
+  does not exist because nothing needs quiescing.
 - **Slots are fixed-size, the tables fixed-capacity.** Slot size
   and count are set at mount from the arena size; the guest's
   grant table is sized at mount and allocation-free in steady
   state per the kernel core's constraints. Eviction is
   server-driven (the server owns the arena), least-recently
-  granted first, revocation by notification; a revoked-but-read
-  slot race is harmless by the generation on the grant — the
-  guest validates the generation after the copy and retries on
-  the wire on mismatch, the one check the accelerator needs.
+  granted first, revocation by notification. The race between a
+  refill or revocation and an in-flight guest copy is closed by
+  the index table's sequence words, the classic sequence-lock
+  discipline: the server makes the slot's word odd before
+  touching its bytes and even-and-advanced after (each store
+  released), and the guest reads the word before and after its
+  copy (each load acquired) — a copy whose two reads disagree,
+  observe an odd value, or observe a sequence other than its
+  grant's is discarded and the read taken on the wire. A torn
+  mid-refill copy is thereby detected, never served; this is the
+  one check the accelerator needs, and its two memory-ordering
+  rules are stated here so no implementation rediscovers them.
 - **Reconnection invalidates everything.** Grants are
   generation-tagged; a new session generation invalidates every
   grant the guest holds (ids die with the generation — the
@@ -185,8 +219,9 @@ migratable VM runs wire-only mounts; stated as the deployment
 rule. The vhost-user model shares all guest memory with the
 backend, which places the server inside that VM's trust boundary
 — THREAT-MODEL is owed a line for the device-transport deployment
-when implementation opens. Confidential-VM compatibility is not
-determinable from the public record; wire-only serves there too.
+when implementation opens. One item is not determinable from the
+public record and is marked exactly that, not proven:
+confidential-VM compatibility; wire-only serves there too.
 
 ## Phasing
 
@@ -204,9 +239,12 @@ determinable from the public record; wire-only serves there too.
    readahead engine's measured shape and marked as provisional.
 3. **D3 — measurement.** Granted versus wire reads across sizes,
    patterns and postures; slot size, count and the size floor set
-   from the numbers; the userspace-mapping question answered; a
-   writable arena for the write path opened or closed on
-   evidence, in WRITESTREAM.md's terms.
+   from the numbers (the floor — the file size below which a
+   grant is never asked for because the wire read is already
+   cheap — runs provisionally at one slot's size until then);
+   the userspace-mapping question answered; a writable arena for
+   the write path opened or closed on evidence, in
+   WRITESTREAM.md's terms.
 
 ## Acceptance criteria — for this specification
 

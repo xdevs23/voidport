@@ -213,10 +213,12 @@ recorded decision. So the decision, stated plainly:
 **The kernel client uses the guest page cache for file data.** The
 standard native shape: read and write paths through the page cache
 against the wire, shared mappings served the way every real
-filesystem serves them. This deliberately gives up, for the interim,
-the one-cache property the userspace direct mode bought — a
-built-image guest running the kernel client caches file data twice,
-guest and host — and says so instead of pretending otherwise.
+filesystem serves them. This gives up the one-cache property the
+userspace direct mode bought — a built-image guest running the
+kernel client caches file data twice, guest and host — and says so
+instead of pretending otherwise (amended 2026-08-18: the retiring
+of the direct-mapped window makes this permanent, not interim; the
+v2 window removes the round trips, not the duplication).
 
 **The v2 seam is exactly here, and it is why the trade is
 acceptable.** The data path sits behind one provider boundary in

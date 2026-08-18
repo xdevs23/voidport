@@ -50,9 +50,10 @@ frame" would be inert on the client that ships first. The
 mechanism is therefore **sub-frame chunking with a concurrent
 window**:
 
-- **The kernel client** owns its write path and sees the whole
-  syscall; it chunks at the frame bound and below, and one large
-  write fills the window by itself.
+- **The kernel client** owns its write-through path and streams
+  its batches whole — a write's full extent, a memory-map
+  writeback's page batch — chunked at the frame bound and below,
+  so one large write fills the window by itself.
 - **The userspace client** receives at most max_write per request
   and chunks *below* the frame bound (a 1 MiB request becoming,
   for example, eight 128 KiB chunks in flight at once), which
@@ -84,12 +85,19 @@ no future home claimed for it.
 ## The contract
 
 - **Scope.** Offset-addressed data writes on direct-io mounts
-  (the mount default; a cached-fallback mount keeps v1's path
-  byte-identical). Excluded and unchanged from v1: append handles
-  (not offset-addressed), O_SYNC and O_DSYNC handles (per-write
-  durability ordering), and guest O_DIRECT handles (served by the
-  parallel-direct-writes surface, whose semantics stay exactly as
-  shipped).
+  (off by default on the userspace client, and the posture the
+  measured deployments run; a page-cached mount keeps v1's path
+  byte-identical). On the kernel client the same contract applies
+  to the provider's write-through path: the unit is the
+  provider's batch — the syscall's extent for a write, the page
+  batch for the memory-map writeback hook — chunked at and below
+  the frame bound under the same window. Excluded and unchanged
+  from v1: append handles (not offset-addressed), O_SYNC and
+  O_DSYNC handles (per-write durability ordering), and guest
+  O_DIRECT handles — excluded on their own semantics: a guest
+  choosing O_DIRECT asked for unbuffered, uncoalesced submission,
+  and that path is already served by parallel direct writes
+  exactly as shipped.
 - **Chunking.** Each chunk is an ordinary WriteRequest carrying
   its own absolute offset and the full write_flags of its parent
   — PRIVILEGED_STRIP rides **every** chunk, as the shipped rule
@@ -104,38 +112,55 @@ no future home claimed for it.
   allocation-free steady state, no overflow class, satisfying the
   kernel core's constraints by construction and sized within the
   request-table capacity that bounds the mount's concurrency. The
-  server's per-connection bound of 64 in-flight requests is the
-  depth ceiling a default mount meets; the operator's existing
-  per-session in-flight override is the WAN dial, and the mount's
-  window option must state it cannot exceed what the server
-  grants. A full window backpressures the writer; it never
-  errors.
+  server's per-connection bound of 64 in-flight requests is a
+  shared budget — readahead's chunks, metadata traffic and write
+  chunks all draw on it — so the write window's default leaves
+  the other classes their measured shares (provisionally eight
+  chunks per handle and thirty-two per mount, W2 replacing both),
+  and a window that met the ceiling would stall the connection's
+  read loop for everyone. The operator's existing per-session
+  in-flight override is the WAN dial; the mount's window option
+  matching it is operator coordination, stated plainly — nothing
+  is negotiated, because the handshake carries no in-flight field
+  and this contract adds no wire surface. A full window
+  backpressures the writer; it never errors.
 - **The send path.** Chunks are independent requests, so the
   client's single serialization point releases between frames,
-  and the client's send queue admits pending non-write requests
-  ahead of queued chunks — the request-direction analog of the
-  server's two reply classes, so a metadata request never waits
-  behind a window of bulk frames.
+  and the send queue this engine introduces admits pending
+  non-write requests ahead of queued chunks — the
+  request-direction analog of the server's two reply classes, so
+  a metadata request never waits behind a window of bulk frames.
+  One ordering assumption is stated the way the fsync one is:
+  a release, flush or forget naming the same handle or node
+  cannot be issued while the write is in flight, because the
+  guest kernel holds the file reference across the syscall — the
+  kernel client's provider re-establishes this itself.
 - **Failure, stated without pretense.** Chunks apply
   concurrently, so a failed chunk does not stop later chunks that
   were already in flight from applying: the bytes-on-disk state
-  of a failed streamed write is *some subset of its chunks*, not
-  the prefix a serial loop leaves. The syscall reports the
-  longest fully-answered prefix as a short write when that prefix
-  is nonempty, and the first chunk's errno otherwise; chunks
-  beyond the reported count may have applied, and this documented
-  divergence from v1's strict-prefix failure state is the one
-  semantic change this contract makes — confined to writes that
-  fail partway, absent entirely on the success path, and priced
-  against the serial alternative in W2. Unsent chunks are
-  abandoned; in-flight chunks are awaited before the syscall
-  returns, so nothing of the request outlives it.
+  of a failed streamed write is *some subset of its chunks'
+  byte ranges*, not the prefix a serial loop leaves. Error
+  delivery stays v1's: the syscall reports the first failed
+  chunk's errno, exactly as the serial loop reports its errno
+  after a partial apply. The one semantic change this contract
+  makes is therefore the failure-time file state — a byte-range
+  subset instead of a prefix — confined to writes that fail
+  partway, absent entirely on the success path, and priced
+  against the serial alternative in W2. A chunk answered short
+  while the write is otherwise healthy resumes from the answered
+  byte with a follow-up chunk; once any chunk has failed, no
+  resume is attempted. Unsent chunks are abandoned; in-flight
+  chunks are awaited before the syscall returns, so nothing of
+  the request outlives it.
 - **Connection loss.** The resilience contract applies verbatim
   and unamended: a written-but-unanswered chunk fails the write
-  with EIO, queued-never-written chunks are moot, and nothing
-  replays — a replayed chunk would address a handle whose id died
-  with the generation, and the review record shows replay without
-  a fencing surface is a stale-write hazard besides. If session
+  with EIO; queued-never-written chunks are sent as they are and
+  receive their honest stale answer from the new generation,
+  which fails the write the same way — so the all-queued case
+  fails too, never a false success — and nothing replays: a
+  replayed chunk would address a handle whose id died with the
+  generation, and the review record shows replay without a
+  fencing surface is a stale-write hazard besides. If session
   continuity ever arrives (the parked attach-connection surface
   is the only candidate), streamed-write replay may be revisited
   in its terms; until then the contract's honest answer is v1's.
