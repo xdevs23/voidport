@@ -4649,13 +4649,19 @@ recorded for the implementation: the HTTP-01 and TLS-ALPN-01
 challenges need ports 80 or 443 reachable from the CA, so a
 server not fronting those needs the DNS-01 challenge (provider
 credentials, the way caddy does it) — both get support. ZeroSSL's
-external account binding is settled (2026-08-18, from the caddy
-maintainer's own account, retracting the uncertainty in place):
-EAB is always required by ZeroSSL, and it is generated
-automatically when an account email is provided — so the
-configuration carries an **email field**, and manually generated
-EAB credentials (key id and MAC key) remain configurable for the
-deployment that has them. Certificate state for a fleet of
+external account binding is settled (2026-08-18, re-checked
+against ZeroSSL's current documentation after the first source
+proved two years old): EAB is always required, and ZeroSSL's own
+API generates credentials from an email address alone, no account
+needed — so the configuration carries an **email field**, and
+manually generated EAB credentials (key id and MAC key) remain
+configurable for the deployment that has them. Two operational
+facts from the same re-check: generated EAB credentials are
+reusable but not stored by ZeroSSL and their generation is
+rate-limited per day, so the server generates once and persists
+them in its own certificate state; and ZeroSSL caps subdomains at
+six labels, which the issuance path surfaces as a plain
+configuration error instead of a failed order. Certificate state for a fleet of
 identical replicas serving one domain lives where the fleet's
 shared state lives — the backend — so members do not race the
 CA's rate limits issuing per-member duplicates.
