@@ -98,9 +98,9 @@ io_uring evaluation stays retired by the recorded decision.
    both clients, tested by the existing suites through the
    userspace client and by ring-1 tests directly. The core speaks
    through a frame transport handed to it as data — vsock now, the
-   v2 window's control queue later — so the decided v2 shape's
-   control half has its seam here, beside the data-provider
-   boundary named in the caching section. The extraction is
+   v2 window's device queue later (DATAPLANE.md's decided
+   transport: one more frame transport, at this same seam), beside
+   the data-provider boundary named in the caching section. The extraction is
    its own implementation phase with its own review, because it
    refactors shipped v1 code. Kernel-space constraints the core
    must meet, decided here: replay retention and the request table
@@ -136,10 +136,12 @@ io_uring evaluation stays retired by the recorded decision.
    move up. The surfaces that currently qualify on the probed
    kernels: the static-inline VFS helpers the registration path
    uses (the review's probe names the class; the exact list is a
-   phase-3 deliverable pinned by its gate), and the five
-   kernel-socket calls (**compile-proven**, with the newest-kernel
-   signature drift already found and fixed one-line in the
-   probes). A helper that starts deciding things moves up a layer.
+   phase-3 deliverable pinned by its gate). The kernel-socket
+   calls once budgeted here retired to the bindings crate — phase
+   1 measured them called from Rust directly, and the transport
+   section carries that record (retracted in place 2026-08-18:
+   this sentence had kept the stale C budget). A helper that
+   starts deciding things moves up a layer.
    When the upstream VFS or socket abstraction series merge, the
    corresponding helpers retire by swap — the file's destination
    is empty.
@@ -193,15 +195,102 @@ soft dependency, and the built-image case controls its image — a
 mount-time preflight answers a typed error when the transport is
 absent anyway).
 
-**The C surface came out empty.** All six kernel-socket calls are
-declared in the kernel's generated bindings crate and are called
-from Rust directly — the shim the probes once carried is retired,
-not ported. The one bindings gap: the vsock address structure is
+**The C surface came out empty.** All five kernel-socket calls —
+and the init_net symbol their addressing needs — are declared in
+the kernel's generated bindings crate and are used from Rust
+directly; the shim the probes once carried is retired, not
+ported. (Corrected 2026-08-18: an earlier revision counted "six
+calls", folding the symbol into the call count.) The one bindings gap: the vsock address structure is
 absent from the bindings, and is mirrored as a repr(C) struct
 with static assertions on size, alignment and every field offset;
 it is userspace ABI, frozen by the kernel's own compatibility
 promise. Licensing is moot either way: the Rust runtime's exports
 force GPL-2.0 regardless, consistent with the recorded split.
+
+## The session core's extraction contract (2026-08-18)
+
+Pinned before phase 2 opened, from the spec's cold review; each
+item retracts in place anything it contradicted above.
+
+- **What the core is.** A synchronous decision machine: frames,
+  instants and the seed enter as arguments, and every outcome
+  leaves as a value — what to write, whom to wake, when to wake
+  next, what to fail with. The adapters perform the verdicts and
+  decide nothing. The deadline tie-break ("the deadline wins
+  every tie") is the core's own decision, taken on the instant
+  the adapter supplies after its wait; an adapter never compares
+  times itself.
+- **Allocation.** The core allocates nothing — not only in steady
+  state, at all. Its tables live in storage the adapter hands it
+  at construction: the userspace client from its heap, the kernel
+  client from GFP-flagged allocation. No type the core owns
+  carries an owned string or a growable buffer; its error classes
+  are enums, and prose reasons are the adapter's business.
+- **Dependencies.** The core's dependency set is the wire crate's
+  and nothing more: voidport-proto and the language's core
+  library. No new external crate and no new proc-macro — the
+  kbuild recipe prices every dependency as a hand-written rule —
+  and phase 3's gate extends the ladder's drift test to hash the
+  core beside the wire crate. The no-std proof is a 64-bit,
+  std-free check target (x86_64-unknown-none, provisioned in the
+  flake) run by the checks; the wasm target the toolchain also
+  carries proves neither the pointer width nor the allocation
+  rule, being 32-bit and shipping an allocator.
+- **Replay retention is the table, and bytes stay with the
+  caller.** v1 retains no frame bytes: a resend re-encodes from
+  the awaiting caller's own arguments under the current
+  connection's bound, a bound that shrank below the request fails
+  it, and that behaviour is kept exactly. "Replay retention"
+  names the table's per-request replay state — opcode, replay
+  class, lifecycle position, generation — never payload bytes;
+  the growth case, a replacement connection announcing a larger
+  bound, is absorbed by re-encoding exactly as it is today.
+- **The per-operation replay classification is the core's.** The
+  table that says which operation is idempotent, which is
+  once-only, and which is moot on a dead generation — including
+  the flags-dependent open classification — is protocol
+  semantics, not I/O. It lives in the core beside the discipline
+  that consumes it; a client re-deriving one classification by
+  hand is the second copy the extraction forbids.
+- **The concurrency bound, derived and not invented.** The
+  userspace mount computes its table capacity at mount from its
+  own bounded engines plus a metadata allowance: the write
+  window's per-mount count, plus the readahead engine's per-mount
+  count, plus an allowance at least the server's default
+  run-ahead bound. Bulk traffic cannot reach the allowance — each
+  bulk engine is bounded by its own window before it reaches the
+  table — so a prompt request always finds a slot and the send
+  path's two-class rule keeps its shipped guarantee. The kernel
+  client derives its capacity the same way from its own engines
+  as it grows them, and the I/O contract's run-ahead sentence
+  means this derivation.
+- **Backpressure is a wait, and v1 already has the class.** A
+  full table parks the caller until a slot frees — the same
+  observable class as v1's callers queueing at the single writer
+  over a backpressuring socket. It never errors and never grows.
+  Timing semantics, defined: the schedule's bounds, ordering and
+  tie-break rules — never the realization of the jitter inside
+  those bounds. Under that definition a seeded jitter source is
+  not an observable timing change.
+- **The seed.** The userspace adapter seeds from the operating
+  system at mount; the kernel adapter from the kernel's random
+  bytes at mount; tests supply the seed, which is what the
+  determinism criterion measures. The generator is a small
+  arithmetic generator inside the core, seeded per mount so two
+  mounts that lost the same server do not retry in lockstep —
+  the shipped rule, kept.
+- **Handshake validation, enumerated.** The classes the core
+  owns: a protocol-version mismatch — checked on the reply too,
+  an absence in v1 corrected here and recorded as a correction —
+  reserved flag bits set on the reply (the same), a frame bound
+  below the floor, a root node id that is not the contract's, a
+  refusal status per its distinct class, and a malformed reply.
+  Dial-time transport failures (connect, I/O, an oversized
+  pre-handshake frame) are the adapter's, since a core with no
+  I/O cannot produce them.
+- **The relicensing is the act the licensing section decided**:
+  shipped GPL-3.0-only session code moves into the MIT core,
+  sanctioned by the split recorded below.
 
 ## The data path and the caching decision
 
@@ -278,8 +367,9 @@ imposed: mounting requires system administrator capability in the
 initial namespace (the standard bar for a network filesystem
 module); the mount is visible guest-wide like any mount — the
 userspace client's allow-other flag was a FUSE artifact and has no
-analog here — THREAT-MODEL is owed a line for this when
-implementation opens; per-request credentials are the calling
+analog here — THREAT-MODEL is owed a line for this at phase 3's
+gate, the phase whose mount creates the surface; per-request
+credentials are the calling
 task's at call time, matching the
 request head's semantics; permission checking stays exactly v1's
 default-permissions model — the guest kernel checks against
@@ -474,6 +564,59 @@ Each phase gates the next; none is started by this document.
    the license table, under the full increment pipeline (it
    refactors shipped code); the userspace client consumes it and
    the v1 suites prove nothing moved.
+
+   Acceptance criteria for this phase (derived 2026-08-18 from the
+   constraints this document already rules; each is checkable):
+
+   1. A new workspace crate holds the session core. It compiles
+      without the standard library — proven by the 64-bit
+      std-free check target the extraction contract names
+      (x86_64-unknown-none, run by the checks), not claimed — it
+      contains no unsafe code, it allocates nothing (storage is
+      the adapter's, per the contract), and its license is MIT —
+      the wire crate's, for the reason the licensing section
+      records.
+   2. One authority: handshake validation with its distinct error
+      classes, request-id allocation and request tracking, the
+      request-lifecycle replay discipline (queued is sent;
+      written-and-unanswered is re-sent only if idempotent, else
+      fails; no-response requests addressing a dead generation are
+      dropped as moot), the per-operation replay classification
+      table, and the reconnect state machine with its monotonic
+      stall deadline and backoff schedule all live in the core
+      and nowhere else. What remains in the userspace
+      client is I/O adaptation — sockets, tasks, wakeups — not a
+      second copy of any decision.
+   3. The core performs no I/O, reads no clock and owns no
+      randomness: frames enter and leave as data through the
+      transport seam, the current instant and every deadline are
+      arguments, and the backoff jitter derives from a seed the
+      mount supplies.
+   4. The request table — which is the replay retention, per the
+      extraction contract — is fixed-capacity, sized at
+      construction by the contract's derivation from the mount's
+      own bounded engines. A full table backpressures the caller
+      as a wait; it never errors, never grows, and allocates
+      nothing.
+   5. The userspace client consumes the core and the v1 suites
+      prove nothing moved: the whole workspace suite is green with
+      no existing assertion weakened or removed, and the wire
+      behaviour is unchanged. The properties those suites do not
+      pin — the request-id sequence, the backoff schedule's
+      bounds — are pinned by the ring-1 tests of criterion 6
+      instead of being claimed.
+   6. Ring-1 tests exercise the core directly, without a socket:
+      every handshake error class the core owns (the contract's
+      enumeration), every replay-discipline lifecycle state, the
+      request-id sequence, table backpressure at capacity, and
+      the backoff schedule's determinism from a fixed seed.
+   7. The license table in the README carries the core's row, and
+      the crate manifest states MIT.
+   8. Nothing user-facing changes: no new options, no new wire
+      surface, and no timing change an operator could observe —
+      timing semantics as the extraction contract defines them,
+      with the reply-validation corrections the contract records
+      as the one deliberate strictening.
 3. **Read-only mount**: registration through the bindings and
    helpers, lookup, getattr, open, read, readdir, entry
    revalidation, the FORGET mapping; the full ring-2 harness comes
