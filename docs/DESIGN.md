@@ -4628,12 +4628,19 @@ is finished, and the move is decided deliberately** — the same
 sequencing law v2 had. The io_uring evaluation once deferred here
 is removed outright the same day; no roadmap carries it.
 
+The law for every future mandate, this one and the next (decided
+2026-08-18): a future item **hints at what earlier work can
+accommodate through architecture and design, and nothing more** —
+it places no acceptance criterion and no requirement on earlier
+work. Where an entry below names what earlier work can leave open
+for it, that is the hint, read exactly that way.
+
 - **SMB and NFS as backends.** The server speaks smb and nfs as a
   client itself, connecting directly to the remote server instead
   of going through a kernel-mounted filesystem. A capability the
   backend protocol lacks is added by other means — which means
   exactly is an open design conversation, settled before this item
-  is built. Obligation on v2: the pluggable-backend seam must
+  is built. Hint to v2: the pluggable-backend seam can
   admit backends that are network clients with capability sets
   narrower than the host filesystem's.
 
@@ -4644,8 +4651,8 @@ is removed outright the same day; no roadmap carries it.
 
 - **Transparent per-file compression and encryption.** The server
   holds the keys and performs the transforms; clients see plain
-  contents and none of the machinery. Obligation on v2: the
-  data-plane design must not foreclose a server-side transform
+  contents and none of the machinery. Hint to v2: the
+  data-plane design can leave room for a server-side transform
   stage between policy and backing.
 
 - **voidport as the root filesystem.** Expected to fall out of the
@@ -4681,10 +4688,10 @@ their seams open.
   layer; the client comes first, the server where its host
   abstractions carry over, and the mount surface (macFUSE or the
   platform's own filesystem extension API) is decided when the
-  item opens. The kernel module remains Linux. Obligation on
-  earlier work: platform specifics stay contained where they
-  already live, and nothing new grows Linux assumptions outside
-  those places.
+  item opens. The kernel module remains Linux. Hint to
+  earlier work: platform specifics can stay contained where they
+  already live, with nothing new growing Linux assumptions
+  outside those places.
 
 - **An S3 backend.** Object storage behind a namespace, through
   the same pluggable-backend seam v2 builds and the same
@@ -4697,11 +4704,12 @@ their seams open.
   contain a block device, exposed by the client as a real one —
   in the kernel client, a node under /dev, mountable and usable
   like any other. The source behind it is anything: a physical
-  device, a file on a filesystem, another backend. Obligation on
-  earlier work: the data plane must not assume file semantics are
-  the only semantics — block I/O is fixed-size, offset-addressed,
-  metadata-free — and the kernel client's provider boundary is
-  the natural attachment point for the device-shaped variant.
+  device, a file on a filesystem, another backend. Hint to
+  earlier work: the data plane can avoid assuming file semantics
+  are the only semantics — block I/O is fixed-size,
+  offset-addressed, metadata-free — and the kernel client's
+  provider boundary is the natural attachment point for the
+  device-shaped variant.
 
 - **A caching layer.** A hot tier that serves frequent reads and
   absorbs dirty writes in front of slower backends. Absorbing
