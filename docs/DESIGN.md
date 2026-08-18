@@ -4837,10 +4837,13 @@ their seams open.
   the rest of the record where it already answers them: the
   per-namespace auth types cover their credentials, the
   ACME-backed TLS covers FTPS and HTTP, and the per-namespace
-  domains give each served namespace its own name. Hint to
-  earlier work: the v3 served-protocol seam can treat the
-  protocol as a pluggable frontend the way backends are pluggable
-  behind, so a sixth protocol is an addition and never a
+  domains give each served namespace its own name. Each served
+  protocol lives in **its own crate** (decided 2026-08-18), never
+  in the core: the workspace grows one crate per frontend, and
+  the core exposes the seam they all plug into. Hint to earlier
+  work: the v3 served-protocol seam can treat the protocol as a
+  pluggable frontend the way backends are pluggable behind, so a
+  sixth protocol is an addition — one new crate — and never a
   restructuring.
 
 ## Roadmap
