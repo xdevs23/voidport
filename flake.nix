@@ -11,9 +11,24 @@
         "aarch64-linux"
       ];
       forAllSystems = f: nixpkgs.lib.genAttrs systems (system: f nixpkgs.legacyPackages.${system});
+
+      # The kernel client is built by kbuild, outside the cargo workspace, from
+      # its own directory. It is reachable here so the module is a flake output
+      # like everything else this repository builds, and it is reachable
+      # directly (`nix-build kernel/nix`) so the ladder can ask for one rung
+      # without the whole tree being copied into the store for each.
+      kernelFor =
+        system:
+        import ./kernel/nix {
+          inherit system;
+          nixpkgsPath = nixpkgs;
+        };
     in
     {
       packages = forAllSystems (pkgs: {
+        kernel-module = (kernelFor pkgs.stdenv.hostPlatform.system).module;
+        kernel-guest = (kernelFor pkgs.stdenv.hostPlatform.system).guest;
+
         default = pkgs.rustPlatform.buildRustPackage {
           pname = "voidport";
           version = "1.0.0";

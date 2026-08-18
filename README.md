@@ -449,15 +449,18 @@ $ voidport-torture --url voidport://127.0.0.1:9000/@share/srv/data \
 
 ## License
 
-Per crate, chosen by role (full texts in `LICENSES/`):
+Per component, chosen by role (full texts in `LICENSES/`):
 
-| Crate | License |
+| Component | License |
 |---|---|
 | `voidportd` (the server) | AGPL-3.0-only |
 | `voidport`, `voidport-ctl`, `voidport-control`, `voidport-tui`, `voidport-bench`, `voidport-torture`, `voidport-pty` | GPL-3.0-only |
 | `voidport-proto` (wire format) | MIT |
+| `kernel/probe` (the kernel module) | GPL-2.0-only |
 
 The server carries the AGPL because its value is delivered over a network;
 the tools carry the GPL; the wire-format crate is MIT so any client —
-including a future GPL-2.0 kernel module — can speak the protocol without
-license friction.
+the kernel module included — can speak the protocol without license
+friction. The module's own license is not a choice: the kernel's Rust
+runtime exports it is built on are GPL-2.0-only, and a GPL-2.0-only module
+is what may use them.

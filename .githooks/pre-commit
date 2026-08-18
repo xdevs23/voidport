@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 # Tree hygiene: refuse to commit files that do not belong to this project.
 #
-# The repository is a Rust workspace plus documentation. Concurrent tools and
+# The repository is a Rust workspace, its documentation, and the kernel
+# client's out-of-tree module. Concurrent tools and
 # humans read foreign source trees (kernel sources, other projects) during
 # investigation, and a stray copy left in the working directory is one
 # careless `git add -A` from entering history — which must never happen.
@@ -10,8 +11,11 @@
 # that slipped past a `--no-verify`.
 #
 # Rules, deliberately blunt:
-#   * no C/C++/object/kernel artifacts anywhere — this workspace has no
-#     legitimate use for them (the one unsafe island is plain Rust + libc);
+#   * no C/C++/object/kernel artifacts anywhere — nothing here has a
+#     legitimate use for them (the one unsafe island is plain Rust + libc,
+#     and the kernel module reaches the kernel through its bindings, so its
+#     C surface is empty). A C file that becomes unavoidable is added HERE
+#     too, with the reason it cannot be Rust;
 #   * every top-level entry must be on the allowlist below — a new
 #     legitimate top-level file is added HERE, in the same commit, which is
 #     exactly the review moment the rule wants.
@@ -20,7 +24,7 @@
 # here in whichever mode this hook was given — one word list, both entries.
 set -euo pipefail
 
-allowed_top='^(Cargo\.lock|Cargo\.toml|check|crates|docs|flake\.lock|flake\.nix|\.gitignore|LICENSES|README\.md|\.githooks)(/|$)'
+allowed_top='^(Cargo\.lock|Cargo\.toml|check|crates|docs|flake\.lock|flake\.nix|kernel|\.gitignore|LICENSES|README\.md|\.githooks)(/|$)'
 foreign_ext='\.(c|h|cpp|hpp|cc|hh|cxx|hxx|ko|o|a|so|orig|rej)$'
 
 if [ "${1:-}" = "--all" ]; then

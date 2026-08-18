@@ -1,0 +1,14 @@
+# kbuild writes its products beside the source when the module is built here
+# with a plain `make`, which the Makefile supports against the running
+# kernel's build tree. None of it belongs to the history, and the extension
+# ban in the commit hook does not cover the names without one.
+*.ko
+*.mod
+*.mod.c
+*.o
+*.rlib
+*.rmeta
+.*.cmd
+.tmp_versions/
+Module.symvers
+modules.order

@@ -1,0 +1,118 @@
+# SPDX-License-Identifier: GPL-2.0
+#
+# Out-of-tree kbuild for the voidport phase-one probe module.
+#
+# Three sources come from outside this directory and are named by the
+# environment, so nothing here carries a path to a particular machine:
+#
+#   VOIDPORT_PROTO_SRC     the workspace's wire crate, consumed BY PATH. There
+#                          is never a copy of it: one wire truth, mechanically.
+#   VOIDPORT_ZEROCOPY_SRC  the wire crate's one dependency, resolved from the
+#                          workspace's lockfile.
+#   VOIDPORT_PROCMACRO_DIR the host-side build of `zerocopy-derive`, with its
+#                          own dependency chain in `deps/`.
+#
+# How an external crate rides kbuild
+# ----------------------------------
+# kbuild has no cargo and no crate graph. `scripts/Makefile.build` compiles
+# exactly one `.rs` per `.o`, and the only crates it offers the compiler are
+# `--extern kernel --extern pin_init`, resolved from `-L $(objtree)/rust`
+# against `--sysroot=/dev/null`.
+#
+# So each external crate is compiled by a rule of its own, with kbuild's own
+# `$(rust_flags)`, and emits three products from one invocation:
+#
+#   .o      the crate's code, listed in `<module>-y` so the module link
+#           contains it. Without this the module object compiles and modpost
+#           then fails with one "undefined!" per used item.
+#   .rlib   what `--extern` hands to the crates above it.
+#   .rmeta  what the `-L` search resolves transitive dependencies through.
+#
+# One invocation for all three matters: symbol names must agree between the
+# metadata the callers compile against and the object the module links.
+
+obj-m += voidport_probe.o
+voidport_probe-y := voidport_probe_main.o voidport_proto.o zerocopy.o
+
+# `--extern name=path` names *direct* dependencies only. Everything rustc pulls
+# in transitively -- `zerocopy` behind `voidport_proto`, and the
+# `zerocopy_derive` proc macro that zerocopy re-exports -- is resolved purely by
+# searching the `-L` directories for the crate's exact name. An `--extern` entry
+# for a transitive crate is ignored, and the failure surfaces as "can't find
+# crate" naming whichever crate was asked for first, which is not the one that
+# is missing. So every directory holding a built crate is on `-L`: the object
+# directory for the rlibs, and the host build's `deps` directory for the hashed
+# proc-macro shared object.
+procmacro_deps := $(VOIDPORT_PROCMACRO_DIR)/deps
+zerocopy_derive := $(VOIDPORT_PROCMACRO_DIR)/libzerocopy_derive.so
+
+# Exactly the flags kbuild uses for this module's own Rust object -- these
+# targets are part of the module, so `$(rust_flags)` already resolves
+# `--cfg MODULE` and the kernel's config cfgs for them. Two things kbuild keeps
+# inside `cmd_rustc_o_rs` instead of in `$(rust_flags)` are restated here: the
+# sysroot pair that points `core` at the kernel's own build, and the crate type.
+# The edition is filtered out instead of appended because rustc rejects
+# `--edition` twice and `rust_common_flags` pins the whole tree to 2021.
+crate_rustflags = \
+	$(filter-out --edition=2021,$(rust_flags)) \
+	-Zunstable-options --sysroot=/dev/null \
+	-L$(objtree)/rust -L$(obj) -L$(procmacro_deps) \
+	--crate-type rlib
+
+crate_stem = $(basename $(notdir $@))
+
+quiet_cmd_rustc_crate = RUSTC L $@
+      cmd_rustc_crate = $(RUSTC) $(crate_rustflags) $(crate_flags) \
+	--crate-name $(crate_stem) \
+	--emit=obj=$@ \
+	--emit=link=$(obj)/lib$(crate_stem).rlib \
+	--emit=metadata=$(obj)/lib$(crate_stem).rmeta \
+	$< $(cmd_objtool)
+
+# `--cfg no_fp_fmt_parse` is crucial, not cosmetic: `rust/Makefile` builds the
+# kernel's `core` with that cfg, which deletes `Display`/`Debug` for `f32` and
+# `f64` from it, and the kernel does NOT carry the cfg into the generated
+# `rustc_cfg` an out-of-tree build inherits. zerocopy declares the same cfg and
+# drops the float formatting of its `F32`/`F64` byteorder types under it;
+# without it the crate fails against the kernel's `core` on exactly those impls.
+$(obj)/zerocopy.o: private crate_flags = \
+	--edition=2021 \
+	--cfg 'feature="derive"' \
+	--cfg no_fp_fmt_parse \
+	--extern zerocopy_derive=$(zerocopy_derive) \
+	-Aunexpected_cfgs -Amissing_docs -Aunreachable_pub
+$(obj)/zerocopy.o: $(VOIDPORT_ZEROCOPY_SRC)/src/lib.rs FORCE
+	$(call if_changed,rustc_crate)
+
+# `-Anon_ascii_idents` is the second non-obvious flag. `rust_common_flags` sets
+# `-Dnon_ascii_idents` for the whole kernel tree, and zerocopy's derive expands
+# to a per-field marker enum whose name is non-ASCII for its field-projection
+# machinery. Nothing in the wire crate's own source is non-ASCII: the
+# identifiers exist only in the expansion, so the deny fires once per wire
+# struct field, each pointing at an ordinary ASCII field name, which hides the
+# cause unless the expansion is dumped.
+#
+# The edition is the wire crate's own, not the kernel tree's: the crate is 2024
+# and the tree is 2021, and the per-crate filtering above is what lets both be
+# true in one build.
+#
+# The outlives lint is a kernel-tree idiom the wire crate never opted into. The
+# crate belongs to the workspace and is compiled here unchanged, so a lint this
+# build turns on is this build's to turn off again.
+$(obj)/voidport_proto.o: private crate_flags = \
+	--edition=2024 \
+	-Anon_ascii_idents \
+	-Aexplicit_outlives_requirements \
+	--extern zerocopy=$(obj)/libzerocopy.rlib
+$(obj)/voidport_proto.o: $(VOIDPORT_PROTO_SRC)/src/lib.rs $(obj)/zerocopy.o FORCE
+	$(call if_changed,rustc_crate)
+
+RUSTFLAGS_voidport_probe_main.o += \
+	--extern voidport_proto=$(obj)/libvoidport_proto.rlib \
+	--extern zerocopy=$(obj)/libzerocopy.rlib \
+	-L$(obj) -L$(procmacro_deps)
+$(obj)/voidport_probe_main.o: $(obj)/voidport_proto.o $(obj)/zerocopy.o
+
+targets += zerocopy.o voidport_proto.o
+clean-files += libzerocopy.rlib libzerocopy.rmeta \
+	       libvoidport_proto.rlib libvoidport_proto.rmeta

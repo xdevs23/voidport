@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+# The guest rung: boot the probe guest against a real voidport server and
+# assert the round trip, from both ends.
+#
+# This runs outside the nix build sandbox on purpose. It needs `/dev/kvm` and
+# `/dev/vhost-vsock`, and a sandbox exposes neither; the module and the guest
+# image are derivations, this is not.
+#
+# What one run does:
+#
+#   1. allocates a vsock port and a guest cid, retrying a collision;
+#   2. starts an unmodified voidportd serving one namespace on that port;
+#   3. boots the guest, whose init loads the transport chain and the module;
+#   4. reads the server's own control plane until it reports the session;
+#   5. waits for the guest's own marker, asserts both ends of the exchange,
+#      and ends the guest.
+#
+# Usage: kernel/harness [runs]
+#
+# The run directory is deliberately outside the repository: it holds a unix
+# socket, and a `path:` flake reference copies the whole tree into the store,
+# which refuses sockets. Set VOIDPORT_HARNESS_DIR to move it.
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+runs=${1:-1}
+run_dir=${VOIDPORT_HARNESS_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/voidport-kernel-harness}
+heavy_lock=${VOIDPORT_HEAVY_LOCK:-$HOME/.cache/voidport-heavy.lock}
+
+# How long the guest is given to reach its init, and how long the control plane
+# is given to report the session the guest opened.
+boot_seconds=${VOIDPORT_HARNESS_BOOT_SECONDS:-120}
+session_seconds=${VOIDPORT_HARNESS_SESSION_SECONDS:-60}
+
+# The namespace the module asks for. It is compiled into the module, because a
+# module parameter carries integers only.
+namespace=probe
+
+say() { printf '%s\n' "harness: $*"; }
+die() {
+  printf '%s\n' "harness: $*" >&2
+  exit 1
+}
+
+for device in /dev/kvm /dev/vhost-vsock; do
+  [ -c "$device" ] || die "$device is missing, and the guest rung needs it"
+done
+
+# One machine-wide lock covers every heavy phase, this one included: a guest
+# booting beside a compile multiplies the memory spike.
+exec 9>"$heavy_lock"
+flock -w 5400 9 || die "gave up waiting for the heavy lock"
+
+say "building the guest image and the server"
+guest=$(nix-build --no-out-link "$root/kernel/nix" -A guest)
+tools=$(nix-build --no-out-link "$root/kernel/nix" -A harnessTools)
+binaries=$(
+  nix develop "path:$root" -c bash -c \
+    'cargo build -p voidportd -p voidport-ctl >&2 && printf %s "$CARGO_TARGET_DIR/debug"'
+)
+server_binary="$binaries/voidportd"
+control_binary="$binaries/voidport-ctl"
+qemu="$tools/bin/qemu-system-x86_64"
+
+# Every child this script starts belongs to the run: one exit path ends the
+# guest and the server together, however the script leaves.
+guest_pid=
+server_pid=
+stop_guest() {
+  [ -n "$guest_pid" ] || return 0
+  kill "$guest_pid" 2>/dev/null || true
+  wait "$guest_pid" 2>/dev/null || true
+  guest_pid=
+}
+stop_server() {
+  [ -n "$server_pid" ] || return 0
+  kill "$server_pid" 2>/dev/null || true
+  wait "$server_pid" 2>/dev/null || true
+  server_pid=
+}
+trap 'stop_guest; stop_server' EXIT INT TERM
+
+# A cid or a port already taken is answered by taking another, not by failing:
+# anything else on the machine may hold one, and one machine-wide lock covers
+# ladder runs but nothing outside them. The range is wide enough that a
+# collision is the exception it is treated as.
+pick_number() {
+  local low=$1 span=$2
+  printf '%s' "$((low + (RANDOM * 32768 + RANDOM) % span))"
+}
+
+# Waits until `$1` matches in `$2`, or until `$3` tenths of a second have
+# passed, or until the process `$4` has ended.
+await_line() {
+  local pattern=$1 file=$2 limit=$3 pid=$4 waited=0
+  while [ "$waited" -lt "$limit" ]; do
+    grep -aq -- "$pattern" "$file" && return 0
+    kill -0 "$pid" 2>/dev/null || return 1
+    sleep 0.1
+    waited=$((waited + 1))
+  done
+  return 1
+}
+
+# Starts the server on a free vsock port, setting `port`.
+start_server() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    port=$(pick_number 20000 40000)
+    # The readiness line below is an info record, and the server honours an
+    # inherited RUST_LOG: an environment that quiets it would leave this
+    # waiting for a line that is never written.
+    RUST_LOG=info "$server_binary" \
+      --state "$work/state.toml" \
+      --control-socket "$work/control.sock" \
+      share "$work/tree" --vsock "$port" --name "$namespace" \
+      >"$work/server.log" 2>&1 &
+    server_pid=$!
+    if await_line "serving a data listener" "$work/server.log" 100 "$server_pid"; then
+      return 0
+    fi
+    stop_server
+    say "vsock port $port could not be served; taking another"
+  done
+  die "no vsock port could be bound in five attempts"
+}
+
+# Boots the guest on a free cid, setting `cid`. A cid another guest already
+# claims is refused by the host's vsock device at startup, which is what the
+# retry reads.
+start_guest() {
+  local attempt
+  for attempt in 1 2 3 4 5; do
+    cid=$(pick_number 1048576 15728640)
+    "$qemu" \
+      -machine q35,accel=kvm -cpu host -m 512M \
+      -nographic -no-reboot \
+      -kernel "$guest/bzImage" -initrd "$guest/initramfs.cpio" \
+      -append "console=ttyS0 VOIDPORT_PORT=$port" \
+      -device "vhost-vsock-pci,guest-cid=$cid" \
+      </dev/null >"$work/guest.log" 2>&1 &
+    guest_pid=$!
+    if await_line "Run /init as init process" "$work/guest.log" \
+      "$((boot_seconds * 10))" "$guest_pid"; then
+      return 0
+    fi
+    stop_guest
+    say "guest cid $cid could not be claimed; taking another"
+  done
+  die "no guest cid could be claimed in five attempts"
+}
+
+# Reads the server's control plane until it reports the session the guest
+# opened, and keeps what it read.
+#
+# The session is identified, not counted: exactly one session, on the
+# namespace this run serves, over vsock, from the cid this run booted. An
+# aggregate over the whole list would be answered by any other client on the
+# machine, which is the opposite of what this run is measuring.
+await_session() {
+  local waited=0
+  while [ "$waited" -lt $((session_seconds * 5)) ]; do
+    if "$control_binary" --socket "$work/control.sock" --json session list \
+      >"$work/sessions.json" 2>/dev/null &&
+      "$tools/bin/jq" -e --arg cid "$cid" --arg namespace "$namespace" '
+        [ .result.sessions[]
+          | select(.peer | startswith($cid + ":"))
+          | select(.transport == "vsock" and .namespace == $namespace) ]
+        | length == 1
+      ' "$work/sessions.json" >/dev/null; then
+      return 0
+    fi
+    kill -0 "$guest_pid" 2>/dev/null || die "the guest ended before its session appeared"
+    sleep 0.2
+    waited=$((waited + 1))
+  done
+  die "the server never reported a vsock session"
+}
+
+# Fails unless the guest console carries the line.
+expect_console() {
+  grep -aq -- "$1" "$work/guest.log" ||
+    die "the guest console never said: $1"
+}
+
+for run in $(seq 1 "$runs"); do
+  work="$run_dir/run-$run"
+  rm -rf "$work"
+  mkdir -p "$work/tree"
+  printf 'served over a kernel vsock session\n' >"$work/tree/note.txt"
+
+  start_server
+  say "run $run: the server serves namespace $namespace on vsock port $port"
+
+  start_guest
+  say "run $run: the guest booted on cid $cid"
+
+  await_session
+  say "run $run: the server reports the session"
+
+  # The server registers a session before it writes the reply, so the control
+  # plane can answer while the module is still reading. The guest's own marker
+  # is what says the module's attempt is over, and only then is the console a
+  # complete record to assert against.
+  await_line "voidport harness: complete" "$work/guest.log" \
+    "$((boot_seconds * 10))" "$guest_pid" ||
+    die "the guest never finished its load attempt"
+
+  expect_console "voidport probe: created a kernel-owned vsock socket"
+  expect_console "voidport probe: connected to cid 2 port $port"
+  expect_console "voidport probe: sent "
+  expect_console "voidport probe: received "
+  expect_console "voidport probe: hello accepted:"
+  expect_console "voidport harness: the module loaded"
+
+  stop_guest
+  stop_server
+
+  say "run $run: the round trip holds; evidence in $work"
+  grep -a "voidport probe:\|voidport harness:" "$work/guest.log"
+  printf 'server sessions: %s\n' "$(cat "$work/sessions.json")"
+done
+
+say "$runs run(s) completed"

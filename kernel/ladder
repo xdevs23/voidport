@@ -1,0 +1,140 @@
+#!/usr/bin/env bash
+# The revalidation ladder for the voidport kernel client.
+#
+# Every kernel bump and every change to this directory runs it, in this order,
+# cheapest rung first so a failure is named by the smallest thing that can name
+# it:
+#
+#   1. the module's crate inputs against the workspace's own files;
+#   2. the workspace's wire crate, compiled under kbuild's own flags;
+#   3. the probe module, built out of tree against the kernel's build tree;
+#   4. style, against the kernel tree's own configuration;
+#   5. built-equals-loaded, checked instead of assumed;
+#   6. the guest round trip, against a real server.
+#
+# Every rung but the last is a derivation, so a repeat run of an unchanged tree
+# is answered from the store. The last is not: it needs the host's KVM and
+# vsock devices, which a build sandbox exposes neither of. That is also why
+# this script is its own entry point and the workspace check never calls it:
+# the check and the flake package build stay sandbox-clean and boot nothing.
+#
+# Usage: kernel/ladder [runs]
+#
+# `runs` is how many times the guest rung runs, which is how a fresh guest
+# address per run is exercised. It defaults to two, for exactly that reason.
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+runs=${1:-2}
+heavy_lock=${VOIDPORT_HEAVY_LOCK:-$HOME/.cache/voidport-heavy.lock}
+
+say() { printf '\n== %s\n' "$*"; }
+die() {
+  printf '%s\n' "ladder: $*" >&2
+  exit 1
+}
+
+# Heavy work serializes on one machine-wide lock, taken per rung instead of
+# for the whole ladder: the guest rung takes it for itself, and a lock held
+# across a rung that takes it again would wait on this script forever.
+heavy() (
+  exec 9>"$heavy_lock"
+  flock -w 5400 9 || exit 1
+  "$@"
+)
+
+build() { heavy nix-build --no-out-link "$root/kernel/nix" -A "$1"; }
+
+# Both sides of a crate input are NAR hashes: the store object the module was
+# built from, and the working tree the workspace builds from. A vendored copy,
+# a second wire crate or a stale lockfile answers with a different hash. Both
+# readers are nix's own, which is what the ladder is already run through.
+same_content() {
+  local name=$1 stored=$2 own=$3 theirs mine
+  theirs=$(nix-store --query --hash "$stored") || die "$name is not in the store"
+  mine=$(nix-hash --type sha256 --base32 "$root/$own")
+  [ "$theirs" = "sha256:$mine" ] ||
+    die "the module's $name is not the workspace's $own"
+}
+
+say "rung 1: the module's crate inputs are the workspace's"
+inputs=$(build crateInputs) || die "the module's crate inputs are unavailable"
+while read -r name value; do
+  case $name in
+    voidport-proto) same_content "$name" "$value" crates/voidport-proto ;;
+    lockfile) same_content "$name" "$value" Cargo.lock ;;
+    *) printf 'crate input: %s %s\n' "$name" "$value" ;;
+  esac
+done <"$inputs"
+printf 'crate inputs: the module builds the workspace files, not a copy\n'
+
+say "rung 2: the wire crate under kbuild"
+crate=$(build wireCrate) || die "the wire crate does not ride kbuild"
+printf 'wire crate object: %s\n' "$crate"
+
+say "rung 3: the probe module"
+module=$(build module) || die "the module does not build"
+printf 'module: %s\n' "$module"
+
+say "rung 4: style, against the kernel tree's own configuration"
+style=$(build style) || die "the kernel's style configuration is unavailable"
+tools=$(build tools) || die "the ladder's tools are unavailable"
+
+# The Rust is checked against the kernel tree's rustfmt configuration, from the
+# crate root: rustfmt follows the crate's own module tree from there, so no
+# file is checked twice and none is forgotten.
+"$tools/bin/rustfmt" --check \
+  --config-path "$style/.rustfmt.toml" \
+  "$root/kernel/probe/voidport_probe_main.rs" ||
+  die "the Rust does not match the kernel tree's rustfmt configuration"
+printf 'rustfmt: the module Rust matches the kernel tree configuration\n'
+
+# checkpatch has a C file to read only if one exists. The destination of this
+# module's C surface is empty, and the rung reports which state it is in
+# instead of being silently skipped.
+mapfile -t c_files < <("$tools/bin/find" "$root/kernel/probe" \
+  \( -name '*.c' -o -name '*.h' \) | sort)
+if [ "${#c_files[@]}" -eq 0 ]; then
+  printf 'checkpatch: the module has no C surface, so there is nothing to check\n'
+else
+  "$tools/bin/perl" "$style/scripts/checkpatch.pl" \
+    --no-tree --strict --terse --file "${c_files[@]}" ||
+    die "the C does not pass the kernel tree's checkpatch"
+  printf 'checkpatch: %s C file(s) pass\n' "${#c_files[@]}"
+fi
+
+# clippy is the second half of the same bar, and the kernel tree carries its
+# own configuration for it. kbuild runs it by building the module with
+# clippy-driver in the compiler's place, so this is a build of its own and not
+# the one that produces what is loaded.
+linted=$(build linted) || die "the Rust does not pass the kernel tree's clippy"
+printf 'clippy: the module Rust passes the kernel tree configuration (%s)\n' "$linted"
+
+say "rung 5: built equals loaded"
+# The rule that makes loading sound is that a module is only ever loaded on the
+# kernel it was built against. The guest carries both, so the check reads what
+# each of them says: the module's own vermagic against the release the image
+# states it boots.
+guest=$(build guest) || die "the guest image does not build"
+vermagic=$("$tools/bin/modinfo" -F vermagic "$module/voidport_probe.ko" | cut -d' ' -f1)
+release=$(cat "$guest/kernel-release")
+[ -n "$vermagic" ] || die "the module carries no vermagic"
+[ "$vermagic" = "$release" ] ||
+  die "the module was built for $vermagic and the guest boots $release"
+printf 'built equals loaded: %s\n' "$vermagic"
+
+# The same rule decides whether the module may be loaded on this machine at
+# all. It may only while the machine boots the very kernel the module was
+# built against; otherwise the guest is the only place it loads, and that is
+# read here instead of assumed either way.
+running=$(uname -r)
+if [ "$vermagic" = "$running" ]; then
+  printf 'this machine boots %s, so it may load the module too\n' "$running"
+else
+  printf 'this machine boots %s, so the guest is the only place it loads\n' "$running"
+fi
+
+say "rung 6: the guest round trip, $runs run(s)"
+"$root/kernel/harness" "$runs"
+
+say "the ladder holds"
