@@ -22,6 +22,11 @@
           nativeBuildInputs = [ pkgs.pkg-config ];
           buildInputs = [ pkgs.fuse3 ];
 
+          # Building the programs does not run the test suite: someone who
+          # wants the binaries should not wait for it or be stopped by it.
+          # The `tests` package is the same build with the suite switched on.
+          doCheck = false;
+
           # Each binary's build script renders its own manual page from its clap
           # definition into that crate's OUT_DIR, subcommand pages included.
           # They are collected here, not written by hand, so an option
@@ -41,6 +46,12 @@
               done
           '';
         };
+
+        # The test suite, for whoever asks for it: `nix build .#tests`.
+        tests = self.packages.${pkgs.stdenv.hostPlatform.system}.default.overrideAttrs (_: {
+          pname = "voidport-tests";
+          doCheck = true;
+        });
       });
 
       devShells = forAllSystems (pkgs: {
