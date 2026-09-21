@@ -380,6 +380,29 @@ Refinements from the rule-engine spec review (decided 2026-08-12):
   The earlier "generations distinguish recycled nodes" framing is
   retracted — with never-reused ids there is nothing to distinguish, and
   the ABI field stays for a future client that does reuse ids.
+  (Amended 2026-09-22, release 1.0.1: "never reused" means **never given
+  to another file**. The userspace client presents the node id as
+  `st_ino`, so an id that changed when the guest kernel forgot a file and
+  looked it up again changed the file's inode number under tools that
+  identify a file by device and inode; a compiler read one `#pragma once`
+  header twice in one compile that way. The node table now remembers the
+  id of a forgotten node with its key and its identity and gives that id
+  back when the same file is looked up again. A file that was replaced
+  in between gets a fresh id, and a retired id is never given out again,
+  so there is still nothing for a generation to distinguish. An id comes
+  back only where both identities carry a birth time and agree, or where
+  neither side has an identity, as for a synthesized directory: on a
+  filesystem that reports no birth time a recycled inode number could pass
+  for the forgotten file, so there a forgotten file gets a fresh id as it
+  did in 1.0.0, and no entry is kept for it, since none could ever be
+  used. The price is one small entry per forgotten file that carries a
+  birth time, for the life of the session. Where the operator configured `max_nodes`, the
+  remembered entries are kept to that same number, the oldest going first,
+  and a file whose entry went gets a fresh id at its next lookup; where no
+  cap is configured nothing bounds them but the session's end.
+  Presenting the host's inode number instead was set aside for this
+  release because the FUSE library takes an entry's node id from the inode
+  field of its attributes.)
 
 ## Policy changes vs. open handles
 
@@ -1798,8 +1821,9 @@ node and handle counts) served by the control plane and exposed by
    the pinned inode, not the replacement.
 5. Node identity: ino stable across lookups, hardlinks share an ino,
    FORGET at zero lookups closes the node fd (observed via /proc fd
-   count), session teardown closes everything, node ids are never reused
-   within a session, and the wire generation is 0.
+   count), session teardown closes everything, a node id is never given
+   to another file within a session and a forgotten file gets its id back
+   (amended 2026-09-22), and the wire generation is 0.
 6. Concurrency: overlapping requests complete out of order on one
    session; two sessions (one writer, one reader) observe each other's
    writes through the server.
@@ -1861,8 +1885,8 @@ server):
 **FUSE mapping.** A fuser (0.18) `Filesystem` implementation. The
 kernel node id is the server node id; `st_ino` presents the node id per
 the accepted fuser-coupling limitation; generation is 0 (probe-verified
-legal: the kernel compares generation for equality only, and node ids
-are never reused). Caller identity (uid/gid/pid) from each fuser
+legal: the kernel compares generation for equality only, and a node id
+is never given to another file). Caller identity (uid/gid/pid) from each fuser
 request fills the request head. The mount always sets
 `default_permissions` and `fsname=voidport`.
 
@@ -1999,7 +2023,8 @@ below.)
   Where btime is absent the check falls back to `(dev, ino, kind)`
   and the guarantee is stated best-effort for that filesystem. Only
   the pinned descriptor becomes evictable; `max_nodes` continues to
-  bound table entries.
+  bound table entries, and since 1.0.1 it bounds the remembered ids of
+  forgotten files by the same number.
 - **Budget**: at most N *cache-resident* node descriptors at once,
   across all sessions (the descriptor table is process-wide).
   Default: `clamp(soft RLIMIT_NOFILE / 2 − reserve, 4096, 262144)` —

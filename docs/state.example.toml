@@ -114,6 +114,14 @@ max_listing_entries = 1048576  # entries in one materialized listing (EOVERFLOW)
 # that would have exceeded it, so size it against the trees your guests walk, or
 # leave it unset and let the machine be the bound.
 #
+# Since 1.0.1 the server also remembers the node id of every file a guest has
+# forgotten, where the filesystem reports a birth time for it (ext4, btrfs and
+# xfs do), so the file shows the same inode number when it is looked up again:
+# one small record per forgotten file, far smaller than a held node, for the
+# life of the session. `max_nodes` bounds those records by the same
+# number, the oldest going first; with no cap configured only the end of the
+# session drops them.
+#
 # What the server does regardless of this table: at startup it raises
 # RLIMIT_NOFILE to the OS maximum (`/proc/sys/fs/nr_open`, commonly 1,048,576)
 # and logs what it got. It never lowers the limit, and failing to raise it is
