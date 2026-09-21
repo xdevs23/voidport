@@ -753,6 +753,51 @@ fn a_listing_larger_than_the_kernel_buffer_resumes_and_leaves_nothing_behind() {
     );
 }
 
+/// A file keeps its inode number on the mount after the guest kernel has
+/// dropped and re-looked it up, which is what a compiler that tells headers
+/// apart by device and inode number needs within one compile.
+///
+/// The node table recognizes a forgotten file by its birth time, so on a
+/// scratch filesystem that reports none only the lookup itself is asserted.
+#[test]
+fn a_file_keeps_its_inode_number_after_the_kernel_forgets_it() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = Fixture::start("stable-inode");
+    let host = fixture.host("tree/data.bin");
+    let has_birth_time = fs::metadata(&host).expect("stattable").created().is_ok();
+
+    let guest = fixture.mount("stable", "plain", "/tree");
+    let baseline = session_nodes(&fixture);
+    let before = fs::metadata(guest.path("data.bin"))
+        .expect("stattable")
+        .ino();
+    assert!(
+        session_nodes(&fixture) > baseline,
+        "the stat looked the file up"
+    );
+
+    fs::write("/proc/sys/vm/drop_caches", b"2\n").expect("a prunable dentry cache (needs root)");
+    assert!(
+        eventually(PATIENCE, || session_nodes(&fixture) <= baseline),
+        "the kernel did not give the file back; the session holds {} nodes against a baseline of {baseline}",
+        session_nodes(&fixture)
+    );
+
+    let after = fs::metadata(guest.path("data.bin"))
+        .expect("stattable")
+        .ino();
+    if has_birth_time {
+        assert_eq!(after, before, "the inode number changed across a forget");
+    } else {
+        eprintln!(
+            "the scratch filesystem reports no birth time; NOT PROVEN by this run: a file keeps \
+             its inode number after the kernel forgets it"
+        );
+    }
+}
+
 /// How many nodes the one live session holds.
 fn session_nodes(fixture: &Fixture) -> usize {
     let sessions = fixture.sessions();
