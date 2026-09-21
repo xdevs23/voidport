@@ -8,7 +8,10 @@
 //! unmount. Nothing leaked: the entries are freed correctly, and glibc simply
 //! keeps freed memory in its arenas instead of returning it to the kernel.
 //! "The guest forgot it" has to mean "the host got the memory back", and this
-//! module is what makes it mean that.
+//! module is what makes it mean that. What goes back is the node and its
+//! descriptor; one small entry per forgotten file stays for the life of the
+//! session, so that the file gets its node id back at its next lookup. That
+//! entry is no node and is not counted here.
 //!
 //! Two mechanisms, and both are needed — measured, not assumed (the arms are in
 //! `docs/PERFORMANCE.md`, 2026-08-15):

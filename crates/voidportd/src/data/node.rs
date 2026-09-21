@@ -7,14 +7,17 @@
 //!
 //! Three rules from the design shape the table:
 //!
-//! * **Node ids are generation-disjoint and never reused.** Every session's
-//!   mount root is node id 1, which is what lets one server serve many roots;
-//!   every other id comes from [`IdSpace`], which guarantees that no id is
-//!   handed out twice — not within a session, not across the sessions of one
-//!   server, and not across server restarts. That is what makes a stale id a
-//!   plain `ESTALE` after a reconnect instead of a silently different file.
-//!   Because ids are never reused, the wire's `generation` field is reserved
-//!   and carries 0.
+//! * **Node ids are generation-disjoint and never given to another file.**
+//!   Every session's mount root is node id 1, which is what lets one server
+//!   serve many roots; every other id comes from [`IdSpace`], which takes no
+//!   id twice — not within a session, not across the sessions of one server,
+//!   and not across server restarts. That is what makes a stale id a plain
+//!   `ESTALE` after a reconnect instead of a silently different file. The
+//!   one way an id comes back is to the same file: the table remembers the
+//!   id of a forgotten node and the next lookup of that file gets it again,
+//!   so a file keeps its id, and with it its inode number on the mount, for
+//!   the life of its session. Because an id never names a second file, the
+//!   wire's `generation` field is reserved and carries 0.
 //! * **Non-directories are keyed by `(host_dev, host_ino, effective mode)`.**
 //!   One host inode reachable through rules with different share modes is one
 //!   node id per mode, each with its own enforcement and presented bits, while
@@ -38,7 +41,7 @@
 //! counted through [`crate::reclaim`], which is what turns a drained table back
 //! into host memory, not allocator arena the process keeps for life.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
@@ -57,9 +60,9 @@ pub const ROOT_NODE_ID: u64 = 1;
 
 /// The generation every entry reply carries.
 ///
-/// Node ids are never reused within a session, so there is nothing for a
-/// generation to distinguish. The field stays on the wire for a future client
-/// that does reuse ids.
+/// A node id is never given to another file within a session, so there is
+/// nothing for a generation to distinguish. The field stays on the wire for a
+/// future client that does give an id to a second file.
 pub const GENERATION: u64 = 0;
 
 /// What backs a node.
@@ -361,6 +364,84 @@ pub struct NodeTable {
     /// The configured cap, or `None` where the operator configured none and the
     /// table grows until the process runs out of descriptors.
     limit: Option<usize>,
+    /// The ids of forgotten nodes, by the key each node had. Records, no
+    /// nodes: they hold no descriptor, and count neither toward the cap nor in
+    /// the reclaim ledger.
+    remembered: HashMap<NodeKey, Remembered>,
+    /// The order the records were remembered in, oldest first, kept only
+    /// under a configured cap, which is the one thing that pushes a record
+    /// out. A record recalled or dropped leaves its line behind; the age tells
+    /// such a line from the record of a later forget of the same key.
+    order: VecDeque<(u64, NodeKey)>,
+    /// The age the next record gets.
+    next_age: u64,
+}
+
+/// The id of a forgotten node, kept so the same file gets it back.
+#[derive(Debug)]
+struct Remembered {
+    id: u64,
+    /// When it was remembered, as a count of records made before it.
+    age: u64,
+    identity: Kept,
+}
+
+/// What a record keeps of the identity its node held.
+#[derive(Debug)]
+enum Kept {
+    /// The node held none: a synthesized directory.
+    Absent,
+    /// The key already carries the device and the inode number.
+    BesideKey {
+        kind: FileKind,
+        birth: Option<(i64, u32)>,
+    },
+    /// The key carries neither: a directory, keyed by its namespace path.
+    Whole(NodeIdentity),
+}
+
+impl Kept {
+    fn of(key: &NodeKey, held: Option<NodeIdentity>) -> Self {
+        match (key, held) {
+            (_, None) => Self::Absent,
+            (NodeKey::Inode { device, inode, .. }, Some(held))
+                if held.device == *device && held.inode == *inode =>
+            {
+                Self::BesideKey {
+                    kind: held.kind,
+                    birth: held.birth,
+                }
+            }
+            (_, Some(held)) => Self::Whole(held),
+        }
+    }
+
+    /// Whether the entry a lookup found under `key` is the file the record
+    /// was made for.
+    ///
+    /// Stricter than [`still_the_same`]: one side with an identity and one
+    /// without is no match, and neither is a pair in which a birth time is
+    /// missing. Without one the check rests on device, inode and kind, which a
+    /// recycled inode number satisfies, and a record waits far longer for its
+    /// file than a live node does.
+    fn names(&self, key: &NodeKey, found: Option<NodeIdentity>) -> bool {
+        let held = match (self, key) {
+            (Self::Absent, _) => return found.is_none(),
+            (Self::BesideKey { kind, birth }, NodeKey::Inode { device, inode, .. }) => {
+                NodeIdentity {
+                    device: *device,
+                    inode: *inode,
+                    kind: *kind,
+                    birth: *birth,
+                }
+            }
+            (Self::BesideKey { .. }, NodeKey::Directory(_)) => return false,
+            (Self::Whole(held), _) => *held,
+        };
+        found.is_some_and(|found| {
+            held.birth.is_some() && found.birth.is_some() && held.matches(&found)
+        })
+    }
 }
 
 /// A node plus the lookup count that keeps it alive.
@@ -372,8 +453,9 @@ struct Entry {
 }
 
 impl NodeTable {
-    /// An empty table naming nodes from `ids` and bounded by `limit` nodes, or
-    /// by nothing when it is `None`.
+    /// An empty table naming nodes from `ids`. `limit` bounds its nodes and,
+    /// by the same number, the ids it remembers of forgotten nodes; `None`
+    /// bounds neither.
     #[must_use]
     pub fn new(limit: Option<usize>, ids: IdSpace) -> Self {
         Self {
@@ -381,6 +463,9 @@ impl NodeTable {
             index: HashMap::new(),
             ids,
             limit,
+            remembered: HashMap::new(),
+            order: VecDeque::new(),
+            next_age: 0,
         }
     }
 
@@ -418,6 +503,13 @@ impl NodeTable {
     /// Returns the node for a resolved entry, allocating one if this is the
     /// first lookup of it, and counts the lookup either way.
     ///
+    /// A forgotten file gets the id it had: where the table remembers `key`
+    /// and the identity it remembers agrees with `found`, the node is built
+    /// with the remembered id. That still reports [`Interned::Created`],
+    /// because the node is new and the caller's fresh pin is the one it holds.
+    /// Where they disagree the record is dropped and a fresh id taken, so an id
+    /// never names two files.
+    ///
     /// `build` is only called when the entry is new, so a repeated lookup costs
     /// no descriptor. The flag says which happened, because the caller's reply
     /// must describe the node it got back, not what it just resolved —
@@ -432,8 +524,8 @@ impl NodeTable {
     /// # Errors
     ///
     /// Returns `ENFILE` when a configured table is full — the lookup that would
-    /// exceed the cap fails, and nothing is inserted. An unconfigured table
-    /// never returns it.
+    /// exceed the cap fails, and nothing is inserted; a remembered id stays
+    /// remembered for the next attempt. An unconfigured table never returns it.
     pub fn intern(
         &mut self,
         key: NodeKey,
@@ -443,10 +535,21 @@ impl NodeTable {
         if let Some(node) = self.revisit(&key, found) {
             return Ok((node, Interned::Existing));
         }
+        // A record of another file is dead whatever the cap answers.
+        if self
+            .remembered
+            .get(&key)
+            .is_some_and(|record| !record.identity.names(&key, found))
+        {
+            self.remembered.remove(&key);
+        }
         if self.limit.is_some_and(|limit| self.nodes.len() >= limit) {
             return Err(Errno::NFILE);
         }
-        let id = self.ids.take();
+        let id = match self.remembered.remove(&key) {
+            Some(record) => record.id,
+            None => self.ids.take(),
+        };
         let node = build(id);
         self.insert(id, key, node.clone());
         Ok((node, Interned::Created))
@@ -489,7 +592,7 @@ impl NodeTable {
     /// Takes a node out of the table, whatever its lookup count.
     ///
     /// The id is not reused, so nothing the client still holds against it can
-    /// ever name another file.
+    /// ever name another file. A retired node is not remembered.
     fn retire(&mut self, id: u64) {
         if let Some(entry) = self.nodes.remove(&id) {
             self.index.remove(&entry.key);
@@ -506,8 +609,10 @@ impl NodeTable {
 
     /// Drops `count` lookups from a node, forgetting it at zero.
     ///
-    /// Forgetting closes the pinned descriptor. The id is not reused: the
-    /// counter only moves forward.
+    /// Forgetting closes the pinned descriptor and takes the node out. The
+    /// table remembers its id under its key, so the next lookup of the same
+    /// file gets it back; the id is never given to another file. The mount
+    /// root is installed by its own path and is not remembered.
     pub fn forget(&mut self, id: u64, count: u64) {
         let Some(entry) = self.nodes.get_mut(&id) else {
             return;
@@ -518,6 +623,43 @@ impl NodeTable {
             self.index.remove(&entry.key);
             reclaim::released(1);
             self.shrink_if_drained();
+            if id != ROOT_NODE_ID {
+                self.remember(entry);
+            }
+        }
+    }
+
+    /// Records the id of a node that has just left the table.
+    ///
+    /// Under a configured cap the records are kept to that same number, the
+    /// oldest going first. A guest exceeds it only by forgetting more distinct
+    /// files than the cap lets it hold at once, so a cap sized for a working
+    /// set never pushes out a record of that working set.
+    fn remember(&mut self, entry: Entry) {
+        let age = self.next_age;
+        self.next_age += 1;
+        let identity = Kept::of(&entry.key, entry.node.identity());
+        let id = entry.node.id;
+        let Some(limit) = self.limit else {
+            self.remembered
+                .insert(entry.key, Remembered { id, age, identity });
+            return;
+        };
+        self.order.push_back((age, entry.key.clone()));
+        self.remembered
+            .insert(entry.key, Remembered { id, age, identity });
+        while self.remembered.len() > limit {
+            let (age, key) = self.order.pop_front().expect("a line per record");
+            if self.remembered.get(&key).is_some_and(|r| r.age == age) {
+                self.remembered.remove(&key);
+            }
+        }
+        // Lines whose record was recalled or dropped are swept once they are
+        // the larger half, which keeps the order within twice the cap.
+        if self.order.len() > 2 * limit.max(1) {
+            let remembered = &self.remembered;
+            self.order
+                .retain(|(age, key)| remembered.get(key).is_some_and(|r| r.age == *age));
         }
     }
 
@@ -548,6 +690,8 @@ impl NodeTable {
         reclaim::released(self.nodes.len());
         self.nodes.clear();
         self.index.clear();
+        self.remembered.clear();
+        self.order.clear();
     }
 
     /// How many nodes the session holds.
@@ -561,6 +705,13 @@ impl NodeTable {
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.nodes.is_empty()
+    }
+
+    /// How many forgotten ids the table remembers, which no lookup or forget
+    /// shows.
+    #[cfg(test)]
+    fn remembered(&self) -> usize {
+        self.remembered.len()
     }
 
     /// The lookup count of a node, for tests and diagnostics.
@@ -768,6 +919,75 @@ mod tests {
         node_of(0, entry, EffectiveMode::Rw).identity()
     }
 
+    /// A synthesized directory, which holds no identity.
+    fn synthesized(id: u64, name: &str) -> Node {
+        Node {
+            id,
+            ino: 3,
+            path: path(&format!("/{name}")),
+            backing: NodeBacking::Synthesized,
+        }
+    }
+
+    /// A node over one real entry that recorded `identity` for it.
+    fn node_as(id: u64, entry: &std::path::Path, identity: NodeIdentity) -> Node {
+        let fd = rustix::fs::openat(
+            rustix::fs::CWD,
+            entry,
+            rustix::fs::OFlags::PATH | rustix::fs::OFlags::NOFOLLOW,
+            rustix::fs::Mode::empty(),
+        )
+        .expect("the entry pins");
+        let pin = DescriptorBudget::new(4096).pin(Pinned {
+            fd,
+            path: path("/entry"),
+            backing: backing("entry"),
+            identity,
+            recipe: backing("entry"),
+        });
+        Node {
+            id,
+            ino: 7,
+            path: path("/entry"),
+            backing: NodeBacking::Host {
+                pin,
+                mode: EffectiveMode::Rw,
+                kind: identity.kind,
+            },
+        }
+    }
+
+    /// The identity of one real entry with a birth time, the entry's own
+    /// where the scratch filesystem reports one. The table compares birth
+    /// times and never reads them from the host, so a made-up one keeps these
+    /// tests the same on every filesystem.
+    fn born(entry: &std::path::Path) -> NodeIdentity {
+        let mut identity = identity_of(entry).expect("a host entry has an identity");
+        identity.birth = identity.birth.or(Some((1, 0)));
+        identity
+    }
+
+    /// The key a file of that identity gets.
+    fn key_of(identity: NodeIdentity) -> NodeKey {
+        NodeKey::Inode {
+            device: identity.device,
+            inode: identity.inode,
+            mode: EffectiveMode::Rw,
+        }
+    }
+
+    /// A table with the root installed and the given cap.
+    fn table_of(limit: Option<usize>) -> NodeTable {
+        let mut table = NodeTable::new(limit, crate::data::ids::Generations::shared().space());
+        table.install_root(
+            NodeKey::Directory(path("/")),
+            1,
+            path("/"),
+            NodeBacking::Synthesized,
+        );
+        table
+    }
+
     #[test]
     fn the_root_is_node_id_one_and_synthesized_nodes_have_no_descriptor() {
         let table = table();
@@ -790,7 +1010,7 @@ mod tests {
             mode: EffectiveMode::Rw,
         };
         let (first, interned) = table
-            .intern(key.clone(), None, |id| file(id, "a", 10, EffectiveMode::Rw))
+            .intern(key.clone(), None, |id| synthesized(id, "a"))
             .expect("room");
         assert_eq!(interned, Interned::Created);
         let (second, interned) = table
@@ -810,11 +1030,11 @@ mod tests {
         assert!(table.get(first.id).is_none());
         assert_eq!(table.len(), 1);
 
-        // And the id is not handed out again.
+        // Neither side offers an identity, so the file gets its id back.
         let (third, _) = table
-            .intern(key, None, |id| file(id, "a", 10, EffectiveMode::Rw))
+            .intern(key, None, |id| synthesized(id, "a"))
             .expect("room");
-        assert_ne!(third.id, first.id);
+        assert_eq!(third.id, first.id);
     }
 
     #[test]
@@ -1003,6 +1223,322 @@ mod tests {
         // And the forgets the client still owes for it are harmless.
         table.forget(old.id, 2);
         assert!(table.get(fresh.id).is_some(), "the fresh node is untouched");
+    }
+
+    #[test]
+    fn a_forgotten_file_gets_its_id_back_and_is_reported_as_created() {
+        let scratch = crate::testing::Scratch::new("node-recall");
+        let entry = scratch.file("entry", b"1");
+        let identity = born(&entry);
+        let mut table = table();
+
+        let (first, _) = table
+            .intern(key_of(identity), Some(identity), |id| {
+                node_as(id, &entry, identity)
+            })
+            .expect("room");
+        table.forget(first.id, 1);
+        assert!(table.get(first.id).is_none(), "a remembered id is stale");
+        assert_eq!(table.len(), 1, "a remembered entry is no node");
+        assert_eq!(table.remembered(), 1);
+
+        // A forget naming the remembered id changes nothing.
+        table.forget(first.id, 1);
+        assert_eq!(table.remembered(), 1);
+
+        let (again, interned) = table
+            .intern(key_of(identity), Some(identity), |id| {
+                node_as(id, &entry, identity)
+            })
+            .expect("room");
+        assert_eq!(again.id, first.id);
+        assert_eq!(
+            interned,
+            Interned::Created,
+            "the caller keeps its fresh pin"
+        );
+        assert_eq!(table.remembered(), 0);
+        assert_eq!(table.len(), 2);
+    }
+
+    #[test]
+    fn a_directory_keyed_by_path_gets_its_id_back() {
+        let scratch = crate::testing::Scratch::new("node-recall-dir");
+        let entry = scratch.file("entry", b"1");
+        let identity = born(&entry);
+        let key = NodeKey::Directory(path("/entry"));
+        let mut table = table();
+
+        let (first, _) = table
+            .intern(key.clone(), Some(identity), |id| {
+                node_as(id, &entry, identity)
+            })
+            .expect("room");
+        table.forget(first.id, 1);
+        let (again, _) = table
+            .intern(key, Some(identity), |id| node_as(id, &entry, identity))
+            .expect("room");
+        assert_eq!(again.id, first.id);
+    }
+
+    #[test]
+    fn a_synthesized_directory_admitted_again_gets_its_id_back() {
+        let mut table = table();
+        let key = NodeKey::Directory(path("/a"));
+        let (first, _) = table
+            .intern(key.clone(), None, |id| synthesized(id, "a"))
+            .expect("room");
+        table.forget(first.id, 1);
+        let (again, _) = table
+            .intern(key, None, |id| synthesized(id, "a"))
+            .expect("room");
+        assert_eq!(again.id, first.id);
+    }
+
+    #[test]
+    fn the_mount_root_is_never_remembered() {
+        let mut table = table();
+        table.forget(ROOT_NODE_ID, 1);
+        assert!(table.get(ROOT_NODE_ID).is_none());
+        assert_eq!(table.remembered(), 0);
+    }
+
+    #[test]
+    fn a_file_replaced_while_forgotten_gets_a_fresh_id() {
+        let scratch = crate::testing::Scratch::new("node-recall-replaced");
+        let first = scratch.file("first", b"1");
+        let second = scratch.file("second", b"2");
+        let held = born(&first);
+        // The replacement under the very same key: same device and inode
+        // number, as a recycled inode number has it, and another birth time.
+        let mut found = held;
+        found.birth = held.birth.map(|(seconds, nanos)| (seconds + 1, nanos));
+        let mut table = table();
+
+        let (old, _) = table
+            .intern(key_of(held), Some(held), |id| node_as(id, &first, held))
+            .expect("room");
+        table.forget(old.id, 1);
+        let (fresh, _) = table
+            .intern(key_of(held), Some(found), |id| node_as(id, &second, found))
+            .expect("room");
+        assert_ne!(fresh.id, old.id);
+        assert_eq!(table.remembered(), 0, "the dead entry was dropped");
+
+        // The old id is not given out again, not even to the file it named.
+        table.forget(fresh.id, 1);
+        let (third, _) = table
+            .intern(key_of(held), Some(held), |id| node_as(id, &first, held))
+            .expect("room");
+        assert_ne!(third.id, old.id);
+        assert_ne!(third.id, fresh.id);
+    }
+
+    #[test]
+    fn an_identity_on_one_side_only_gets_a_fresh_id() {
+        let scratch = crate::testing::Scratch::new("node-recall-one-sided");
+        let entry = scratch.file("entry", b"1");
+        let identity = born(&entry);
+        let mut table = table();
+
+        let (first, _) = table
+            .intern(key_of(identity), Some(identity), |id| {
+                node_as(id, &entry, identity)
+            })
+            .expect("room");
+        table.forget(first.id, 1);
+        let (second, _) = table
+            .intern(key_of(identity), None, |id| synthesized(id, "a"))
+            .expect("room");
+        assert_ne!(second.id, first.id);
+
+        // And the other way around: remembered without, looked up with.
+        table.forget(second.id, 1);
+        let (third, _) = table
+            .intern(key_of(identity), Some(identity), |id| {
+                node_as(id, &entry, identity)
+            })
+            .expect("room");
+        assert_ne!(third.id, second.id);
+        assert_ne!(third.id, first.id);
+    }
+
+    #[test]
+    fn an_identity_without_a_birth_time_gets_a_fresh_id() {
+        let scratch = crate::testing::Scratch::new("node-recall-no-birth");
+        let entry = scratch.file("entry", b"1");
+        let born = born(&entry);
+        let mut unborn = born;
+        unborn.birth = None;
+        let mut table = table();
+
+        let (first, _) = table
+            .intern(key_of(unborn), Some(unborn), |id| {
+                node_as(id, &entry, unborn)
+            })
+            .expect("room");
+        table.forget(first.id, 1);
+        assert_eq!(table.remembered(), 1);
+        let (second, _) = table
+            .intern(key_of(unborn), Some(unborn), |id| {
+                node_as(id, &entry, unborn)
+            })
+            .expect("room");
+        assert_ne!(second.id, first.id);
+
+        // A birth time on the looking side alone is no match either.
+        table.forget(second.id, 1);
+        let (third, _) = table
+            .intern(key_of(born), Some(born), |id| node_as(id, &entry, born))
+            .expect("room");
+        assert_ne!(third.id, second.id);
+    }
+
+    #[test]
+    fn a_retired_id_is_never_reused() {
+        let scratch = crate::testing::Scratch::new("node-recall-retired");
+        let first = scratch.file("first", b"1");
+        let second = scratch.file("second", b"2");
+        let (held, other) = (born(&first), born(&second));
+        let key = NodeKey::Directory(path("/entry"));
+        let mut table = table();
+
+        let (old, _) = table
+            .intern(key.clone(), Some(held), |id| node_as(id, &first, held))
+            .expect("room");
+        let (fresh, _) = table
+            .intern(key.clone(), Some(other), |id| node_as(id, &second, other))
+            .expect("room");
+        assert_ne!(fresh.id, old.id);
+        assert_eq!(table.remembered(), 0, "a retired node is not remembered");
+
+        // The first file back under the key retires the second node and gets
+        // an id of its own, never the retired one.
+        let (third, _) = table
+            .intern(key, Some(held), |id| node_as(id, &first, held))
+            .expect("room");
+        assert_ne!(third.id, old.id);
+        assert_ne!(third.id, fresh.id);
+    }
+
+    #[test]
+    fn a_recall_at_a_full_table_is_refused_and_succeeds_once_room_exists() {
+        let mut table = table();
+        let key = NodeKey::Directory(path("/a"));
+        let (first, _) = table
+            .intern(key.clone(), None, |id| synthesized(id, "a"))
+            .expect("room");
+        table.forget(first.id, 1);
+
+        let mut filling = Vec::new();
+        for name in ["b", "c", "d"] {
+            let (node, _) = table
+                .intern(NodeKey::Directory(path(&format!("/{name}"))), None, |id| {
+                    synthesized(id, name)
+                })
+                .expect("room");
+            filling.push(node.id);
+        }
+        assert_eq!(table.len(), 4);
+        let full = table
+            .intern(key.clone(), None, |_| {
+                unreachable!("a refused recall builds nothing")
+            })
+            .expect_err("the table is full");
+        assert_eq!(full, Errno::NFILE);
+        assert_eq!(
+            table.remembered(),
+            1,
+            "the entry waits for the next attempt"
+        );
+
+        table.forget(filling[0], 1);
+        let (again, _) = table
+            .intern(key, None, |id| synthesized(id, "a"))
+            .expect("room");
+        assert_eq!(again.id, first.id);
+    }
+
+    #[test]
+    fn every_forgotten_node_is_remembered_until_the_table_is_cleared() {
+        let mut table = table_of(None);
+        let mut ids = Vec::new();
+        for index in 0..100u64 {
+            let (node, _) = table
+                .intern(NodeKey::Directory(path(&format!("/{index}"))), None, |id| {
+                    synthesized(id, "a")
+                })
+                .expect("room");
+            ids.push(node.id);
+        }
+        for id in ids {
+            table.forget(id, 1);
+        }
+        assert_eq!(table.remembered(), 100);
+        assert_eq!(table.len(), 1, "remembered entries are not nodes");
+        table.clear();
+        assert_eq!(table.remembered(), 0);
+    }
+
+    #[test]
+    fn a_cap_keeps_the_newest_remembered_entries_and_evicts_the_oldest() {
+        let mut table = table_of(Some(3));
+        let key = |index: u64| NodeKey::Directory(path(&format!("/{index}")));
+        let mut ids = Vec::new();
+        for index in 0..5u64 {
+            let (node, _) = table
+                .intern(key(index), None, |id| synthesized(id, "a"))
+                .expect("room");
+            ids.push(node.id);
+            table.forget(node.id, 1);
+        }
+        assert_eq!(table.remembered(), 3);
+
+        // The newest is still known, the oldest gets a fresh id.
+        let (newest, _) = table
+            .intern(key(4), None, |id| synthesized(id, "a"))
+            .expect("room");
+        assert_eq!(newest.id, ids[4]);
+        let (oldest, _) = table
+            .intern(key(0), None, |id| synthesized(id, "a"))
+            .expect("room");
+        assert!(!ids.contains(&oldest.id));
+    }
+
+    #[test]
+    fn one_file_forgotten_many_times_evicts_nothing() {
+        let mut table = table_of(Some(3));
+        let other = NodeKey::Directory(path("/other"));
+        let (kept, _) = table
+            .intern(other.clone(), None, |id| synthesized(id, "other"))
+            .expect("room");
+        table.forget(kept.id, 1);
+        let key = NodeKey::Directory(path("/a"));
+        for _ in 0..50 {
+            let (node, _) = table
+                .intern(key.clone(), None, |id| synthesized(id, "a"))
+                .expect("room");
+            table.forget(node.id, 1);
+        }
+        assert_eq!(table.remembered(), 2);
+        assert!(
+            table.order.len() <= 6,
+            "recalled entries leave no growing trail"
+        );
+        let (again, _) = table
+            .intern(other, None, |id| synthesized(id, "other"))
+            .expect("room");
+        assert_eq!(again.id, kept.id);
+    }
+
+    /// The size the documents quote for one remembered entry. A record keyed
+    /// by a directory owns the bytes of its namespace path on top of it.
+    #[test]
+    fn a_remembered_entry_stays_lean() {
+        let record = std::mem::size_of::<Remembered>();
+        let with_key = std::mem::size_of::<(NodeKey, Remembered)>();
+        println!("Remembered: {record} bytes, with its key: {with_key} bytes");
+        assert!(with_key <= 128, "{with_key} bytes per remembered entry");
     }
 
     #[test]

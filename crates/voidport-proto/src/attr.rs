@@ -68,10 +68,11 @@ wire_struct! {
     /// An entry reply: the node id a lookup produced, plus its attributes.
     ///
     /// A node id is session-scoped and keyed by
-    /// `(host_dev, host_ino, effective_share_mode)`. `generation` distinguishes a
-    /// reused node id from its previous life. Every entry reply — including each
-    /// readdirplus entry — increments the node's lookup count, which `forget`
-    /// decrements.
+    /// `(host_dev, host_ino, effective_share_mode)`. `generation` would tell a
+    /// node id given to a second file from its previous life; a server that
+    /// never gives an id to another file sends 0. Every entry reply — including
+    /// each readdirplus entry — increments the node's lookup count, which
+    /// `forget` decrements.
     pub struct EntryOut {
         /// Session-scoped node id naming the file in later operations.
         pub node_id: U64,

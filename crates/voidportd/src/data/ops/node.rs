@@ -24,8 +24,8 @@ use crate::records::PrivilegedBits;
 
 /// The entry reply a resolved node produces.
 ///
-/// The generation is 0 by contract: node ids are never reused within a
-/// session, so there is nothing for it to distinguish.
+/// The generation is 0 by contract: a node id is never given to another file
+/// within a session, so there is nothing for it to distinguish.
 pub fn entry_of(resolved: &Resolved) -> EntryOut {
     EntryOut {
         node_id: U64::new(resolved.node.id),
