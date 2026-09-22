@@ -12,8 +12,7 @@
 //! descriptor. A forgotten node whose identity has a birth time, or is absent
 //! for a synthesized directory, leaves a small record in its session. A lookup
 //! proving the same identity gets its node id back while that record remains.
-//! A configured node cap also bounds these records, with the oldest removed
-//! first. These records hold no nodes and are not counted here.
+//! These records hold no nodes and are not counted here.
 //!
 //! Two mechanisms, and both are needed — measured, not assumed (the arms are in
 //! `docs/PERFORMANCE.md`, 2026-08-15):
