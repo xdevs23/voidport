@@ -600,6 +600,7 @@ impl NodeTable {
         }
     }
 
+    /// A record and its ordering entry must be removed together.
     fn remove_remembered(&mut self, key: &NodeKey) -> Option<Remembered> {
         let record = self.remembered.remove(key)?;
         self.order.remove(&record.age);
