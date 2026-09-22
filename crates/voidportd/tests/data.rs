@@ -871,7 +871,7 @@ fn node_identity_is_stable_shared_by_hardlinks_and_released_by_forget() {
 
     // A forgotten file gets its node id back, where the scratch filesystem
     // reports a birth time for the table to recognize it by. The ino on the
-    // wire was stable before this and proves nothing here.
+    // wire is stable for any lookup and proves nothing about the node id.
     let fresh = client.lookup(ROOT, "data.bin").expect("resolves");
     if fs::metadata(&path).expect("stattable").created().is_ok() {
         assert_eq!(
