@@ -383,65 +383,7 @@ struct Remembered {
     id: u64,
     /// When it was remembered, as a count of records made before it.
     age: u64,
-    identity: Kept,
-}
-
-/// What a record keeps of the identity its node held.
-#[derive(Debug)]
-enum Kept {
-    /// The node held none: a synthesized directory.
-    Absent,
-    /// The key already carries the device and the inode number.
-    BesideKey {
-        kind: FileKind,
-        birth: Option<(i64, u32)>,
-    },
-    /// The key carries neither: a directory, keyed by its namespace path.
-    Whole(NodeIdentity),
-}
-
-impl Kept {
-    fn of(key: &NodeKey, held: Option<NodeIdentity>) -> Self {
-        match (key, held) {
-            (_, None) => Self::Absent,
-            (NodeKey::Inode { device, inode, .. }, Some(held))
-                if held.device == *device && held.inode == *inode =>
-            {
-                Self::BesideKey {
-                    kind: held.kind,
-                    birth: held.birth,
-                }
-            }
-            (_, Some(held)) => Self::Whole(held),
-        }
-    }
-
-    /// Whether the entry a lookup found under `key` is the file the record
-    /// was made for.
-    ///
-    /// Stricter than [`still_the_same`]: one side with an identity and one
-    /// without is no match, and neither is a pair in which a birth time is
-    /// missing. Without one the check rests on device, inode and kind, which a
-    /// recycled inode number satisfies, and a record waits far longer for its
-    /// file than a live node does.
-    fn names(&self, key: &NodeKey, found: Option<NodeIdentity>) -> bool {
-        let held = match (self, key) {
-            (Self::Absent, _) => return found.is_none(),
-            (Self::BesideKey { kind, birth }, NodeKey::Inode { device, inode, .. }) => {
-                NodeIdentity {
-                    device: *device,
-                    inode: *inode,
-                    kind: *kind,
-                    birth: *birth,
-                }
-            }
-            (Self::BesideKey { .. }, NodeKey::Directory(_)) => return false,
-            (Self::Whole(held), _) => *held,
-        };
-        found.is_some_and(|found| {
-            held.birth.is_some() && found.birth.is_some() && held.matches(&found)
-        })
-    }
+    identity: Option<NodeIdentity>,
 }
 
 /// A node plus the lookup count that keeps it alive.
@@ -539,7 +481,7 @@ impl NodeTable {
         if self
             .remembered
             .get(&key)
-            .is_some_and(|record| !record.identity.names(&key, found))
+            .is_some_and(|record| !both_prove_the_same(record.identity, found))
         {
             self.remembered.remove(&key);
         }
@@ -638,7 +580,7 @@ impl NodeTable {
     fn remember(&mut self, entry: Entry) {
         let age = self.next_age;
         self.next_age += 1;
-        let identity = Kept::of(&entry.key, entry.node.identity());
+        let identity = entry.node.identity();
         let id = entry.node.id;
         let Some(limit) = self.limit else {
             self.remembered
@@ -822,6 +764,24 @@ fn still_the_same(held: Option<NodeIdentity>, found: Option<NodeIdentity>) -> bo
     match (held, found) {
         (Some(held), Some(found)) => held.matches(&found),
         _ => true,
+    }
+}
+
+/// Whether both identities prove that a forgotten file is the one found.
+///
+/// Stricter than [`still_the_same`]: one side with an identity and one
+/// without is no match, and neither is a pair in which a birth time is
+/// missing. Without one the check rests on device, inode and kind, which a
+/// recycled inode number satisfies, and a record waits far longer for its
+/// file than a live node does. Two absent identities name a synthesized
+/// directory under the same namespace path.
+fn both_prove_the_same(held: Option<NodeIdentity>, found: Option<NodeIdentity>) -> bool {
+    match (held, found) {
+        (None, None) => true,
+        (Some(held), Some(found)) => {
+            held.birth.is_some() && found.birth.is_some() && held.matches(&found)
+        }
+        _ => false,
     }
 }
 
