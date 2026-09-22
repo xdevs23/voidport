@@ -42,7 +42,7 @@
 //! counted through [`crate::reclaim`], which is what turns a drained table back
 //! into host memory, not allocator arena the process keeps for life.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap};
 use std::os::fd::OwnedFd;
 use std::sync::Arc;
 
@@ -370,10 +370,9 @@ pub struct NodeTable {
     /// neither toward the cap nor in the reclaim ledger.
     remembered: HashMap<NodeKey, Remembered>,
     /// The order the records were remembered in, oldest first, kept only
-    /// under a configured cap, which is the one thing that pushes a record
-    /// out. A record recalled or dropped leaves its line behind; the age tells
-    /// such a line from the record of a later forget of the same key.
-    order: VecDeque<(u64, NodeKey)>,
+    /// under a configured cap. Each remembered record has exactly one entry,
+    /// removed with the record on recall, rejection or eviction.
+    order: BTreeMap<u64, NodeKey>,
     /// The age the next record gets.
     next_age: u64,
 }
@@ -407,7 +406,7 @@ impl NodeTable {
             ids,
             limit,
             remembered: HashMap::new(),
-            order: VecDeque::new(),
+            order: BTreeMap::new(),
             next_age: 0,
         }
     }
@@ -484,12 +483,12 @@ impl NodeTable {
             .get(&key)
             .is_some_and(|record| !both_prove_the_same(record.identity, found))
         {
-            self.remembered.remove(&key);
+            self.remove_remembered(&key);
         }
         if self.limit.is_some_and(|limit| self.nodes.len() >= limit) {
             return Err(Errno::NFILE);
         }
-        let id = match self.remembered.remove(&key) {
+        let id = match self.remove_remembered(&key) {
             Some(record) => record.id,
             None => self.ids.take(),
         };
@@ -593,22 +592,19 @@ impl NodeTable {
                 .insert(entry.key, Remembered { id, age, identity });
             return;
         };
-        self.order.push_back((age, entry.key.clone()));
+        self.order.insert(age, entry.key.clone());
         self.remembered
             .insert(entry.key, Remembered { id, age, identity });
         while self.remembered.len() > limit {
-            let (age, key) = self.order.pop_front().expect("a line per record");
-            if self.remembered.get(&key).is_some_and(|r| r.age == age) {
-                self.remembered.remove(&key);
-            }
+            let (_, key) = self.order.pop_first().expect("an entry per record");
+            self.remembered.remove(&key);
         }
-        // Lines whose record was recalled or dropped are swept once they are
-        // the larger half, which keeps the order within twice the cap.
-        if self.order.len() > 2 * limit.max(1) {
-            let remembered = &self.remembered;
-            self.order
-                .retain(|(age, key)| remembered.get(key).is_some_and(|r| r.age == *age));
-        }
+    }
+
+    fn remove_remembered(&mut self, key: &NodeKey) -> Option<Remembered> {
+        let record = self.remembered.remove(key)?;
+        self.order.remove(&record.age);
+        Some(record)
     }
 
     /// Gives back the table's own storage once most of it is empty.
@@ -1451,11 +1447,77 @@ mod tests {
         }
         for id in ids {
             table.forget(id, 1);
+            assert_exact_order(&table);
         }
         assert_eq!(table.remembered(), 100);
         assert_eq!(table.len(), 1, "remembered entries are not nodes");
         table.clear();
         assert_eq!(table.remembered(), 0);
+        assert_exact_order(&table);
+    }
+
+    fn assert_exact_order(table: &NodeTable) {
+        for key in table.remembered.keys() {
+            assert!(!table.index.contains_key(key));
+        }
+        if table.limit.is_none() {
+            assert!(table.order.is_empty());
+            return;
+        }
+        assert_eq!(table.order.len(), table.remembered.len());
+        for (age, key) in &table.order {
+            assert_eq!(table.remembered.get(key).expect("current record").age, *age);
+        }
+        for (key, record) in &table.remembered {
+            assert_eq!(table.order.get(&record.age), Some(key));
+        }
+    }
+
+    #[test]
+    fn the_order_contains_exactly_the_current_records() {
+        let mut table = table_of(Some(3));
+        let key = |name: &str| NodeKey::Directory(path(&format!("/{name}")));
+        for name in ["a", "b", "entry"] {
+            let (node, _) = table
+                .intern(key(name), None, |id| synthesized(id, name))
+                .expect("room");
+            assert_exact_order(&table);
+            table.forget(node.id, 1);
+            assert_exact_order(&table);
+        }
+
+        let recalled_id = table.remembered[&key("b")].id;
+        let (recalled, _) = table
+            .intern(key("b"), None, |id| synthesized(id, "b"))
+            .expect("room");
+        assert_eq!(recalled.id, recalled_id);
+        assert_exact_order(&table);
+        table.forget(recalled.id, 1);
+        assert_exact_order(&table);
+
+        let (new, _) = table
+            .intern(key("d"), None, |id| synthesized(id, "d"))
+            .expect("room");
+        table.forget(new.id, 1);
+        assert!(!table.remembered.contains_key(&key("a")));
+        assert!(table.remembered.contains_key(&key("b")));
+        assert_exact_order(&table);
+
+        let scratch = crate::testing::Scratch::new("node-order-rejection");
+        let entry = std::path::PathBuf::from(scratch.directory("entry"));
+        let identity = born(&entry);
+        let rejected_id = table.remembered[&key("entry")].id;
+        let (replacement, _) = table
+            .intern(key("entry"), Some(identity), |id| {
+                node_as(id, &entry, identity)
+            })
+            .expect("room");
+        assert_ne!(replacement.id, rejected_id);
+        assert_exact_order(&table);
+
+        table.clear();
+        assert!(table.remembered.is_empty());
+        assert_exact_order(&table);
     }
 
     #[test]
