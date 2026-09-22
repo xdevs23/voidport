@@ -534,7 +534,7 @@ impl NodeTable {
     /// Takes a node out of the table, whatever its lookup count.
     ///
     /// The id is not reused, so nothing the client still holds against it can
-    /// ever name another file. A retired node is not remembered.
+    /// ever name another file.
     fn retire(&mut self, id: u64) {
         if let Some(entry) = self.nodes.remove(&id) {
             self.index.remove(&entry.key);
