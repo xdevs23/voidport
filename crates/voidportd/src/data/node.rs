@@ -587,17 +587,16 @@ impl NodeTable {
         let age = self.next_age;
         self.next_age += 1;
         let id = entry.node.id;
-        let Some(limit) = self.limit else {
-            self.remembered
-                .insert(entry.key, Remembered { id, age, identity });
-            return;
-        };
-        self.order.insert(age, entry.key.clone());
+        if self.limit.is_some() {
+            self.order.insert(age, entry.key.clone());
+        }
         self.remembered
             .insert(entry.key, Remembered { id, age, identity });
-        while self.remembered.len() > limit {
-            let (_, key) = self.order.pop_first().expect("an entry per record");
-            self.remembered.remove(&key);
+        if let Some(limit) = self.limit {
+            while self.remembered.len() > limit {
+                let (_, key) = self.order.pop_first().expect("an entry per record");
+                self.remembered.remove(&key);
+            }
         }
     }
 
