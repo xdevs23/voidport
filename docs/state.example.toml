@@ -117,10 +117,15 @@ max_listing_entries = 1048576  # entries in one materialized listing (EOVERFLOW)
 # Since 1.0.1 the server also remembers the node id of every file a guest has
 # forgotten, where the filesystem reports a birth time for it (ext4, btrfs and
 # xfs do), so the file shows the same inode number when it is looked up again:
-# one small record per forgotten file, far smaller than a held node, for the
-# life of the session. `max_nodes` bounds those records by the same
-# number, the oldest going first; with no cap configured only the end of the
-# session drops them.
+# one small record per forgotten file with a birth time, and per synthesized
+# directory. On x86-64 the record is 64 bytes, or 96 bytes with its key,
+# excluding collection storage and the namespace path bytes a directory key
+# owns. A configured cap also needs one ordering entry with a copy of the key
+# per record, including another copy of a directory's path bytes.
+# `max_nodes` bounds those records by the same number, the oldest going
+# first. A file gets its id back while its matching record remains. With no
+# cap configured, records remain until recall, identity mismatch or the end
+# of the session.
 #
 # What the server does regardless of this table: at startup it raises
 # RLIMIT_NOFILE to the OS maximum (`/proc/sys/fs/nr_open`, commonly 1,048,576)

@@ -952,7 +952,9 @@ limit (`LimitNOFILE=`, `ulimit -n`) for more concurrent large guests, or
 configure `max_nodes`/`max_handles` as opt-in throttles where guests are not
 trusted to be reasonable. (Since 1.0.1 `max_nodes` also bounds the
 remembered node ids of forgotten files, by the same number; unset, a session
-keeps one small record per file it has forgotten until it ends.) Where both are configured the server checks
+keeps one small record per forgotten file whose identity carries a birth
+time, and per synthesized directory, until it ends.) Where both are
+configured the server checks
 `max_nodes + max_handles + 1024` against the limit it reached and warns when
 the caps promise more than the process can back. The sizing note in
 `docs/state.example.toml` carries the same arithmetic for operators.

@@ -396,7 +396,8 @@ Refinements from the rule-engine spec review (decided 2026-08-12):
   for the forgotten file, so there a forgotten file gets a fresh id as it
   did in 1.0.0, and no entry is kept for it, since none could ever be
   used. The price is one small entry per forgotten file that carries a
-  birth time, for the life of the session. Where the operator configured `max_nodes`, the
+  birth time, and per forgotten synthesized directory, for the life of
+  the session. Where the operator configured `max_nodes`, the
   remembered entries are kept to that same number, the oldest going first,
   and a file whose entry went gets a fresh id at its next lookup; where no
   cap is configured nothing bounds them but the session's end.
