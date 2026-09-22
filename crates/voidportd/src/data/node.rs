@@ -14,10 +14,11 @@
 //!   and not across server restarts. That is what makes a stale id a plain
 //!   `ESTALE` after a reconnect instead of a silently different file. The
 //!   one way an id comes back is to the same file: the table remembers the
-//!   id of a forgotten node and the next lookup of that file gets it again,
-//!   so a file keeps its id, and with it its inode number on the mount, for
-//!   the life of its session. Because an id never names a second file, the
-//!   wire's `generation` field is reserved and carries 0.
+//!   id of a forgotten node whose identity carries a birth time, or which
+//!   has no identity because it is a synthesized directory. A lookup that
+//!   proves the same identity gets that id and inode number back while the
+//!   record remains in the session. Because an id never names a second file,
+//!   the wire's `generation` field is reserved and carries 0.
 //! * **Non-directories are keyed by `(host_dev, host_ino, effective mode)`.**
 //!   One host inode reachable through rules with different share modes is one
 //!   node id per mode, each with its own enforcement and presented bits, while
@@ -364,9 +365,9 @@ pub struct NodeTable {
     /// The configured cap, or `None` where the operator configured none and the
     /// table grows until the process runs out of descriptors.
     limit: Option<usize>,
-    /// The ids of forgotten nodes, by the key each node had. Records, no
-    /// nodes: they hold no descriptor, and count neither toward the cap nor in
-    /// the reclaim ledger.
+    /// The ids of forgotten nodes whose identity has a birth time or is
+    /// absent, by the key each node had. Records hold no descriptor and count
+    /// neither toward the cap nor in the reclaim ledger.
     remembered: HashMap<NodeKey, Remembered>,
     /// The order the records were remembered in, oldest first, kept only
     /// under a configured cap, which is the one thing that pushes a record
@@ -552,9 +553,10 @@ impl NodeTable {
     /// Drops `count` lookups from a node, forgetting it at zero.
     ///
     /// Forgetting closes the pinned descriptor and takes the node out. The
-    /// table remembers its id under its key, so the next lookup of the same
-    /// file gets it back; the id is never given to another file. The mount
-    /// root is installed by its own path and is not remembered.
+    /// table remembers its id under its key if its identity has a birth time
+    /// or is absent, so a lookup proving the same file gets it back. The id
+    /// is never given to another file. The mount root is installed by its
+    /// own path and is not remembered.
     pub fn forget(&mut self, id: u64, count: u64) {
         let Some(entry) = self.nodes.get_mut(&id) else {
             return;
@@ -571,16 +573,20 @@ impl NodeTable {
         }
     }
 
-    /// Records the id of a node that has just left the table.
+    /// Records the id of a node that has just left the table, if its identity
+    /// has a birth time or is absent.
     ///
     /// Under a configured cap the records are kept to that same number, the
     /// oldest going first. A guest exceeds it only by forgetting more distinct
     /// files than the cap lets it hold at once, so a cap sized for a working
     /// set never pushes out a record of that working set.
     fn remember(&mut self, entry: Entry) {
+        let identity = entry.node.identity();
+        if identity.is_some_and(|identity| identity.birth.is_none()) {
+            return;
+        }
         let age = self.next_age;
         self.next_age += 1;
-        let identity = entry.node.identity();
         let id = entry.node.id;
         let Some(limit) = self.limit else {
             self.remembered
@@ -1338,7 +1344,7 @@ mod tests {
             })
             .expect("room");
         table.forget(first.id, 1);
-        assert_eq!(table.remembered(), 1);
+        assert_eq!(table.remembered(), 0);
         let (second, _) = table
             .intern(key_of(unborn), Some(unborn), |id| {
                 node_as(id, &entry, unborn)
@@ -1346,12 +1352,24 @@ mod tests {
             .expect("room");
         assert_ne!(second.id, first.id);
 
-        // A birth time on the looking side alone is no match either.
         table.forget(second.id, 1);
+        assert_eq!(table.remembered(), 0);
         let (third, _) = table
             .intern(key_of(born), Some(born), |id| node_as(id, &entry, born))
             .expect("room");
         assert_ne!(third.id, second.id);
+        assert_ne!(third.id, first.id);
+
+        // A birth time on the remembered side alone cannot prove a match.
+        table.forget(third.id, 1);
+        assert_eq!(table.remembered(), 1);
+        let (fourth, _) = table
+            .intern(key_of(unborn), Some(unborn), |id| {
+                node_as(id, &entry, unborn)
+            })
+            .expect("room");
+        assert_ne!(fourth.id, third.id);
+        assert_eq!(table.remembered(), 0);
     }
 
     #[test]
