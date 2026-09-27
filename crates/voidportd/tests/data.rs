@@ -696,69 +696,75 @@ fn a_symlink_is_returned_as_a_symlink_and_never_followed() {
 }
 
 #[test]
-fn a_symlink_node_is_not_a_hard_link_target() {
+fn a_symlink_node_gains_a_second_name_by_a_hard_link() {
     let fixture = Fixture::start("link-symlink");
-    fs::write(fixture.join("outside.txt"), b"outside the graft").expect("writable");
-    let outside = fixture.join("outside.txt");
-    symlink(&outside, fixture.tree("escape")).expect("writable");
-    let mut client = fixture.server.mount("plain", "/tree");
-
-    let link = client.lookup(ROOT, "escape").expect("resolves");
-    assert!(link.is_symlink());
-
-    // `link` hardlinks through `/proc/self/fd` with `AT_SYMLINK_FOLLOW`, and
-    // only the kind check keeps that from being asked to resolve a symlink.
-    // Nothing but a regular file or a directory may be a hard-link target.
-    assert_eq!(
-        client
-            .link(ROOT, link.node_id, "copied")
-            .expect_err("a symlink is not a hard-link target"),
-        status::PERM
-    );
-    assert!(!fixture.tree("copied").exists(), "and nothing was created");
-    assert_eq!(
-        fs::metadata(&outside).expect("host-side").nlink(),
-        1,
-        "the outside file gained no name inside the graft"
-    );
-}
-
-#[test]
-fn a_guest_symlink_to_an_outside_path_cannot_be_linked_into_a_graft() {
-    let fixture = Fixture::start("link-symlink-escape");
     let outside = fixture.join("outside.txt");
     fs::write(&outside, b"outside the graft").expect("writable");
     let outside_path = outside.to_str().expect("a utf-8 fixture path");
     let mut client = fixture.server.mount("plain", "/tree");
 
-    // The guest's own symlink, naming an absolute path the namespace never
-    // grafted, looked up as the symlink node it is.
-    let created = client
+    // One symlink made on the host whose target does not exist, and one the
+    // guest made naming a host file the namespace never grafted.
+    symlink("/nowhere/at/all", fixture.tree("dangling")).expect("writable");
+    client
         .symlink(ROOT, "escape", outside_path)
         .expect("a guest may create a symlink");
-    assert!(created.is_symlink());
-    let looked_up = client.lookup(ROOT, "escape").expect("resolves");
-    assert!(looked_up.is_symlink());
 
-    // Hard-linking it must not become a way to give the *target* a name inside
-    // the graft: the target is whatever the guest wrote, and the server never
-    // resolves that.
+    for (name, target) in [("dangling", "/nowhere/at/all"), ("escape", outside_path)] {
+        let original = client.lookup(ROOT, name).expect("resolves");
+        assert!(original.is_symlink());
+        let second = format!("{name}-again");
+
+        // As on a local filesystem, `linkat` without a follow flag names the
+        // symlink itself a second time and resolves nothing.
+        let linked = client
+            .link(ROOT, original.node_id, &second)
+            .expect("a symlink is a hard-link target");
+        assert!(linked.is_symlink(), "{name}: the second name is a symlink");
+        assert_eq!(linked.attr.ino.get(), original.attr.ino.get(), "{name}");
+        assert_eq!(linked.attr.nlink.get(), 2, "{name}");
+        assert_eq!(
+            client.readlink(linked.node_id).expect("readable"),
+            target.as_bytes(),
+            "{name}: the target text is carried over verbatim"
+        );
+
+        // The host holds the same: two names of one symlink inode.
+        let host_original = fs::symlink_metadata(fixture.tree(name)).expect("host-side");
+        let host_second = fs::symlink_metadata(fixture.tree(&second)).expect("host-side");
+        assert!(host_second.file_type().is_symlink(), "{name}");
+        assert_eq!(host_second.ino(), host_original.ino(), "{name}");
+        assert_eq!(host_second.nlink(), 2, "{name}");
+        assert_eq!(
+            fs::read_link(fixture.tree(&second)).expect("host-side"),
+            std::path::Path::new(target),
+            "{name}"
+        );
+    }
+
+    // The file outside the graft was never resolved, so it has no new name
+    // and no new contents.
+    assert_eq!(fs::read(&outside).expect("host-side"), b"outside the graft");
+    assert_eq!(fs::metadata(&outside).expect("host-side").nlink(), 1);
+}
+
+#[test]
+fn a_directory_node_is_refused_a_hard_link_by_the_host() {
+    let fixture = Fixture::start("link-directory");
+    let mut client = fixture.server.mount("plain", "/tree");
+    let sub = client.lookup(ROOT, "sub").expect("resolves");
+    assert!(sub.is_directory());
+
     assert_eq!(
         client
-            .link(ROOT, looked_up.node_id, "escaped")
-            .expect_err("a symlink node is not a hard-link target"),
+            .link(ROOT, sub.node_id, "sub-again")
+            .expect_err("a directory is not a hard-link target"),
         status::PERM
     );
-    assert!(!fixture.tree("escaped").exists());
-    assert_eq!(
-        fs::metadata(&outside).expect("host-side").nlink(),
-        1,
-        "no name inside the graft names the outside inode"
+    assert!(
+        fs::symlink_metadata(fixture.tree("sub-again")).is_err(),
+        "and nothing was created"
     );
-    let escaped = client
-        .lookup(ROOT, "escaped")
-        .expect_err("nothing was made");
-    assert_eq!(escaped, status::NOENT);
 }
 
 #[test]

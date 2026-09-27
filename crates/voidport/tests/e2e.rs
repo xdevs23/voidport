@@ -510,6 +510,77 @@ fn posix_continuity_survives_the_proxy() {
     );
 }
 
+/// A hard link through the mount behaves as `linkat` without
+/// `AT_SYMLINK_FOLLOW` does on a local filesystem: a symlink gets a second name
+/// of its own, whatever its target, a regular file links, a directory is refused
+/// with `EPERM`, and a read-only file gains no writable name.
+#[test]
+fn a_hard_link_of_a_symlink_names_the_symlink_itself() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = Fixture::start("link-symlink");
+    let outside = fixture.directory.write("outside.txt", "outside the share");
+    // The namespace root holds `/tree` read-write and `/readonly`, the same host
+    // tree read-only, so one mount reaches both share modes.
+    let guest = fixture.mount("link-symlink", "plain", "/");
+    let link = |from: &str, to: &str| {
+        rustix::fs::linkat(
+            rustix::fs::CWD,
+            guest.path(from),
+            rustix::fs::CWD,
+            guest.path(to),
+            rustix::fs::AtFlags::empty(),
+        )
+    };
+
+    std::os::unix::fs::symlink("/nowhere/at/all", guest.path("tree/dangling"))
+        .expect("symlinkable");
+    std::os::unix::fs::symlink(&outside, guest.path("tree/escape")).expect("symlinkable");
+    for (name, target) in [
+        ("dangling", Path::new("/nowhere/at/all")),
+        ("escape", outside.as_path()),
+    ] {
+        let original = format!("tree/{name}");
+        let second = format!("tree/{name}-again");
+        link(&original, &second).expect("a symlink is a hard-link target");
+        let left = fs::symlink_metadata(guest.path(&original)).expect("stat");
+        let right = fs::symlink_metadata(guest.path(&second)).expect("stat");
+        assert!(right.file_type().is_symlink(), "{name}: still a symlink");
+        assert_eq!(left.ino(), right.ino(), "{name}: one inode, two names");
+        assert_eq!(right.nlink(), 2, "{name}");
+        assert_eq!(
+            fs::read_link(guest.path(&second)).expect("readable"),
+            target,
+            "{name}: the target text is carried over verbatim"
+        );
+    }
+    // Nothing resolved the second symlink's target on the host.
+    assert_eq!(fs::read(&outside).expect("host-side"), b"outside the share");
+    assert_eq!(fs::metadata(&outside).expect("host-side").nlink(), 1);
+
+    link("tree/data.bin", "tree/data-again").expect("a regular file links");
+    assert_eq!(
+        fs::metadata(guest.path("tree/data-again"))
+            .expect("stat")
+            .nlink(),
+        2
+    );
+
+    assert_eq!(
+        link("tree/sub", "tree/sub-again").expect_err("a directory is not a hard-link target"),
+        rustix::io::Errno::PERM
+    );
+    assert!(fs::symlink_metadata(fixture.host("tree/sub-again")).is_err());
+
+    assert_eq!(
+        link("readonly/data.bin", "tree/escaped")
+            .expect_err("a read-only file may not gain a writable name"),
+        rustix::io::Errno::ROFS
+    );
+    assert!(fs::symlink_metadata(fixture.host("tree/escaped")).is_err());
+}
+
 /// What `df` reports for a mount, which the design decided per node kind and
 /// nothing end to end had ever pinned.
 ///

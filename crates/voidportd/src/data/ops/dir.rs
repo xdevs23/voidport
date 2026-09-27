@@ -28,7 +28,7 @@ use super::{Context, OpResult, name_of};
 use crate::data::node::Move;
 use crate::data::session::{Resolved, Session, Site};
 use crate::host::open::{pin_child, proc_path};
-use crate::host::{FileKind, HostAttr, HostIdentity};
+use crate::host::{HostAttr, HostIdentity};
 use crate::rules::GuestIds;
 
 /// Creates a directory.
@@ -220,25 +220,22 @@ fn moving(site: &Site) -> Option<HostIdentity> {
 /// `AT_SYMLINK_FOLLOW`, which is the unprivileged spelling of "link this
 /// descriptor's inode"; `AT_EMPTY_PATH` would need `CAP_DAC_READ_SEARCH`.
 ///
-/// Two things are enforced before that syscall, and both are the design's:
+/// The target's kind is the host's to judge, as it is for a local `linkat`: a
+/// symlink, a FIFO or a socket gets a second name, and a directory is refused
+/// by the host with `EPERM`. The follow flag cannot resolve a symlink's target
+/// here. The node's descriptor is opened `O_PATH | O_NOFOLLOW`, so for a
+/// symlink node it is the link itself, and the flag follows only the `/proc`
+/// magic link to that inode. The second name is the symlink, whatever its
+/// target text names, as observed on ext4 and btrfs.
 ///
-/// * **The target's kind.** Only a regular file or a directory may be a
-///   hard-link target (`EPERM` otherwise). `AT_SYMLINK_FOLLOW` is a *follow*
-///   flag, and the one thing this server must never do is resolve a guest's
-///   symlink on the host side; refusing the kind outright means the follow flag
-///   can never be handed a symlink, whatever a future magic-link or kernel
-///   behaviour would make of one.
-/// * **Both ends' share modes.** The destination is [`Session::site`]'s
-///   business, but the **source node** must be writable too: a hard link is a
-///   new name for an inode, so linking a read-only node into a read-write
-///   directory would let the guest open that inode for writing under the new
-///   name. Read-only means the inode, not the path that reached it.
+/// Both ends' share modes are enforced before that syscall. The destination is
+/// [`Session::site`]'s business, but the **source node** must be writable too:
+/// a hard link is a new name for an inode, so linking a read-only node into a
+/// read-write directory would let the guest open that inode for writing under
+/// the new name. Read-only means the inode, not the path that reached it.
 pub fn link(context: &Context<'_>, request: Request<'_, LinkRequest>) -> OpResult {
     let session = context.session;
     let target = session.node(request.body().target_node_id.get())?;
-    if !matches!(target.kind(), FileKind::Regular | FileKind::Directory) {
-        return Err(Errno::PERM);
-    }
     target.require_writable()?;
     let parent = session.node(request.head().node_id.get())?;
     let name = name_of(request.name())?;
