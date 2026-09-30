@@ -10,13 +10,12 @@
 //!
 //! Two things in here are subtler than a map of descriptors:
 //!
-//! * **Locks need one open file description per wire lock owner.** OFD locks
-//!   belong to the description, and probing showed that two owners sharing one
-//!   description have their locks *coalesce* instead of conflicting. So a file
-//!   handle lazily reopens a description per owner — to its own access, never
-//!   wider, so a read-only handle cannot take a write lock — and drops it when
-//!   that owner's locks are released; closing a description releases exactly
-//!   its own locks and nothing else's.
+//! * **Locks belong to the file, not to the handle.** A POSIX record lock is
+//!   its owner's for the whole file, whichever descriptor placed it, so a file
+//!   handle holds no locks of its own: it joins the session's lock set for its
+//!   file (see [`crate::data::locks`]), which every handle on that file shares.
+//!   What the handle decides is whether a request through it may place a lock
+//!   of its kind, from the access it was opened with.
 //! * **Directory listings are materialized at opendir.** The listing a guest
 //!   walks is not the host's: it is the host children merged with the
 //!   directory's literal-rule children, each decided by the rule engine, with
@@ -28,13 +27,14 @@
 
 use std::collections::HashMap;
 use std::os::fd::{AsFd, BorrowedFd, OwnedFd};
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
 
 use rustix::fs::OFlags;
 use rustix::io::Errno;
 
 use crate::data::ids::IdSpace;
-use crate::host::open::reopen;
+use crate::data::locks::{FileLocks, LockAccess, Membership};
+use crate::host::lock::LockKind;
 use crate::host::{BackingIo, HostIdentity};
 use crate::rules::{Name, Resolution};
 
@@ -114,9 +114,12 @@ impl DirListing {
 pub struct FileHandle {
     /// The descriptor reads and writes go through.
     fd: OwnedFd,
-    /// The node's pinned `O_PATH` descriptor, kept so per-owner lock
-    /// descriptions can be reopened from the same inode later.
-    pinned: Arc<OwnedFd>,
+    /// The handle's place in the session's lock set for the file, shared with
+    /// every other handle on it.
+    locks: Membership,
+    /// Which kinds of lock may be placed through the handle: the access it was
+    /// opened with.
+    access: LockAccess,
     /// Whether the handle was opened for writing.
     writable: bool,
     /// Whether this description reaches its file through the host page cache or
@@ -124,25 +127,24 @@ pub struct FileHandle {
     /// meet. Decided once, from the flags the description was opened with, so a
     /// posture changed afterwards leaves this handle exactly as it was.
     backing: BackingIo,
-    /// One open file description per wire lock owner, created on that owner's
-    /// first lock and dropped when its locks are released.
-    owners: Mutex<HashMap<u64, Arc<OwnedFd>>>,
 }
 
 impl FileHandle {
-    /// Wraps an opened descriptor.
+    /// Wraps an opened descriptor, joining `locks`, the session's lock set for
+    /// its file.
     ///
     /// `flags` are the flags the description was opened with, which is what
-    /// decides how its reads and writes reach the file.
+    /// decides how its reads and writes reach the file and which locks may be
+    /// placed through it.
     #[must_use]
-    pub fn new(fd: OwnedFd, pinned: Arc<OwnedFd>, writable: bool, flags: OFlags) -> Self {
+    pub fn new(fd: OwnedFd, locks: Membership, writable: bool, flags: OFlags) -> Self {
         let backing = BackingIo::of(fd.as_fd(), flags);
         Self {
             fd,
-            pinned,
+            locks,
+            access: LockAccess::of(flags),
             writable,
             backing,
-            owners: Mutex::new(HashMap::new()),
         }
     }
 
@@ -164,97 +166,31 @@ impl FileHandle {
         self.writable
     }
 
-    /// The description `owner` already holds locks through, if it has one.
-    ///
-    /// A query — `getlk` — answers through this and never through
-    /// [`Self::lock_description`]: a description is a host descriptor, and a
-    /// guest that may name `u64::MAX` owners must not be able to make the
-    /// server open one per name. An owner with no description holds no locks,
-    /// so any lock-free description of the same inode answers its `getlk`
-    /// identically.
+    /// The session's lock set for this handle's file.
     #[must_use]
-    pub fn description(&self, owner: u64) -> Option<Arc<OwnedFd>> {
-        self.owners().get(&owner).map(Arc::clone)
+    pub fn locks(&self) -> &Arc<FileLocks> {
+        self.locks.locks()
     }
 
-    /// The open file description that carries `owner`'s locks, reopening one on
-    /// first use.
+    /// The access the handle was opened with, as far as locks are concerned.
+    #[must_use]
+    pub fn access(&self) -> LockAccess {
+        self.access
+    }
+
+    /// Checks that a lock of `kind` may be placed through this handle.
     ///
-    /// **The description is never opened wider than the handle itself.** A lock
-    /// lives on a description, and the kernel refuses a write lock through one
-    /// that cannot be written — `EBADF`, exactly as through a local `O_RDONLY`
-    /// descriptor. Reopening read-write regardless would do two things the
-    /// design forbids: hand a guest holding a read-only handle an exclusive
-    /// lock it could not take locally, and have the server open a read-only
-    /// graft's file for writing on its own authority, which is the one thing
-    /// share-mode enforcement exists to prevent.
-    ///
-    /// A writable handle is reopened read-write, because one description must
-    /// serve that owner's read locks too; where the file itself cannot be read,
-    /// a write-only description is the fallback and a read lock is what fails
-    /// on it. Either way the errno is the host's, not an invention.
+    /// The kernel refuses a read lock through a descriptor not open for reading
+    /// and a write lock through one not open for writing, with `EBADF`, and the
+    /// same holds through a handle: the description the lock is placed on is
+    /// the owner's, shared with the owner's other handles on the file, so the
+    /// handle is what says which kinds this request may take.
     ///
     /// # Errors
     ///
-    /// Returns the host errno of the reopen.
-    pub fn lock_description(&self, owner: u64) -> Result<Arc<OwnedFd>, Errno> {
-        let mut owners = self.owners();
-        if let Some(description) = owners.get(&owner) {
-            return Ok(Arc::clone(description));
-        }
-        let description = Arc::new(self.reopen_description()?);
-        owners.insert(owner, Arc::clone(&description));
-        Ok(description)
-    }
-
-    /// A fresh open file description, to the handle's own access.
-    fn reopen_description(&self) -> Result<OwnedFd, Errno> {
-        if !self.writable {
-            return reopen(self.pinned.as_fd(), OFlags::RDONLY);
-        }
-        match reopen(self.pinned.as_fd(), OFlags::RDWR) {
-            Ok(description) => Ok(description),
-            // A file the server may write but not read: the write-only
-            // description still carries this owner's write locks.
-            Err(error) => reopen(self.pinned.as_fd(), OFlags::WRONLY).map_err(|_| error),
-        }
-    }
-
-    /// Drops `owner`'s description, releasing exactly that owner's locks.
-    pub fn release_owner(&self, owner: u64) {
-        self.owners().remove(&owner);
-    }
-
-    /// Drops a description whose lock was refused, so a rejected request costs
-    /// no descriptor.
-    ///
-    /// It is dropped only if it is still the one this owner is filed under and
-    /// nothing else holds it: a concurrent request sharing this description may
-    /// have placed a lock through it in the meantime, and that lock must
-    /// survive.
-    pub fn discard_unused(&self, owner: u64, description: &Arc<OwnedFd>) {
-        let mut owners = self.owners();
-        let unused = owners
-            .get(&owner)
-            .is_some_and(|held| Arc::ptr_eq(held, description))
-            && Arc::strong_count(description) == 2;
-        if unused {
-            owners.remove(&owner);
-        }
-    }
-
-    /// How many owners hold a lock description on this handle.
-    #[must_use]
-    pub fn lock_owners(&self) -> usize {
-        self.owners().len()
-    }
-
-    /// Takes the owner map, ignoring poisoning: a panicking caller can leave
-    /// behind an extra description, which is a closed descriptor at worst.
-    fn owners(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<OwnedFd>>> {
-        self.owners
-            .lock()
-            .unwrap_or_else(|poison| poison.into_inner())
+    /// Returns `EBADF` where the handle's access does not cover `kind`.
+    pub fn permits(&self, kind: LockKind) -> Result<(), Errno> {
+        self.access.permits(kind).then_some(()).ok_or(Errno::BADF)
     }
 }
 
@@ -404,10 +340,10 @@ impl HandleTable {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::lock::{LockKind, LockRange, set, test as test_lock};
+    use crate::data::locks::LockSets;
+    use crate::host::open::reopen;
     use crate::rules::{EffectiveMode, HostBacking, HostTarget};
     use crate::testing::Scratch;
-    use std::fs;
 
     fn name(raw: &str) -> Name {
         Name::new(raw).expect("valid name")
@@ -420,8 +356,8 @@ mod tests {
         }
     }
 
-    /// A file handle over a real file, as `open` builds one.
-    fn handle(scratch: &Scratch) -> FileHandle {
+    /// A file handle over a real file opened with `flags`, as `open` builds one.
+    fn opened(scratch: &Scratch, flags: OFlags) -> FileHandle {
         let path = scratch.file("file", &[0u8; 64]);
         let pinned = Arc::new(
             rustix::fs::openat(
@@ -432,8 +368,18 @@ mod tests {
             )
             .expect("the file pins"),
         );
-        let fd = reopen(pinned.as_fd(), OFlags::RDWR).expect("the pin reopens");
-        FileHandle::new(fd, pinned, true, OFlags::RDWR)
+        let fd = reopen(pinned.as_fd(), flags).expect("the pin reopens");
+        let writable = flags.contains(OFlags::WRONLY) || flags.contains(OFlags::RDWR);
+        let identity = crate::host::attr::HostAttr::of(pinned.as_fd())
+            .expect("stattable")
+            .node_identity();
+        let membership = Arc::new(LockSets::default()).join(identity, &pinned);
+        FileHandle::new(fd, membership, writable, flags)
+    }
+
+    /// A read-write file handle over a real file.
+    fn handle(scratch: &Scratch) -> FileHandle {
+        opened(scratch, OFlags::RDWR)
     }
 
     #[test]
@@ -485,90 +431,26 @@ mod tests {
     }
 
     #[test]
-    fn each_lock_owner_gets_its_own_description() {
+    fn a_handle_permits_the_lock_kinds_its_access_covers() {
         let scratch = Scratch::new("handle");
-        let handle = handle(&scratch);
+        let both = opened(&scratch, OFlags::RDWR);
+        assert!(both.permits(LockKind::Read).is_ok());
+        assert!(both.permits(LockKind::Write).is_ok());
 
-        let first = handle.lock_description(1).expect("reopens");
-        let again = handle.lock_description(1).expect("cached");
-        let second = handle.lock_description(2).expect("reopens");
-        assert!(Arc::ptr_eq(&first, &again), "one description per owner");
-        assert_eq!(handle.lock_owners(), 2);
+        let reader = opened(&scratch, OFlags::RDONLY);
+        assert!(reader.permits(LockKind::Read).is_ok());
+        assert_eq!(reader.permits(LockKind::Write), Err(Errno::BADF));
 
-        // Two owners of one handle genuinely conflict.
-        set(first.as_fd(), LockKind::Write, LockRange::new(0, 9)).expect("free");
-        assert_eq!(
-            set(second.as_fd(), LockKind::Write, LockRange::new(0, 9))
-                .expect_err("the first owner holds it"),
-            Errno::AGAIN
-        );
+        let writer = opened(&scratch, OFlags::WRONLY);
+        assert_eq!(writer.permits(LockKind::Read), Err(Errno::BADF));
+        assert!(writer.permits(LockKind::Write).is_ok());
 
-        // Releasing one owner releases only its locks.
-        handle.release_owner(1);
-        drop(first);
-        drop(again);
-        assert_eq!(handle.lock_owners(), 1);
-        assert_eq!(
-            test_lock(second.as_fd(), LockKind::Write, LockRange::new(0, 9)).expect("testable"),
-            None
-        );
-    }
-
-    #[test]
-    fn a_description_is_kept_only_for_an_owner_that_may_hold_a_lock() {
-        let scratch = Scratch::new("handle");
-        let handle = handle(&scratch);
-        assert!(
-            handle.description(1).is_none(),
-            "an owner that never locked has none, and asking must not make one"
-        );
-
-        // A description whose lock the host refused is dropped again.
-        let first = handle.lock_description(1).expect("reopens");
-        assert!(
-            handle
-                .description(1)
-                .is_some_and(|held| Arc::ptr_eq(&held, &first))
-        );
-        handle.discard_unused(1, &first);
-        assert_eq!(handle.lock_owners(), 0);
-
-        // One a concurrent request is still holding is kept: that request may
-        // have placed a lock through it.
-        let second = handle.lock_description(2).expect("reopens");
-        let shared = handle.description(2).expect("filed");
-        handle.discard_unused(2, &second);
-        assert_eq!(handle.lock_owners(), 1);
-        drop(shared);
-        handle.discard_unused(2, &second);
-        assert_eq!(handle.lock_owners(), 0);
-    }
-
-    #[test]
-    fn a_read_only_file_still_gets_a_description() {
-        let scratch = Scratch::new("handle");
-        let path = scratch.file("readonly", b"x");
-        let mut permissions = fs::metadata(&path).expect("stattable").permissions();
-        #[allow(
-            clippy::permissions_set_readonly_false,
-            reason = "the file is made read-only"
-        )]
-        permissions.set_readonly(true);
-        fs::set_permissions(&path, permissions).expect("settable");
-        let pinned = Arc::new(
-            rustix::fs::openat(
-                rustix::fs::CWD,
-                &path,
-                OFlags::PATH,
-                rustix::fs::Mode::empty(),
-            )
-            .expect("the file pins"),
-        );
-        let fd = reopen(pinned.as_fd(), OFlags::RDONLY).expect("the pin reopens");
-        let handle = FileHandle::new(fd, pinned, false, OFlags::RDONLY);
-        assert!(!handle.is_writable());
-        // Read-write is not available, so the fallback description is.
-        assert!(handle.lock_description(7).is_ok());
+        for handle in [&both, &reader, &writer] {
+            assert!(
+                handle.permits(LockKind::Unlock).is_ok(),
+                "releasing needs no access"
+            );
+        }
     }
 
     #[test]

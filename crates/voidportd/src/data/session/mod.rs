@@ -51,6 +51,7 @@ use crate::data::caps::Limits;
 use crate::data::handle::HandleTable;
 use crate::data::ino::InoAllocator;
 use crate::data::listener::Transport;
+use crate::data::locks::LockSets;
 use crate::data::node::{Node, NodeBacking, NodeKey, NodeTable, ROOT_NODE_ID};
 use crate::data::pin::{DescriptorBudget, Pinned};
 use crate::data::server::{Identity, Registries};
@@ -146,6 +147,8 @@ pub struct Session {
     limits: Limits,
     nodes: Mutex<NodeTable>,
     handles: Mutex<HandleTable>,
+    /// The record locks the session holds, one set per host file.
+    locks: Arc<LockSets>,
     /// The share subscription's outgoing queue, drained by this connection's
     /// writer beside its replies.
     ///
@@ -276,6 +279,7 @@ impl Session {
             limits,
             nodes: Mutex::new(nodes),
             handles: Mutex::new(HandleTable::new(limits.max_handles, generations.space())),
+            locks: Arc::new(LockSets::default()),
             notifications: NotificationQueue::new(),
         })
     }

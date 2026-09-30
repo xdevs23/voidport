@@ -12,8 +12,9 @@
 //! * [`pin`] — the server-global descriptor cache a node's `O_PATH` pin is a
 //!   slot in, and the identity-verified re-pin that makes evicting one safe;
 //! * [`node`] and [`handle`] — the per-session tables: what a node id names,
-//!   what a handle holds, and the lock descriptions a handle lends to each wire
-//!   lock owner;
+//!   and what a handle holds;
+//! * [`locks`] — the record locks a session holds, one set per host file,
+//!   shared by every handle on that file;
 //! * [`session`] — a mount: the namespace it serves by name, the lookups it
 //!   resolves against the registry's current snapshot of it, and the listings
 //!   it materializes;
@@ -37,6 +38,7 @@ pub mod handle;
 pub mod ids;
 pub mod ino;
 pub mod listener;
+pub mod locks;
 pub mod node;
 pub mod ops;
 pub mod pin;

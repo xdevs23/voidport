@@ -1928,6 +1928,78 @@ fn two_wire_owners_on_one_handle_conflict_and_unlock_independently() {
 }
 
 #[test]
+fn one_owner_locks_one_file_through_every_handle_it_holds() {
+    let fixture = Fixture::start("locks-one-owner");
+    let mut client = fixture.server.mount("plain", "/tree");
+    let file = client.lookup(ROOT, "data.bin").expect("resolves");
+    let first = client.open(file.node_id, O_RDWR).expect("opens");
+    let second = client.open(file.node_id, O_RDWR).expect("opens again");
+
+    // A POSIX lock is its owner's for the whole file: the owner locking again
+    // through a second handle extends its own lock instead of conflicting.
+    client
+        .setlk(first, lock(1, lock_type::WRITE, 0, u64::MAX), false)
+        .expect("the range is free");
+    client
+        .setlk(second, lock(1, lock_type::WRITE, 0, u64::MAX), false)
+        .expect("the owner's own lock");
+    for handle in [first, second] {
+        let own = client
+            .getlk(handle, lock(1, lock_type::WRITE, 0, 3))
+            .expect("testable");
+        assert_eq!(
+            own.lock_type.get(),
+            lock_type::UNLOCK,
+            "an owner never conflicts with itself"
+        );
+        assert_eq!(
+            client
+                .setlk(handle, lock(2, lock_type::WRITE, 0, 3), false)
+                .expect_err("another owner still conflicts"),
+            status::AGAIN
+        );
+    }
+
+    // Closing either descriptor releases every lock the owner holds on the
+    // file, whichever handle placed it.
+    client.flush(second, 1).expect("flushes");
+    client
+        .setlk(first, lock(2, lock_type::WRITE, 0, 3), false)
+        .expect("owner 1 let go of the whole file");
+}
+
+#[test]
+fn an_owner_upgrades_its_read_lock_through_a_writable_handle() {
+    let fixture = Fixture::start("locks-upgrade");
+    let mut client = fixture.server.mount("plain", "/tree");
+    let file = client.lookup(ROOT, "data.bin").expect("resolves");
+    let reader = client.open(file.node_id, O_RDONLY).expect("opens to read");
+    let writer = client.open(file.node_id, O_RDWR).expect("opens to write");
+
+    client
+        .setlk(reader, lock(1, lock_type::READ, 0, u64::MAX), false)
+        .expect("the range is free");
+    // A write lock through the read-only handle is refused, as through a local
+    // `O_RDONLY` descriptor.
+    assert_eq!(
+        client
+            .setlk(reader, lock(1, lock_type::WRITE, 0, u64::MAX), false)
+            .expect_err("the handle is not writable"),
+        status::BADF
+    );
+    // Through the writable handle the owner's read lock becomes a write lock.
+    client
+        .setlk(writer, lock(1, lock_type::WRITE, 0, u64::MAX), false)
+        .expect("the owner's own read lock converts");
+    assert_eq!(
+        client
+            .setlk(reader, lock(2, lock_type::READ, 0, 3), false)
+            .expect_err("owner 1 now holds the file exclusively"),
+        status::AGAIN
+    );
+}
+
+#[test]
 fn a_read_only_handle_takes_no_write_lock() {
     let fixture = Fixture::start("lock-share-mode");
     let mut client = fixture.server.mount("plain", "/readonly");

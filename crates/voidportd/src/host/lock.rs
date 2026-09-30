@@ -6,9 +6,9 @@
 //! so two guest lock owners multiplexed through one server process could never
 //! conflict with each other — the second request would simply replace the
 //! first. OFD locks belong to the open file description, so the server can give
-//! each wire lock owner its own description (see the data plane's handle table)
-//! and have their locks conflict exactly as they would between two independent
-//! processes on the host.
+//! each wire lock owner its own description of each file (see the data plane's
+//! lock sets) and have their locks conflict exactly as they would between two
+//! independent processes on the host.
 //!
 //! `F_OFD_GETLK` reports `l_pid` as -1, which is why the wire's `pid` field is
 //! informational for locks: an open file description has no owning process to
@@ -104,6 +104,35 @@ impl LockRange {
     #[must_use]
     pub fn whole_file() -> Self {
         Self::new(0, u64::MAX)
+    }
+
+    /// The range the kernel holds when it accepts this one, in its own
+    /// coordinates: offsets are clamped the way [`set`] passes them, and a range
+    /// to the end of the file ends at the last offset the kernel has.
+    ///
+    /// # Errors
+    ///
+    /// Returns `EINVAL` for a range that ends before it starts.
+    pub fn as_held(self) -> Result<Self, Errno> {
+        let (start, length) = self.as_raw()?;
+        let (start, last) = (start.unsigned_abs(), libc::off_t::MAX.unsigned_abs());
+        let end = if length <= 0 {
+            last
+        } else {
+            start.saturating_add(length.unsigned_abs() - 1).min(last)
+        };
+        Ok(Self::new(start, end))
+    }
+
+    /// The request that places a range [`Self::as_held`] returned: one that
+    /// ends at the kernel's last offset runs to the end of the file.
+    #[must_use]
+    pub fn from_held(self) -> Self {
+        if self.end >= libc::off_t::MAX.unsigned_abs() {
+            Self::new(self.start, u64::MAX)
+        } else {
+            self
+        }
     }
 
     /// The kernel's `(l_start, l_len)` pair.

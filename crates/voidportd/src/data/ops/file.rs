@@ -1,7 +1,7 @@
 //! File operations: open, create, read, write, release, sync, locking.
 
-use std::os::fd::{AsFd, OwnedFd};
-use std::sync::Arc;
+use std::os::fd::AsFd;
+use std::sync::{Arc, Weak};
 use std::time::Duration;
 
 use rustix::fs::{Mode, OFlags};
@@ -22,6 +22,7 @@ use zerocopy::byteorder::little_endian::{U32, U64};
 use super::node::entry_of;
 use super::{Context, OpResult, fixed_len, name_of};
 use crate::data::handle::{FileHandle, Handle};
+use crate::data::locks::{FileLocks, OwnerLocks, Placed};
 use crate::host::lock::{Conflict, LockKind, LockRange};
 use crate::host::open::{create_child, pin_child, reopen};
 use crate::rules::GuestIds;
@@ -104,9 +105,12 @@ pub fn open(context: &Context<'_>, request: Request<'_, OpenRequest>) -> OpResul
     // and a handle's own reference is its own.
     let pinned = node.descriptor(&namespace)?.ok_or(Errno::STALE)?;
     let fd = reopen(pinned.as_fd(), flags)?;
+    let locks = session
+        .locks()
+        .join(node.identity().ok_or(Errno::STALE)?, &pinned);
     let handle = session.handles().insert(
         node.id,
-        Handle::File(Arc::new(FileHandle::new(fd, pinned, writes(flags), flags))),
+        Handle::File(Arc::new(FileHandle::new(fd, locks, writes(flags), flags))),
     )?;
     context.reply(&OpenResponse {
         handle: U64::new(handle),
@@ -154,8 +158,8 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
     // The entry becomes a node pinned from the site it was created at — not
     // looked up again through the namespace — so a concurrent replacement of
     // the name cannot make the reply describe a different inode. The handle
-    // then borrows the *node's* pin, which is what its per-owner lock
-    // descriptions are reopened from.
+    // then joins the lock set of the *node's* file, whose per-owner lock
+    // descriptions are reopened from the node's pin.
     let pinned = pin_child(site.directory.as_fd(), &site.name)?;
     let resolved = session.admit_pinned(
         parent.path.child(&name),
@@ -168,6 +172,9 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
         .node
         .descriptor(&session.namespace())?
         .ok_or(Errno::STALE)?;
+    let locks = session
+        .locks()
+        .join(resolved.node.identity().ok_or(Errno::STALE)?, &node_pin);
     // The insert is its own statement so its guard is gone before the error arm
     // touches the node table: a guard produced in a `match` scrutinee outlives
     // the arms, and holding the handle table across the node table here would
@@ -175,7 +182,7 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
     // both counts for the operator — could deadlock against.
     let inserted = session.handles().insert(
         resolved.node.id,
-        Handle::File(Arc::new(FileHandle::new(fd, node_pin, true, flags))),
+        Handle::File(Arc::new(FileHandle::new(fd, locks, true, flags))),
     );
     let handle = match inserted {
         Ok(handle) => handle,
@@ -329,16 +336,18 @@ fn strip_privileged(session: &crate::data::session::Session, node_id: u64) {
 
 /// Releases a handle, closing the host descriptor it held.
 ///
-/// Dropping the handle drops every per-owner lock description with it, so the
-/// locks a session held through this handle are gone whether or not the client
-/// asked for the unlock.
+/// The file's lock set outlives the handle while another handle on the file is
+/// open, because a lock belongs to its owner for the whole file. Once the last
+/// handle on the file goes, every description goes with it, so the locks the
+/// session held on the file are gone whether or not the client asked for the
+/// unlock.
 pub fn release(context: &Context<'_>, request: Request<'_, ReleaseRequest>) -> OpResult {
     let body = request.body();
     let handle = body.handle.get();
     if body.release_flags.get() & release_flags::UNLOCK != 0
         && let Ok(file) = context.session.handles().file(handle)
     {
-        file.release_owner(body.lock_owner.get());
+        file.locks().release_owner(body.lock_owner.get());
     }
     context.session.handles().remove(handle);
     context.reply(&ReleaseResponse {})
@@ -348,12 +357,13 @@ pub fn release(context: &Context<'_>, request: Request<'_, ReleaseRequest>) -> O
 ///
 /// POSIX drops a process's record locks when it closes *any* descriptor for the
 /// file, and `flush` is where a client reports that; the owner's description
-/// goes with it. Nothing is synced here — `fsync` is the operation that means
+/// goes with it, and with it every lock the owner placed on the file through
+/// any handle. Nothing is synced here — `fsync` is the operation that means
 /// durability.
 pub fn flush(context: &Context<'_>, request: Request<'_, FlushRequest>) -> OpResult {
     let body = request.body();
     let file = context.session.handles().file(body.handle.get())?;
-    file.release_owner(body.lock_owner.get());
+    file.locks().release_owner(body.lock_owner.get());
     context.reply(&FlushResponse {})
 }
 
@@ -389,9 +399,9 @@ pub fn getlk(context: &Context<'_>, request: Request<'_, GetlkRequest>) -> OpRes
     let body = request.body();
     let file = context.session.handles().file(body.handle.get())?;
     let (kind, range) = lock_request(&body.lock)?;
-    let held = file.description(body.lock.owner.get());
-    let description = held.as_ref().map_or_else(|| file.fd(), |held| held.as_fd());
-    let conflict = crate::host::lock::test(description, kind, range)?;
+    let conflict = file
+        .locks()
+        .test(body.lock.owner.get(), kind, range, file.fd())?;
     context.reply(&GetlkResponse {
         lock: conflict_reply(&body.lock, conflict),
     })
@@ -409,14 +419,17 @@ pub enum Locked {
 
 /// Places or releases a lock.
 ///
-/// Each wire owner gets its own open file description, because locks held
-/// through one description coalesce instead of conflicting. Releasing the whole
-/// file drops the description itself, which is what makes an owner's unlock
-/// release exactly that owner's locks.
+/// Each wire owner gets its own open file description per file, because locks
+/// held through one description coalesce instead of conflicting, and every
+/// handle on the file places that owner's locks through it, because a POSIX
+/// lock is its owner's for the whole file (see [`crate::data::locks`]). A lock
+/// of a kind the handle's access does not cover is refused with `EBADF`, as
+/// through a local descriptor.
 ///
-/// A description exists only while its owner may hold a lock through it: an
-/// unlock from an owner that has none is answered without opening anything, and
-/// a description whose first lock the host refused is dropped again.
+/// A description exists only while its owner holds a lock through it or a
+/// blocking request of the owner waits on it: an unlock from an owner that has
+/// none is answered without opening anything, and one that leaves the owner
+/// holding nothing — a refused first lock included — closes it again.
 ///
 /// **A blocking request never blocks a thread.** The host call is always the
 /// non-blocking one; a conflict on a request that asked to wait becomes a
@@ -426,84 +439,25 @@ pub fn setlk(context: &Context<'_>, request: Request<'_, SetlkRequest>) -> Resul
     let body = request.body();
     let file = context.session.handles().file(body.handle.get())?;
     let (kind, range) = lock_request(&body.lock)?;
+    file.permits(kind)?;
     let owner = body.lock.owner.get();
-    let held = file.description(owner);
-    if held.is_none() && kind == LockKind::Unlock {
-        // Nothing is held through this handle by this owner, so there is
-        // nothing to release — and releasing nothing must not cost a
-        // descriptor.
-        return context.reply(&SetlkResponse {}).map(Locked::Answered);
-    }
-    let fresh = held.is_none();
-    let description = match held {
-        Some(description) => description,
-        None => file.lock_description(owner)?,
-    };
-    let placement = Placement {
-        file,
-        description,
-        owner,
-        kind,
-        range,
-        fresh,
-    };
-    match crate::host::lock::set(placement.description.as_fd(), kind, range) {
-        Ok(()) => {
-            placement.settled();
-            context.reply(&SetlkResponse {}).map(Locked::Answered)
-        }
-        Err(error)
-            if crate::host::lock::is_conflict(error)
-                && body.flags.get() & setlk_flags::WAIT != 0 =>
-        {
-            Ok(Locked::Waiting(LockWait {
-                placement,
-                request_id: context.request_id,
-                max_frame_len: context.max_frame_len,
-                attempts: 0,
-                settled: false,
-            }))
-        }
-        Err(error) => {
-            placement.refused();
-            Err(error)
-        }
-    }
-}
-
-/// One owner's pending lock placement on one handle.
-///
-/// It owns the two things the placement outlives its request by: the handle
-/// (whose owner map files the description) and the description itself, whose
-/// descriptor must stay open for as long as anything may still lock through it.
-#[derive(Debug)]
-struct Placement {
-    file: Arc<FileHandle>,
-    description: Arc<OwnedFd>,
-    owner: u64,
-    kind: LockKind,
-    range: LockRange,
-    /// Whether this request is what opened the description, and therefore what
-    /// must drop it again if the lock never lands.
-    fresh: bool,
-}
-
-impl Placement {
-    /// The host took the lock: the description stays filed, and a whole-file
-    /// unlock retires the owner along with it. The descriptor closes when this
-    /// placement drops, which is at the end of the request either way.
-    fn settled(&self) {
-        if self.kind == LockKind::Unlock && self.range == LockRange::whole_file() {
-            self.file.release_owner(self.owner);
-        }
-    }
-
-    /// The lock will never land — refused, or the waiter was cancelled — so a
-    /// description this request opened costs nothing.
-    fn refused(&self) {
-        if self.fresh {
-            self.file.discard_unused(self.owner, &self.description);
-        }
+    let wait = body.flags.get() & setlk_flags::WAIT != 0;
+    match file
+        .locks()
+        .place(owner, kind, range, file.access(), wait)?
+    {
+        Placed::Done => context.reply(&SetlkResponse {}).map(Locked::Answered),
+        Placed::Waiting(record) => Ok(Locked::Waiting(LockWait {
+            locks: Arc::downgrade(file.locks()),
+            record,
+            owner,
+            kind,
+            range,
+            request_id: context.request_id,
+            max_frame_len: context.max_frame_len,
+            attempts: 0,
+            settled: false,
+        })),
     }
 }
 
@@ -543,7 +497,15 @@ const LOCK_RETRY_CAP: Duration = Duration::from_millis(8);
 /// noticeably longer than its neighbours.
 #[derive(Debug)]
 pub struct LockWait {
-    placement: Placement,
+    /// The file's lock set, which a cancelled wait closes an empty record in.
+    /// Weak, because the set lives as long as the session's handles on the
+    /// file and no longer: a wait does not keep its locks.
+    locks: Weak<FileLocks>,
+    /// The owner's record on the file, which every attempt goes through.
+    record: Arc<OwnerLocks>,
+    owner: u64,
+    kind: LockKind,
+    range: LockRange,
     request_id: u64,
     max_frame_len: u32,
     /// How many attempts have been made, which is what the backoff grows on.
@@ -557,25 +519,23 @@ impl LockWait {
     /// Waits until the lock is this owner's, and answers the request.
     ///
     /// Dropping the returned future is the cancellation the contract rules: the
-    /// connection is gone, so nothing is answered and a description this
-    /// request opened is dropped again.
+    /// connection is gone, so nothing is answered, and the owner's record is
+    /// closed if nothing needs it any more. A close of another of the owner's
+    /// descriptors releases the owner's locks and leaves this wait waiting, as
+    /// it does locally; the session's last handle on the file closing ends it
+    /// with `EBADF`, as a waiting lock whose descriptor was closed ends.
     pub async fn settle(mut self) -> Result<Vec<u8>, FramingError> {
         loop {
             tokio::time::sleep(self.backoff()).await;
-            match crate::host::lock::set(
-                self.placement.description.as_fd(),
-                self.placement.kind,
-                self.placement.range,
-            ) {
-                Ok(()) => {
+            match self.record.retry(self.kind, self.range) {
+                Ok(true) => {
                     self.settled = true;
-                    self.placement.settled();
                     return self.encode(Ok(()));
                 }
-                Err(error) if crate::host::lock::is_conflict(error) => {}
+                Ok(false) => {}
                 Err(error) => {
                     self.settled = true;
-                    self.placement.refused();
+                    self.abandon();
                     return self.encode(Err(error));
                 }
             }
@@ -606,7 +566,7 @@ impl LockWait {
         let mut state = self
             .request_id
             .wrapping_mul(0x9E37_79B9_7F4A_7C15)
-            .wrapping_add(self.placement.owner)
+            .wrapping_add(self.owner)
             .wrapping_add(u64::from(self.attempts))
             | 1;
         state ^= state >> 33;
@@ -626,13 +586,23 @@ impl LockWait {
     }
 }
 
+impl LockWait {
+    /// Closes the owner's record if it holds nothing, now that this wait will
+    /// not place anything through it.
+    fn abandon(&self) {
+        if let Some(locks) = self.locks.upgrade() {
+            locks.abandon(self.owner, &self.record);
+        }
+    }
+}
+
 impl Drop for LockWait {
     /// The connection died while this request was parked. The contract makes
-    /// that the end of the wait — nothing is answered — and the description it
-    /// was about to lock through is dropped if this request is what opened it.
+    /// that the end of the wait — nothing is answered — and the owner's record
+    /// is closed if it holds nothing.
     fn drop(&mut self) {
         if !self.settled {
-            self.placement.refused();
+            self.abandon();
         }
     }
 }

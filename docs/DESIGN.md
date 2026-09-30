@@ -1748,11 +1748,26 @@ presented-bits function). Read/write are passthrough on the handle's fd at
 the requested offset. statfs reports the backing filesystem (fstatfs on
 the pinned fd) for host-backed nodes and zeroed synthetic values for
 synthesized directories. File locking implements getlk/setlk with OFD
-locks on a **per-(handle, wire-owner) lazily reopened description** —
+locks on a **per-(file, wire-owner) lazily reopened description** —
 probe-verified 2026-08-12 that locks through one shared description
 coalesce instead of conflicting, so distinct wire owners need distinct
 open file descriptions; an owner's description drops when its locks are
-released. OFD getlk reports pid -1 (the wire pid field is informational). Xattrs are passthrough for the `user.*`
+released. The description belongs to the host file within the session,
+and every handle the session holds on the file shares it, because a
+POSIX record lock is its owner's for the whole file: a process that
+locks a file through a second descriptor extends its own locks, and
+closing any of its descriptors releases them all, while a blocking
+request pending through another of its descriptors keeps waiting. The
+description is opened to the access of the handle that placed the
+owner's first lock, a write-capable one for reading as well where the
+host allows it, and it is opened for writing only when such a handle
+placed a lock; when a later lock needs more access, the read locks the
+owner holds are placed on a wider description before the old one
+closes. Each request is checked against the access mode of the handle
+it came through, as the kernel checks a local descriptor. A description
+closes once its owner holds nothing and no request of the owner waits,
+and its locks are released explicitly before it closes, so no copy of
+the descriptor elsewhere keeps them. OFD getlk reports pid -1 (the wire pid field is informational). Xattrs are passthrough for the `user.*`
 namespace; `trusted.*`, `security.*`, and `system.*` return EOPNOTSUPP —
 accepted v1 limitation (2026-08-12; ACL and capability xattrs interact
 with privilege in ways the ownership model does not yet rule).

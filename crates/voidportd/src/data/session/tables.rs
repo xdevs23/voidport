@@ -1,4 +1,4 @@
-//! Reaching the session's two tables, and what an id names.
+//! Reaching the session's two tables and its lock sets, and what an id names.
 //!
 //! The plain accessors, with no policy of their own: they hand out the guard
 //! and turn an id into a node, so every other concern of the session — and
@@ -6,12 +6,13 @@
 //! is that an id the session never handed out, or has already forgotten, is
 //! `ESTALE` and not a panic.
 
-use std::sync::MutexGuard;
+use std::sync::{Arc, MutexGuard};
 
 use rustix::io::Errno;
 
 use super::Session;
 use crate::data::handle::HandleTable;
+use crate::data::locks::LockSets;
 use crate::data::node::{Node, NodeTable};
 
 impl Session {
@@ -27,6 +28,11 @@ impl Session {
         self.handles
             .lock()
             .unwrap_or_else(|poison| poison.into_inner())
+    }
+
+    /// The session's record locks, one set per host file.
+    pub fn locks(&self) -> &Arc<LockSets> {
+        &self.locks
     }
 
     /// The node an id names.

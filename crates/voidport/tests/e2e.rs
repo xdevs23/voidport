@@ -914,6 +914,48 @@ fn a_record_lock_conflict_is_observable_across_mounts() {
         .expect("the range is free again");
 }
 
+#[test]
+fn a_process_locks_one_file_through_two_descriptors() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = Fixture::start("locks-one-process");
+    let first = fixture.mount("lock-one", "plain", "/tree");
+    let second = fixture.mount("lock-other", "plain", "/tree");
+    let open = |path| {
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .expect("openable")
+    };
+
+    let one = open(first.path("data.bin"));
+    let two = open(first.path("data.bin"));
+    rustix::fs::fcntl_lock(&one, FlockOperation::NonBlockingLockExclusive)
+        .expect("the range is free");
+    rustix::fs::fcntl_lock(&two, FlockOperation::NonBlockingLockExclusive)
+        .expect("a record lock belongs to the process, so its second descriptor locks too");
+
+    let other = open(second.path("data.bin"));
+    let conflict = rustix::fs::fcntl_lock(&other, FlockOperation::NonBlockingLockExclusive)
+        .expect_err("the first mount holds the file");
+    assert!(
+        matches!(
+            conflict,
+            rustix::io::Errno::AGAIN | rustix::io::Errno::ACCESS
+        ),
+        "a conflict is reported as a conflict, got {conflict}"
+    );
+
+    // Closing either descriptor releases every lock the process holds on the
+    // file.
+    drop(two);
+    rustix::fs::fcntl_lock(&other, FlockOperation::NonBlockingLockExclusive)
+        .expect("the file is free again");
+    drop(one);
+}
+
 // ---------------------------------------------------------------------------
 // Criterion 10 — runtime reconfiguration, seen by a mounted guest
 // ---------------------------------------------------------------------------
@@ -1044,19 +1086,7 @@ fn a_busy_mountpoint_reports_ebusy_and_an_unmount_never_hangs() {
         .expect("openable");
     rustix::fs::fcntl_lock(&blocker, FlockOperation::NonBlockingLockExclusive)
         .expect("the range is free");
-    let waiting = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(guest.path("data.bin"))
-        .expect("openable");
-    let (parked, is_parked) = mpsc::channel();
-    let waiter = std::thread::spawn(move || {
-        parked.send(()).expect("the test is listening");
-        let outcome = rustix::fs::fcntl_lock(&waiting, FlockOperation::LockExclusive);
-        drop(waiting);
-        outcome
-    });
-    is_parked.recv().expect("the waiter started");
+    let mut waiter = lock_waiter(&guest.path("data.bin"));
     // Give the blocking request time to reach the server and park there.
     std::thread::sleep(Duration::from_millis(300));
 
@@ -1075,10 +1105,11 @@ fn a_busy_mountpoint_reports_ebusy_and_an_unmount_never_hangs() {
     // Releasing the lock lets the parked request through, and then the mount
     // comes down cleanly.
     rustix::fs::fcntl_lock(&blocker, FlockOperation::Unlock).expect("releasable");
-    waiter
-        .join()
-        .expect("the waiter finishes")
-        .expect("the parked lock is granted once the range frees");
+    let status = waiter.wait().expect("the waiter's exit is readable");
+    assert!(
+        status.success(),
+        "the parked lock is granted once the range frees, got {status}"
+    );
     drop(blocker);
     drop(held);
     let started = Instant::now();
@@ -1135,14 +1166,10 @@ fn a_parked_blocking_lock_does_not_stall_the_mount() {
     rustix::fs::fcntl_lock(&held, FlockOperation::NonBlockingLockExclusive)
         .expect("the range is free");
 
-    let waiting = fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(guest.path("data.bin"))
-        .expect("openable");
+    let mut child = lock_waiter(&guest.path("data.bin"));
     let (granted, is_granted) = mpsc::channel();
     let waiter = std::thread::spawn(move || {
-        let outcome = rustix::fs::fcntl_lock(&waiting, FlockOperation::LockExclusive);
+        let outcome = child.wait();
         granted.send(()).expect("the test is listening");
         outcome
     });
@@ -1169,10 +1196,50 @@ fn a_parked_blocking_lock_does_not_stall_the_mount() {
     is_granted
         .recv_timeout(PATIENCE)
         .expect("the parked lock is granted once the range frees");
-    waiter
+    let status = waiter
         .join()
         .expect("the waiter finishes")
-        .expect("the lock was granted");
+        .expect("the waiter's exit is readable");
+    assert!(status.success(), "the lock was granted, got {status}");
+}
+
+/// The environment variable that turns this test binary into a process that
+/// waits for a lock.
+const LOCK_WAITER: &str = "VOIDPORT_TEST_LOCK_WAITER";
+
+/// Starts a process that takes a blocking whole-file lock on `path` and exits
+/// once it holds it.
+///
+/// A record lock belongs to its process, so a request that waits on a lock
+/// this process holds has to come from another one: this test binary, run
+/// again as [`a_blocking_lock_waiter_in_its_own_process`].
+fn lock_waiter(path: &std::path::Path) -> std::process::Child {
+    std::process::Command::new(std::env::current_exe().expect("the test binary"))
+        .args([
+            "--exact",
+            "a_blocking_lock_waiter_in_its_own_process",
+            "--test-threads=1",
+        ])
+        .env(LOCK_WAITER, path)
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .expect("the waiter starts")
+}
+
+/// The process [`lock_waiter`] starts: it takes a blocking whole-file lock on
+/// the file the environment names and exits once it holds it. Run any other
+/// way, it does nothing.
+#[test]
+fn a_blocking_lock_waiter_in_its_own_process() {
+    let Some(path) = std::env::var_os(LOCK_WAITER) else {
+        return;
+    };
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("openable");
+    rustix::fs::fcntl_lock(&file, FlockOperation::LockExclusive).expect("the lock is granted");
 }
 
 // ---------------------------------------------------------------------------
