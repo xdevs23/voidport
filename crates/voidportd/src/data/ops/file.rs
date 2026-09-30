@@ -155,11 +155,11 @@ pub fn create(context: &Context<'_>, request: Request<'_, CreateRequest>) -> OpR
         record_created_mode(session, fd.as_fd(), &site.recipe, mode)?;
     }
 
-    // The entry becomes a node pinned from the site it was created at — not
-    // looked up again through the namespace — so a concurrent replacement of
-    // the name cannot make the reply describe a different inode. The handle
-    // then joins the lock set of the *node's* file, whose per-owner lock
-    // descriptions are reopened from the node's pin.
+    // The entry becomes a node pinned from the site it was created at, not
+    // looked up again through the namespace. A rename that replaces the name
+    // between the create and this pin still makes the reply describe the file
+    // now at the name. The handle then joins the lock set of the *node's*
+    // file, whose per-owner lock descriptions are reopened from the node's pin.
     let pinned = pin_child(site.directory.as_fd(), &site.name)?;
     let resolved = session.admit_pinned(
         parent.path.child(&name),
