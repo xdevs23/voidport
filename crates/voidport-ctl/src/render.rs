@@ -7,8 +7,8 @@
 //! vocabulary.
 
 use voidport_control::{
-    IdMapping, ListenerInfo, NamespaceSpec, OwnershipSpec, Reply, Response, Rule, SessionSummary,
-    XattrRule, XattrVerdict,
+    IdMapping, ListenerInfo, NamespaceSpec, OwnershipSpec, PathResolution, Reply, Response, Rule,
+    SessionSummary, XattrRule, XattrVerdict,
 };
 
 /// Renders a response envelope for a terminal.
@@ -75,6 +75,11 @@ fn render_reply(reply: &Reply) -> String {
         // takes — for a `:0` configuration this is the only statement of the
         // port anywhere.
         Reply::Listener { listener } => format!("listening on {listener}"),
+        Reply::Resolution { resolution } => match resolution {
+            PathResolution::Host { mode, host_path } => format!("{mode} {host_path}"),
+            PathResolution::Synthesized {} => "synthesized".to_owned(),
+            PathResolution::Absent {} => "absent".to_owned(),
+        },
     }
 }
 
@@ -258,6 +263,20 @@ mod tests {
             "no namespace \"p\"",
         )));
         assert_eq!(rendered, "error [not-found]: no namespace \"p\"");
+    }
+
+    #[test]
+    fn a_resolution_renders_as_one_line() {
+        let render_one = |resolution| render(&Response::ok(Reply::Resolution { resolution }));
+        assert_eq!(
+            render_one(PathResolution::Host {
+                mode: voidport_control::ShareMode::Rw,
+                host_path: "/srv/project".to_owned(),
+            }),
+            "rw /srv/project"
+        );
+        assert_eq!(render_one(PathResolution::Synthesized {}), "synthesized");
+        assert_eq!(render_one(PathResolution::Absent {}), "absent");
     }
 
     #[test]

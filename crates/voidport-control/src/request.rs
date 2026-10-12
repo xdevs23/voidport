@@ -172,6 +172,14 @@ requests! {
         /// The endpoint as bound, exactly as `server-info` lists it.
         endpoint: String,
     } => "listener-remove",
+    /// Reports how one path resolves in a namespace, the way a guest's
+    /// lookup would walk it. Changes nothing.
+    Resolve {
+        /// The namespace to walk.
+        namespace: NamespaceName,
+        /// The absolute namespace path.
+        path: String,
+    } => "resolve",
 }
 
 /// Parses one request line, classifying every way it can fail.
@@ -309,6 +317,13 @@ mod tests {
                 },
                 r#"{"op":"listener-remove","endpoint":"127.0.0.1:9000"}"#,
             ),
+            (
+                Request::Resolve {
+                    namespace: name("p"),
+                    path: "/a/b".to_owned(),
+                },
+                r#"{"op":"resolve","namespace":"p","path":"/a/b"}"#,
+            ),
         ];
         for (request, encoded) in cases {
             assert_eq!(
@@ -395,6 +410,10 @@ mod tests {
             },
             Request::ListenerRemove {
                 endpoint: "any:1024".to_owned(),
+            },
+            Request::Resolve {
+                namespace: name("p"),
+                path: "/".to_owned(),
             },
         ];
         let names: Vec<&str> = requests.iter().map(Request::operation).collect();

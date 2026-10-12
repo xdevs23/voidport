@@ -78,6 +78,15 @@ pub enum Command {
     /// Data-plane listener operations: where the server accepts mounts.
     #[command(subcommand)]
     Listener(ListenerCommand),
+    /// Show how a path resolves in a namespace: the mode and host path a
+    /// guest would get, a synthesized directory, or absent. Hidden and
+    /// absent answer alike, as they do to a guest. Changes nothing.
+    Resolve {
+        /// The namespace.
+        namespace: String,
+        /// The absolute namespace path.
+        path: String,
+    },
 }
 
 /// `voidport-ctl listener …`
@@ -726,6 +735,10 @@ impl Command {
             Self::Listener(ListenerCommand::Remove { endpoint }) => Request::ListenerRemove {
                 endpoint: endpoint.clone(),
             },
+            Self::Resolve { namespace, path } => Request::Resolve {
+                namespace: namespace_name(namespace)?,
+                path: path.clone(),
+            },
         })
     }
 }
@@ -799,6 +812,7 @@ mod tests {
                 "127.0.0.1:9000",
             ],
             &["voidport-ctl", "listener", "remove", "127.0.0.1:9000"],
+            &["voidport-ctl", "resolve", "p", "/a"],
         ];
         let operations: Vec<&str> = commands
             .iter()

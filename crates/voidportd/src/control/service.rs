@@ -38,7 +38,7 @@ use std::sync::{Arc, Mutex, MutexGuard, OnceLock, RwLock};
 
 use voidport_control::{
     ControlError, ErrorCode, Listener, ListenerInfo, NamespaceName, NamespaceSpec,
-    NamespaceSummary, Reply, Request, Response, Rule, XattrRule,
+    NamespaceSummary, PathResolution, Reply, Request, Response, Rule, ShareMode, XattrRule,
 };
 
 use crate::data::listener::{BoundListener, DataListeners, ListenerError};
@@ -49,7 +49,9 @@ use crate::error::render;
 use crate::namespace::Namespace;
 use crate::records::{RecordHome, RecordStore};
 use crate::registry::{Registry, summarize};
-use crate::rules::{NamespacePath, TableError, XattrRulesError};
+use crate::rules::{
+    EffectiveMode, HostBacking, NamespacePath, Resolution, TableError, XattrRulesError,
+};
 use crate::state::{
     Environment, Limits, LoadedState, PersistError, StateDocument, build_namespace, persist,
 };
@@ -411,6 +413,7 @@ impl Service {
             Request::SessionList {} => Ok(self.session_list()),
             Request::ListenerAdd { listener } => self.listener_add(listener),
             Request::ListenerRemove { endpoint } => self.listener_remove(&endpoint),
+            Request::Resolve { namespace, path } => self.resolve(&namespace, &path),
         };
         match result {
             Ok(reply) => Response::ok(reply),
@@ -471,6 +474,20 @@ impl Service {
                 namespace: namespace.clone(),
             })
             .ok_or_else(|| not_found(name))
+    }
+
+    /// How one path resolves against the published rules of a namespace.
+    fn resolve(&self, name: &NamespaceName, path: &str) -> Result<Reply, ControlError> {
+        let namespace = self
+            .published
+            .namespace(name)
+            .ok_or_else(|| not_found(name))?;
+        let path = NamespacePath::parse(path).map_err(|source| {
+            ControlError::new(ErrorCode::InvalidRequest, format!("{path:?}: {source}"))
+        })?;
+        Ok(Reply::Resolution {
+            resolution: path_resolution(namespace.rules().resolve_path(&path)),
+        })
     }
 
     /// Adds a whole namespace.
@@ -829,6 +846,35 @@ fn describe(listener: &Listener) -> String {
     }
 }
 
+/// A resolution in the vocabulary of the control plane.
+fn path_resolution(resolution: Resolution) -> PathResolution {
+    match resolution {
+        Resolution::HostBacked { backing, mode } => PathResolution::Host {
+            mode: match mode {
+                EffectiveMode::Rw => ShareMode::Rw,
+                EffectiveMode::Ro => ShareMode::Ro,
+            },
+            host_path: host_path(&backing),
+        },
+        Resolution::SynthesizedDir => PathResolution::Synthesized {},
+        Resolution::Nonexistent => PathResolution::Absent {},
+    }
+}
+
+/// The graft target and the components beneath it, joined for a reader.
+fn host_path(backing: &HostBacking) -> String {
+    let graft = backing.graft().as_str().trim_end_matches('/');
+    let path = backing
+        .relative()
+        .iter()
+        .fold(graft.to_owned(), |path, name| format!("{path}/{name}"));
+    if path.is_empty() {
+        "/".to_owned()
+    } else {
+        path
+    }
+}
+
 /// The error for a condition the server believes impossible.
 fn internal(message: &str) -> ControlError {
     ControlError::new(ErrorCode::Internal, message.to_owned())
@@ -920,6 +966,48 @@ mod tests {
             };
             assert_eq!(error.code, ErrorCode::Internal);
         }
+    }
+
+    #[test]
+    fn resolve_in_an_unknown_namespace_is_not_found() {
+        let service = service();
+        let Response::Error { error } = service.handle(Request::Resolve {
+            namespace: NamespaceName::new("missing").expect("valid name"),
+            path: "/a".to_owned(),
+        }) else {
+            panic!("an unknown namespace cannot resolve");
+        };
+        assert_eq!(error.code, ErrorCode::NotFound);
+    }
+
+    #[test]
+    fn a_resolution_reports_the_host_path_behind_it() {
+        use crate::rules::{HostTarget, Name};
+        let name = |raw: &str| Name::new(raw).expect("valid name");
+        let backing = HostBacking::graft_root(HostTarget::new("/srv/project/"))
+            .extend(&[name("src"), name("main.rs")]);
+        assert_eq!(
+            path_resolution(Resolution::HostBacked {
+                backing,
+                mode: EffectiveMode::Ro,
+            }),
+            PathResolution::Host {
+                mode: ShareMode::Ro,
+                host_path: "/srv/project/src/main.rs".to_owned(),
+            }
+        );
+        assert_eq!(
+            host_path(&HostBacking::graft_root(HostTarget::new("/"))),
+            "/"
+        );
+        assert_eq!(
+            host_path(&HostBacking::graft_root(HostTarget::new("/")).child(&name("etc"))),
+            "/etc"
+        );
+        assert_eq!(
+            path_resolution(Resolution::Nonexistent),
+            PathResolution::Absent {}
+        );
     }
 
     /// The message an operator reads names what they asked for, in the

@@ -77,7 +77,8 @@ pub use policy::{
 };
 pub use request::{OPERATIONS, Request, parse_request};
 pub use response::{
-    ControlError, ErrorCode, ListenerInfo, NamespaceSummary, Reply, Response, SessionSummary,
+    ControlError, ErrorCode, ListenerInfo, NamespaceSummary, PathResolution, Reply, Response,
+    SessionSummary,
 };
 
 #[cfg(feature = "client")]

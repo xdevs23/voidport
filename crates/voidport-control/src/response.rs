@@ -13,7 +13,7 @@ use std::fmt;
 use serde::{Deserialize, Serialize};
 
 use crate::policy::{
-    AuthMode, HostDirectIo, NamespaceName, NamespaceSpec, OwnershipMode, PermissionMode,
+    AuthMode, HostDirectIo, NamespaceName, NamespaceSpec, OwnershipMode, PermissionMode, ShareMode,
 };
 
 /// The response envelope.
@@ -138,6 +138,33 @@ pub enum Reply {
         /// The live sessions, in session-id order.
         sessions: Vec<SessionSummary>,
     },
+    /// How one namespace path resolves under the rules the server serves.
+    Resolution {
+        /// The outcome of the walk.
+        resolution: PathResolution,
+    },
+}
+
+/// How one namespace path resolves: the answer a guest would get, without a
+/// guest.
+///
+/// It is policy only. Whether the host path behind an admitted entry exists
+/// is a question about the host, which the walk does not ask.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum PathResolution {
+    /// The path is admitted, and a host path backs it.
+    Host {
+        /// The effective mode: `rw` or `ro`, never `hidden`.
+        mode: ShareMode,
+        /// The host path behind it, lossily for a name that is not UTF-8.
+        host_path: String,
+    },
+    /// The path is a directory that exists only because rules lie beneath it.
+    Synthesized {},
+    /// The path does not resolve. A hidden path and one that no rule admits
+    /// answer alike, as they do to a guest.
+    Absent {},
 }
 
 /// One line of `namespace list`.
