@@ -97,6 +97,30 @@ fn the_worked_example_hides_secret_from_every_direction() {
 }
 
 #[test]
+fn the_worked_example_resolves_whole_paths_as_a_lookup_would() {
+    let table = worked_example();
+    let resolve = |raw: &str| describe(&table.resolve_path(&path(raw)));
+
+    assert_eq!(resolve("/"), "SynthesizedDir");
+    assert_eq!(resolve("/path/to"), "SynthesizedDir");
+    assert_eq!(
+        resolve("/path/to/project"),
+        "Rw graft=\"/path/to/project\" relative=\"\""
+    );
+    assert_eq!(
+        resolve("/path/to/project/bar"),
+        "Ro graft=\"/path/to/project\" relative=\"bar\""
+    );
+    assert_eq!(
+        resolve("/path/to/project/bar/deeper"),
+        "Ro graft=\"/path/to/project\" relative=\"bar/deeper\""
+    );
+    assert_eq!(resolve("/path/to/project/secret"), "Nonexistent");
+    assert_eq!(resolve("/path/to/project/secret/inner"), "Nonexistent");
+    assert_eq!(resolve("/elsewhere"), "Nonexistent");
+}
+
+#[test]
 fn the_worked_example_presents_the_documented_permission_bits() {
     let table = worked_example();
     let project = dir(&table, "/path/to/project");

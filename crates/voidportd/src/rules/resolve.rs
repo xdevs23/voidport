@@ -370,6 +370,20 @@ impl RuleTable {
         }
         Some(directory)
     }
+
+    /// Resolves an absolute namespace path as a lookup of its last component
+    /// would, after walking its parent. The root is the synthesized directory
+    /// every walk starts from.
+    #[must_use]
+    pub fn resolve_path(&self, path: &NamespacePath) -> Resolution {
+        let (Some(parent), Some(name)) = (path.parent(), path.last()) else {
+            return Resolution::SynthesizedDir;
+        };
+        self.walk(&parent)
+            .map_or(Resolution::Nonexistent, |directory| {
+                self.resolve(&directory, name)
+            })
+    }
 }
 
 /// One enumeration in progress: the entries kept so far, and the cap they are

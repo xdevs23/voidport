@@ -297,10 +297,12 @@ $ voidport-ctl rule remove project /docs
 $ voidport-ctl xattr add project 'user.*' --write deny
 $ voidport-ctl xattr list project
 $ voidport-ctl session list
+$ voidport-ctl resolve project /docs/index.md
 ```
 
 `voidport-ctl` groups its operations as `namespace`, `rule`, `xattr`,
-`ownership`, `permission`, `direct-io`, `auth`, `session`, and `info`; every
+`ownership`, `permission`, `direct-io`, `auth`, `session`, `resolve`, and
+`info`; every
 subcommand has `--help`, and `--json` prints the raw response envelope.
 
 **Finding the server takes no flags.** Without `--socket`, `voidport-ctl` tries
