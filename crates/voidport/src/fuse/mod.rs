@@ -65,9 +65,7 @@ use crate::client::{AttrChange, Caller, Client, Lock, LockKind, Readahead};
 use crate::fuse::attr::{
     PRIVILEGED_MASK, Privileged, entry_attr, node_attr, time_change, timespec,
 };
-use crate::fuse::dir::{
-    Directories, DirectoryEntry, DirectoryRead, DirectorySink, read_directory, release_directory,
-};
+use crate::fuse::dir::{DirectoryEntry, DirectoryRead, DirectorySink, read_directory};
 
 /// How the guest kernel caches the data of an open file.
 ///
@@ -261,16 +259,13 @@ pub struct VoidportFs {
     /// What [`direct_io`](Self::direct_io) resolved to once the kernel answered
     /// the handshake. Written by `init` and read by every open thereafter.
     caching: DataCaching,
-    /// The entries each open directory handle has been sent and not yet
-    /// delivered to the kernel. Shared: the callbacks take `&self`, and a mount
-    /// may run several dispatch loops.
-    directories: Arc<Directories>,
     /// The mount's readahead engine.
     ///
     /// Dormant until `init` tells it what the handshake settled on: it runs
     /// **only** where the negotiated mode is [`DataCaching::Direct`], because
-    /// that is the mode with no kernel readahead in front of it. Shared for the
-    /// same reason the directories are, and mutated only through its own lock.
+    /// that is the mode with no kernel readahead in front of it. Shared,
+    /// because the callbacks take `&self` and a mount may run several dispatch
+    /// loops, and mutated only through its lock.
     readahead: Arc<Readahead>,
     /// The callbacks this adapter has taken and not yet replied to. Held here
     /// as well as by the mount, which is what waits on it when it tears down.
@@ -309,7 +304,6 @@ impl VoidportFs {
             direct_io,
             privileged,
             caching: DataCaching::Page,
-            directories: Arc::default(),
             readahead,
             inflight,
         }
@@ -913,13 +907,11 @@ impl fuser::Filesystem for VoidportFs {
         offset: u64,
         reply: ReplyDirectory,
     ) {
-        let (client, caller, attr_ttl) = (self.client(), caller_of(request), self.attr_ttl);
-        let directories = Arc::clone(&self.directories);
+        let (client, caller) = (self.client(), caller_of(request));
         let privileged = self.privileged;
         self.spawn(async move {
             let mut sink = PlainSink { reply };
             match read_directory(
-                &directories,
                 &client,
                 caller,
                 DirectoryRead {
@@ -927,7 +919,6 @@ impl fuser::Filesystem for VoidportFs {
                     handle: fh.0,
                     cookie: offset,
                 },
-                attr_ttl,
                 privileged,
                 &mut sink,
             )
@@ -948,13 +939,10 @@ impl fuser::Filesystem for VoidportFs {
         reply: ReplyDirectoryPlus,
     ) {
         let (client, caller, ttl) = (self.client(), caller_of(request), self.entry_ttl);
-        let attr_ttl = self.attr_ttl;
-        let directories = Arc::clone(&self.directories);
         let privileged = self.privileged;
         self.spawn(async move {
             let mut sink = PlusSink { reply, ttl };
             match read_directory(
-                &directories,
                 &client,
                 caller,
                 DirectoryRead {
@@ -962,7 +950,6 @@ impl fuser::Filesystem for VoidportFs {
                     handle: fh.0,
                     cookie: offset,
                 },
-                attr_ttl,
                 privileged,
                 &mut sink,
             )
@@ -983,11 +970,7 @@ impl fuser::Filesystem for VoidportFs {
         reply: ReplyEmpty,
     ) {
         let (client, caller) = (self.client(), caller_of(request));
-        let directories = Arc::clone(&self.directories);
         self.spawn(async move {
-            // Entries fetched for this handle and never delivered are owed back
-            // before the handle that named them is gone.
-            release_directory(&directories, &client, caller, fh.0).await;
             answer(
                 reply,
                 client

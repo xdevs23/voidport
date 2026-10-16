@@ -59,8 +59,9 @@ pub const HELLO_REQUEST_ID: u64 = 1;
 
 /// The smallest frame bound a session can be served under.
 ///
-/// `max_frame_len` is the server's announcement, and everything the client
-/// sizes — a read chunk, a write chunk, a directory batch — is derived from it.
+/// `max_frame_len` is the value the server sends. The client derives the size
+/// of every read chunk and every write chunk from it, and no directory request
+/// asks for more than it can carry.
 /// A bound below the pre-handshake one leaves no room for a request plus a
 /// usable payload: the read chunk saturates to zero and every nonempty file
 /// would read as empty with no error anywhere. A mount is refused instead.

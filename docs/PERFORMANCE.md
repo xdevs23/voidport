@@ -753,6 +753,12 @@ The wire contract is unchanged: the batch is the `size` field the
 `readdirplus` request has always carried, and every other message is
 byte-identical.
 
+> **Superseded 2026-10-16 by release 1.0.5.** The client sends one readdirplus
+> request for one page of entries per kernel call and stores no entries for a
+> later call, so a listing of 1000 entries takes 30 to 40 requests again. The
+> listing figures of this pass and of its boundary patch describe the batching
+> of 1.0.4.
+
 ### Frames per read syscall
 
 The ceiling the profiling pass attributed was two `read(2)` calls per wire
@@ -981,6 +987,10 @@ run-to-run drift on the rig is wider than most of what is being compared.
 | Held surplus is TTL-bounded | the mount serves an entry from held surplus only within the attr TTL of the fetch that brought it; older surplus is given back with its compensating `forget`s and refetched | a refetch per slow walker, and nothing at all for a walk that outpaces the timeout |
 | Host syscalls left the node-table guard | readdirplus takes and drops the session's node table per entry — a hash lookup or an insertion — instead of holding it across a batch of pins and stats | more lock acquisitions, each of them short |
 | Both hand-rolled frame readers are gone | the buffering is `tokio::io::BufReader` (64 KiB, unchanged) around each end's read half, with the pre-pass `read_frame` shape on top | the one-read-per-frame property, if `BufReader` had not carried it |
+
+> **Superseded 2026-10-16 by release 1.0.5** for the held surplus: the client
+> stores no readdirplus entries for a later kernel call, as noted under the
+> optimisation pass.
 
 ### One read per frame, re-proven — criterion 1
 

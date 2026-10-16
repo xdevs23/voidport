@@ -849,6 +849,20 @@ in PERFORMANCE.md (raw data kept out of tree).
      dropped with its compensating FORGETs and refetched. Fast
      consumers (build systems) keep the round-trip win; slow walkers
      pay a refetch instead of reading stale attributes.
+     (Amended 2026-10-16, release 1.0.5: the client stores no
+     readdirplus entries for a later kernel call. Each kernel call of a
+     listing sends one readdirplus request for one page of entries, and
+     the entries that do not fit into the reply to the kernel are given
+     back to the server with a FORGET at once. The kernel uses the sizes
+     in a readdirplus reply over any write that finished before it
+     asked. A surplus entry used within the attribute timeout therefore
+     set the size of a file written between two getdents64 calls of one
+     listing back to its size when the batch was fetched. In a cargo
+     build, the archiver then read a shorter size for an object file
+     than rustc had written a moment earlier. This also replaces the
+     batches sized to the frame bound in criterion 3 of the acceptance
+     criteria for the optimization pass and in decision 2 of the
+     2026-08-13 hot-path profiling entry.)
   2. **Host syscalls leave the node-table guard.** The batched
      admission holds the session's node-table mutex across up to
      hundreds of pins and stats, which the robustness mandate's

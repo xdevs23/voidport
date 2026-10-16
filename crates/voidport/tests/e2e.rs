@@ -17,13 +17,14 @@ mod support;
 
 use std::fs;
 use std::io::{IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
+use std::mem::MaybeUninit;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use rustix::event::{PollFd, PollFlags, Timespec};
-use rustix::fs::{FlockOperation, XattrFlags};
+use rustix::fs::{FlockOperation, RawDir, XattrFlags};
 use support::{
     Fixture, MAPPED_GUEST_ID, MAPPED_HOST_ID, NOBODY_ID, errno, eventually, presented_mode,
 };
@@ -755,17 +756,118 @@ fn a_listing_describes_its_entries_as_of_the_reply() {
     );
 }
 
+/// Files written between two `getdents64` calls of one listing show their new
+/// size.
+///
+/// The kernel sends one readdirplus per `getdents64` call and uses the sizes in
+/// that reply over any write that finished before it asked. A reply built from
+/// entries the mount fetched for an earlier call therefore sets the size of a
+/// file written in between back to the size it had then, and stat, fstat and
+/// every read return that size until the attribute timeout runs out. The test
+/// opens that window: it reads the entries returned by the first `getdents64`
+/// call, grows every file, and only then reads the rest of the listing. Every
+/// file grows, so the files listed by the later calls are checked wherever the
+/// host filesystem puts them in the listing.
+#[test]
+fn files_written_during_a_long_listing_show_their_new_size() {
+    if !support::preflight() {
+        return;
+    }
+    let page = rustix::param::page_size();
+    // More files than one `getdents64` call into a buffer of one page can
+    // return, since a record of `getdents64` takes at least 24 bytes.
+    let files = page / 24 + 1;
+    // Any growth shows an old size. Writing one page and appending one more
+    // writes little data on hosts with large pages.
+    let first = vec![b'x'; page];
+    let rest = vec![b'y'; page];
+
+    let fixture = Fixture::start("long-listing-freshness");
+    voidportd::testing::create_directory(&fixture.host("tree/objects"));
+    // Timeouts far longer than the test: an old size handed to the kernel is
+    // then still in its cache when the sizes are checked, however slowly the
+    // machine runs the test.
+    let options = MountOptions {
+        attr_timeout: Duration::from_secs(3600),
+        entry_timeout: Duration::from_secs(3600),
+        ..MountOptions::default()
+    };
+    let guest = fixture.mount_with("long-listing", &fixture.tcp_url("plain", "/tree"), &options);
+    let expected: Vec<_> = (0..files)
+        .map(|index| format!("object-{index:04}.o"))
+        .collect();
+    let paths: Vec<_> = expected
+        .iter()
+        .map(|name| guest.path(&format!("objects/{name}")))
+        .collect();
+    for path in &paths {
+        fs::write(path, &first).expect("writable");
+    }
+
+    let directory = fs::File::open(guest.path("objects")).expect("listable");
+    let mut buffer = vec![MaybeUninit::uninit(); page];
+    let mut listing = RawDir::new(&directory, &mut buffer);
+    let mut names = Vec::new();
+    loop {
+        let entry = listing.next().expect("the first call lists an entry");
+        names.push(entry.expect("a readable entry").file_name().to_owned());
+        if listing.is_buffer_empty() {
+            break;
+        }
+    }
+    let listed_by_the_first_call = names.len();
+    for path in &paths {
+        let mut file = fs::OpenOptions::new()
+            .append(true)
+            .open(path)
+            .expect("appendable");
+        file.write_all(&rest).expect("writable");
+    }
+    while let Some(entry) = listing.next() {
+        names.push(entry.expect("a readable entry").file_name().to_owned());
+    }
+    assert!(
+        names.len() > listed_by_the_first_call,
+        "the first `getdents64` call returned the whole listing, so no file was \
+         written between two calls"
+    );
+    let mut names: Vec<_> = names
+        .into_iter()
+        .filter(|name| name.as_c_str() != c"." && name.as_c_str() != c"..")
+        .map(|name| name.to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    assert_eq!(names, expected, "the listing and the directory differ");
+
+    let size = (first.len() + rest.len()) as u64;
+    let stale: Vec<_> = paths
+        .iter()
+        .filter(|path| {
+            let opened = fs::File::open(path).expect("readable");
+            fs::metadata(path).expect("stattable").len() != size
+                || opened.metadata().expect("fstattable").len() != size
+                || fs::read(path).expect("readable").len() as u64 != size
+        })
+        .collect();
+    assert!(
+        stale.is_empty(),
+        "{} of {files} files show a size from before the write: {stale:?}",
+        stale.len()
+    );
+}
+
 /// A listing far larger than one kernel reply buffer, through a real mount.
 ///
 /// This is the compensating-FORGET accounting where the criterion puts it: the
 /// kernel's own buffer, not a test sink standing in for it. The mount asks the
-/// wire for a whole frame of entries and holds the surplus; the kernel
-/// takes a few dozen per `getdents64` and comes back for the rest. Every entry
-/// the server sent counted a lookup, and three things have to be true at once —
-/// the walk resumes exactly where the kernel stopped (every name appears), it
-/// resumes only there (no name appears twice), and once the handle is released
-/// and the kernel has given its own lookups back, the session holds no more
-/// nodes than it did before the walk.
+/// wire for a page of entries per call and gives back what does not fit into
+/// the reply to the kernel. The kernel takes a few dozen entries per
+/// `getdents64` and calls again for the rest. Every entry the server sent
+/// counted a lookup, and three things have to be true at once: the walk resumes
+/// exactly where the kernel stopped (every name appears), it resumes only there
+/// (no name appears twice), and once the handle is released and the kernel has
+/// given its own lookups back, the session has no more nodes than it had before
+/// the walk.
 ///
 /// The kernel is what forgets, and it does so when its dentry cache is pruned;
 /// nothing else makes an idle kernel release inodes it may reuse. So the prune
@@ -801,8 +903,7 @@ fn a_listing_larger_than_the_kernel_buffer_resumes_and_leaves_nothing_behind() {
                 .into_owned()
         })
         .collect();
-    // The `ReadDir` is dropped here: `releasedir`, and with it whatever surplus
-    // the mount was still holding for the handle.
+    // The `ReadDir` is dropped here: `releasedir`.
 
     assert_eq!(
         names.len(),

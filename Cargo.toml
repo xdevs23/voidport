@@ -56,6 +56,9 @@ rustix = { version = "1.1", features = [
     "mm",
     "mount",
     "net",
+    # The page size of the machine that runs the client, which is the size of
+    # one readdirplus request.
+    "param",
     "process",
     # Replacing a descriptor safely, which the terminal-lifecycle tests do to
     # make one takeover step fail while the rest of the process is intact.
