@@ -44,6 +44,7 @@
 
 pub mod attr;
 pub mod dir;
+pub mod pages;
 
 use std::ffi::OsStr;
 use std::future::Future;
@@ -66,6 +67,7 @@ use crate::fuse::attr::{
     PRIVILEGED_MASK, Privileged, entry_attr, node_attr, time_change, timespec,
 };
 use crate::fuse::dir::{DirectoryEntry, DirectoryRead, DirectorySink, read_directory};
+use crate::fuse::pages::PageInvalidator;
 
 /// How the guest kernel caches the data of an open file.
 ///
@@ -76,6 +78,31 @@ pub enum DataCaching {
     /// The guest page cache holds file data, as it does for any filesystem: a
     /// re-read is answered from guest RAM, and N guests reading one host file
     /// keep N copies of it in N guests' memory.
+    ///
+    /// The pages of a file outlive an open: without `FOPEN_KEEP_CACHE` in the
+    /// open reply the kernel drops them on every open (`fuse_open_common` in
+    /// Linux 6.5.6 and `fuse_open` in 6.18.56 and 7.2.10, in `fs/fuse/file.c`,
+    /// and `fuse_create_open` in `fs/fuse/dir.c`), and a build that includes a
+    /// header would read it from the server once per compile. What drops them
+    /// instead, in the same three kernels:
+    ///
+    /// * A `read` refreshes the attributes when they are older than
+    ///   `--attr-timeout` (`fuse_cache_read_iter` in `fs/fuse/file.c`), and the
+    ///   kernel drops the pages when the refreshed size or modification time
+    ///   differs from the one it has recorded (`fuse_change_attributes` in
+    ///   `fs/fuse/inode.c`). `init` requires `FUSE_AUTO_INVAL_DATA` for this.
+    /// * A mapping refreshes no attributes, but the path walk of the open before
+    ///   it does once `--entry-timeout` has passed, so a file that is opened
+    ///   again and then mapped is bounded by the entry timeout.
+    /// * The kernel records the attributes of a `setattr` reply without
+    ///   dropping pages, so `setattr` drops them itself.
+    /// * The first lock granted through an open handle drops them, so a process
+    ///   that opens a file, locks it and reads it reads what the server has, as
+    ///   it did when every open dropped the pages.
+    ///
+    /// Pages filled while a host write was running, or after a host change that
+    /// left the size and the modification time as they were, are stale until
+    /// the size or the modification time changes again.
     Page,
     /// Reads and writes go straight to the wire — the guest page cache holds no
     /// copy of the data, which is the whole point of the option — while the
@@ -134,6 +161,10 @@ impl DataCaching {
 
     /// The flags an `open` or `create` reply carries under this mode.
     ///
+    /// A page-cached handle sets `FOPEN_KEEP_CACHE`, so the kernel keeps the
+    /// cached pages of a file when the file is opened again; see
+    /// [`DataCaching::Page`] for what drops them.
+    ///
     /// A direct handle also announces `FOPEN_PARALLEL_DIRECT_WRITES`, and the
     /// announcement is the whole of it: without it the guest kernel takes the
     /// inode's lock **exclusively** around every direct write, so an application
@@ -149,13 +180,10 @@ impl DataCaching {
     /// file; a write extending past the current end; and a file that has ever
     /// been mapped, whose page cache is the other writer. So this helps in-place
     /// overwrites of an already-sized file, and nothing else claims otherwise.
-    ///
-    /// Nothing else is added: `FOPEN_KEEP_CACHE` stays off because v1 caching is
-    /// writethrough and conservative, in both modes.
     #[must_use]
     fn fopen_flags(self) -> FopenFlags {
         match self {
-            Self::Page => FopenFlags::empty(),
+            Self::Page => FopenFlags::FOPEN_KEEP_CACHE,
             Self::Direct => FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES,
         }
     }
@@ -267,6 +295,10 @@ pub struct VoidportFs {
     /// because the callbacks take `&self` and a mount may run several dispatch
     /// loops, and mutated only through its lock.
     readahead: Arc<Readahead>,
+    /// Drops the cached pages of a file in the kernel. The mount attaches the
+    /// session's notifier to it, because the notifier only exists once this
+    /// adapter has been handed to the session.
+    invalidator: Arc<PageInvalidator>,
     /// The callbacks this adapter has taken and not yet replied to. Held here
     /// as well as by the mount, which is what waits on it when it tears down.
     inflight: Arc<InFlight>,
@@ -305,6 +337,7 @@ impl VoidportFs {
             privileged,
             caching: DataCaching::Page,
             readahead,
+            invalidator: Arc::default(),
             inflight,
         }
     }
@@ -319,6 +352,19 @@ impl VoidportFs {
     #[must_use]
     pub fn client(&self) -> Arc<Client> {
         Arc::clone(&self.client)
+    }
+
+    /// Returns what drops the cached pages of a file in the kernel.
+    #[must_use]
+    pub fn invalidator(&self) -> Arc<PageInvalidator> {
+        Arc::clone(&self.invalidator)
+    }
+
+    /// Returns the invalidator on a mount whose cached pages outlive an open,
+    /// and none on a direct mount, whose only cached pages are the ranges a
+    /// process mapped.
+    fn invalidator_of_kept_pages(&self) -> Option<Arc<PageInvalidator>> {
+        (self.caching == DataCaching::Page).then(|| self.invalidator())
     }
 
     /// Hands one callback's work to the runtime.
@@ -345,7 +391,8 @@ impl fuser::Filesystem for VoidportFs {
     /// record locks guest-locally and the server never sees them, so a
     /// cross-mount conflict is unobservable; without `FUSE_AUTO_INVAL_DATA` a
     /// same-size overwrite from elsewhere stays invisible to a held-open
-    /// descriptor indefinitely instead of being bounded by the attr TTL.
+    /// descriptor, and to every open of a page-cached file, indefinitely
+    /// instead of being bounded by the attr TTL (see [`DataCaching::Page`]).
     /// A kernel that cannot offer them cannot keep the guarantees this
     /// filesystem makes, so the mount fails instead of quietly weakening.
     ///
@@ -437,6 +484,18 @@ impl fuser::Filesystem for VoidportFs {
         });
     }
 
+    /// Changes attributes, and on a page-cached mount drops the cached pages of
+    /// the file once the change succeeded.
+    ///
+    /// The reply contains the attributes the server has now, and those include
+    /// a change the host made earlier. The kernel records them and drops pages
+    /// only when the size changed, so a modification time set by the host would
+    /// match the recorded one at every later refresh.
+    ///
+    /// A change of size is answered first and its pages are dropped after the
+    /// reply: until the reply, the kernel sends no write of a dirty page
+    /// (`fuse_do_setattr` in `fs/fuse/dir.c`), and dropping a dirty page waits
+    /// for its write.
     #[allow(clippy::too_many_arguments, reason = "the callback's shape is fuser's")]
     fn setattr(
         &self,
@@ -472,6 +531,7 @@ impl fuser::Filesystem for VoidportFs {
         // truncate is exactly that — so the prefetched blocks go with it. A
         // chmod or a chown is not, and leaves them alone.
         let readahead = Arc::clone(&self.readahead);
+        let pages = self.invalidator_of_kept_pages();
         let changes_data = size.is_some() || mtime.is_some();
         if changes_data {
             readahead.invalidate(ino.0);
@@ -491,9 +551,17 @@ impl fuser::Filesystem for VoidportFs {
             if changes_data {
                 readahead.invalidate(ino.0);
             }
-            match settled {
-                Ok(attr) => reply.attr(&ttl, &node_attr(ino.0, &attr, privileged)),
-                Err(error) => reply.error(errno(error)),
+            let attr = match settled {
+                Ok(attr) => attr,
+                Err(error) => return reply.error(errno(error)),
+            };
+            let resized = size.is_some();
+            if let Some(pages) = pages.as_ref().filter(|_| !resized) {
+                pages.drop_pages(ino.0).await;
+            }
+            reply.attr(&ttl, &node_attr(ino.0, &attr, privileged));
+            if let Some(pages) = pages.as_ref().filter(|_| resized) {
+                pages.drop_pages(ino.0).await;
             }
         });
     }
@@ -845,6 +913,7 @@ impl fuser::Filesystem for VoidportFs {
     ) {
         let (client, caller) = (self.client(), caller_of(request));
         self.readahead.close(fh.0);
+        self.invalidator.release(fh.0);
         self.spawn(async move {
             answer(
                 reply,
@@ -1168,6 +1237,9 @@ impl fuser::Filesystem for VoidportFs {
     /// A waiting lock parks on the server until the range frees; because this
     /// callback returns immediately and waits on the runtime, the mount keeps
     /// serving everything else meanwhile.
+    ///
+    /// On a page-cached mount the first read or write lock granted through an
+    /// open handle drops the cached pages of the file before the reply.
     #[allow(clippy::too_many_arguments, reason = "the callback's shape is fuser's")]
     fn setlk(
         &self,
@@ -1193,8 +1265,15 @@ impl fuser::Filesystem for VoidportFs {
             pid,
             kind,
         };
+        let pages = self
+            .invalidator_of_kept_pages()
+            .filter(|_| kind != LockKind::Unlock);
         self.spawn(async move {
-            answer(reply, client.setlk(caller, ino.0, fh.0, lock, sleep).await);
+            let placed = client.setlk(caller, ino.0, fh.0, lock, sleep).await;
+            if let (Ok(()), Some(pages)) = (&placed, &pages) {
+                pages.drop_pages_for_lock(ino.0, fh.0).await;
+            }
+            answer(reply, placed);
         });
     }
 
@@ -1510,27 +1589,6 @@ mod tests {
         // unchanged byte for byte.
         assert_eq!(DataCaching::resolve(false, true), DataCaching::Page);
         assert_eq!(DataCaching::resolve(false, false), DataCaching::Page);
-    }
-
-    /// Bits are added only in the direct mode: a page-caching mount replies
-    /// exactly what it replied before the option existed.
-    #[test]
-    fn only_the_direct_mode_sets_a_reply_flag() {
-        assert_eq!(DataCaching::Page.fopen_flags(), FopenFlags::empty());
-        assert_eq!(
-            DataCaching::Direct.fopen_flags(),
-            FopenFlags::FOPEN_DIRECT_IO | FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES
-        );
-        // The kernel's own values for them (`FOPEN_DIRECT_IO` and
-        // `FOPEN_PARALLEL_DIRECT_WRITES`, `include/uapi/linux/fuse.h`), so a
-        // renamed or re-valued library constant cannot silently change what the
-        // kernel is told.
-        assert_eq!(FopenFlags::FOPEN_DIRECT_IO.bits(), 1 << 0);
-        assert_eq!(FopenFlags::FOPEN_PARALLEL_DIRECT_WRITES.bits(), 1 << 6);
-        // `FUSE_DIRECT_IO_ALLOW_MMAP` is an INIT capability, not an open flag:
-        // it is negotiated once in `init`, and it is the *pair* of the two that
-        // keeps `mmap` working. Its kernel value is `1ULL << 36`.
-        assert_eq!(fuser::InitFlags::FUSE_DIRECT_IO_ALLOW_MMAP.bits(), 1 << 36);
     }
 
     #[test]

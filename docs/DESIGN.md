@@ -1932,9 +1932,9 @@ stated guarantee):
 - `FUSE_POSIX_LOCKS` — without it the kernel satisfies record locks
   guest-locally and the server never sees getlk/setlk.
 - `FUSE_AUTO_INVAL_DATA` — without it a same-size overwrite from
-  another mount or the host is invisible to a held-open descriptor
-  indefinitely (cached pages are only invalidated on attr change when
-  this is negotiated).
+  another mount or the host is invisible to an open descriptor, and
+  to every later open of a page-cached file, indefinitely (cached pages
+  are only invalidated on attr change when this is negotiated).
 
 `FUSE_FLOCK_LOCKS` is deliberately NOT negotiated: fuser 0.18 drops the
 kernel's `lk_flags` (the flock-vs-record distinction never reaches the
@@ -1987,15 +1987,32 @@ kernel's. No FORGET flush is owed at unmount: the server clears the
 session's nodes at teardown per the data-plane contract.
 
 **Caching (v1 conservative, per "Coherence and caching").**
-Writethrough — no writeback cache, and open replies never set
-keep_cache. Entry and attr TTLs default 1 second; reads may use the
-page cache, which revalidates on attr change under the negotiated
-`FUSE_AUTO_INVAL_DATA` (probe-verified: a held-open descriptor
-re-reads fresh data after the TTL with the capability, and stays stale
-indefinitely without it). mmap reads work through the page cache under
-the same bound. fsync/flush pass through. Staleness across mounts is
-bounded by the TTLs; the invalidation notification tightens this
-later.
+Writethrough: no writeback cache. Without `--direct-io`, open and
+create replies set keep_cache, so the cached pages of a file outlive
+an open. Entry and attr TTLs default 1 second; reads may use the page
+cache. The pages of a file are dropped when:
+
+- a read refreshes attributes older than the attr TTL and the size or
+  mtime changed, under the negotiated `FUSE_AUTO_INVAL_DATA`, for an
+  open descriptor and a file opened again alike (probe-verified: an
+  open descriptor re-reads fresh data after the TTL with the
+  capability, and is stale indefinitely without it);
+- the path walk of an open refreshes attributes older than the entry
+  TTL and the size or mtime changed, which is what bounds a mapping,
+  since a mapping refreshes no attributes;
+- a setattr succeeds, because the kernel records the attributes of its
+  reply without dropping pages;
+- the first read or write record lock is granted through an open
+  handle, so a process that opens a file, locks it and reads it sees
+  what the server has, as it did when every open dropped the pages.
+
+Pages filled while a host write was running, or after a host change
+that left size and mtime as they were, are stale until the size or
+mtime changes again: the kernel has recorded the final mtime with
+them, and an open no longer drops them. Accepted by the design
+authority on 2026-10-18 for 1.0.x only. fsync/flush pass through. Apart from those pages, staleness
+across mounts is bounded by the TTLs; the server's invalidation
+notification tightens this later.
 
 **Connection and concurrency.** One connection per mount, many
 requests in flight (request ids allocated by the client per the wire

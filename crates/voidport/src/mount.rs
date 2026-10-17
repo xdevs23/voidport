@@ -460,7 +460,9 @@ impl Mount {
             Arc::clone(&readahead),
             Arc::clone(&inflight),
         );
+        let invalidator = filesystem.invalidator();
         let session = Session::new(filesystem, mountpoint, &options.config())
+            .inspect(|session| invalidator.attach(session.notifier()))
             .and_then(Session::spawn)
             .map_err(|source| MountError::Mount {
                 mountpoint: mountpoint.display().to_string(),

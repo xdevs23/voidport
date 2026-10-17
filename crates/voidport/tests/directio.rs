@@ -24,6 +24,12 @@
 //!   asked for direct I/O without the kernel's permission to map it.
 //! * exec-from-mount is observed by running a real binary off the mount, which
 //!   is the same mapping path taken by the loader instead of by the test.
+//! * the cache of a default mount lasting across opens is observed the same
+//!   way, with a second open between the two reads: a host change that leaves
+//!   the attributes as they were is not seen, a new modification time is seen
+//!   once the attributes are fetched again or a mapping follows a new lookup,
+//!   and a successful `setattr` or the first record lock granted through a
+//!   handle makes the next read come from the server.
 //!
 //! There is no SQLite in this workspace, so there is no WAL suite to run under
 //! the option; the `MAP_SHARED` case above is the mechanism a WAL depends on —
@@ -35,8 +41,9 @@ mod support;
 use std::fs;
 use std::os::unix::fs::{FileExt as _, PermissionsExt as _};
 use std::path::Path;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
+use rustix::fs::FlockOperation;
 use support::Fixture;
 use support::mapping::SharedMapping;
 use voidport::mount::MountOptions;
@@ -78,6 +85,22 @@ fn rewrite(path: &Path, byte: u8) {
     file.write_all_at(&vec![byte; PAGE], 0)
         .expect("the host file is rewritten");
     file.sync_all().expect("the host file is flushed");
+}
+
+/// Returns the modification time of a host file.
+fn modified(path: &Path) -> SystemTime {
+    fs::metadata(path)
+        .and_then(|metadata| metadata.modified())
+        .expect("the host file has a modification time")
+}
+
+/// Sets the modification time of a host file.
+fn set_modified(path: &Path, time: SystemTime) {
+    fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .and_then(|file| file.set_modified(time))
+        .expect("the modification time of the host file is set");
 }
 
 /// Reads one page at offset zero from an already-open descriptor.
@@ -145,6 +168,233 @@ fn without_the_option_the_second_read_comes_from_the_guest_page_cache() {
         page_at_zero(&file),
         vec![b'a'; PAGE],
         "an ordinary mount is supposed to hold this page in guest memory"
+    );
+}
+
+/// Reads a whole file through the mount.
+fn read_file(path: &Path) -> Vec<u8> {
+    fs::read(path).expect("readable")
+}
+
+/// What the guest reads after the host rewrites a file the guest has read.
+///
+/// The host file starts as `a` bytes and the guest reads it once through a
+/// mount made with `options`. The host then rewrites it in place with `b`
+/// bytes, which leaves the size as it was, and sets its modification time to
+/// the old one plus `shift`. `then` is what the guest does next with the path
+/// of the file, and what it returns is the result.
+fn read_after_host_rewrite(
+    name: &str,
+    options: &MountOptions,
+    shift: Duration,
+    then: impl FnOnce(&Path) -> Vec<u8>,
+) -> Vec<u8> {
+    let fixture = Fixture::start(name);
+    let host = fixture.host("tree/rewritten.bin");
+    fs::write(&host, vec![b'a'; PAGE]).expect("the host file is created");
+
+    let guest = fixture.mount_with(name, &fixture.tcp_url("plain", "/tree"), options);
+    let path = guest.path("rewritten.bin");
+    assert_eq!(read_file(&path), vec![b'a'; PAGE]);
+
+    let written = modified(&host);
+    rewrite(&host, b'b');
+    set_modified(&host, written + shift);
+    then(&path)
+}
+
+/// A default mount does not drop the cached pages of a file when the file is
+/// opened again, so a second open reads from guest memory and not from the
+/// server.
+///
+/// The host changes the bytes in place and sets the modification time back, and
+/// the timeouts are an hour long, so the kernel has no sign that the file
+/// changed: only an open that drops the cached pages returns the new bytes.
+#[test]
+fn a_reopened_file_is_read_from_the_guest_page_cache() {
+    if !support::preflight() {
+        return;
+    }
+    let read = read_after_host_rewrite("reopen-cached", &options(false), Duration::ZERO, read_file);
+    assert_eq!(
+        read,
+        vec![b'a'; PAGE],
+        "the second open dropped the pages the first open had cached"
+    );
+}
+
+/// A file that is opened again is read from the server once its refreshed
+/// attributes show a new modification time, even when its size is the same.
+///
+/// The attribute timeout is zero, so the read after the second open fetches the
+/// attributes again, and `FUSE_AUTO_INVAL_DATA` drops the cached pages when the
+/// modification time differs. The host sets the new time itself, so the change
+/// does not depend on the resolution of the host clock.
+#[test]
+fn a_new_modification_time_drops_the_cached_pages() {
+    if !support::preflight() {
+        return;
+    }
+    let options = MountOptions {
+        attr_timeout: Duration::ZERO,
+        ..options(false)
+    };
+    let read = read_after_host_rewrite(
+        "reopen-changed",
+        &options,
+        Duration::from_secs(1),
+        read_file,
+    );
+    assert_eq!(
+        read,
+        vec![b'b'; PAGE],
+        "the cached pages outlived a new modification time"
+    );
+}
+
+/// A successful `setattr` drops the cached pages of the file.
+///
+/// The host gives the file a new modification time, and then the guest changes
+/// the mode of the file, all within the hour-long timeouts. The reply to the
+/// `setattr` contains the new modification time and the kernel records it
+/// without dropping pages, so only the invalidation the adapter sends makes the
+/// next read return the new bytes.
+#[test]
+fn a_successful_setattr_drops_the_cached_pages() {
+    if !support::preflight() {
+        return;
+    }
+    let read = read_after_host_rewrite(
+        "setattr-drops",
+        &options(false),
+        Duration::from_secs(1),
+        |path| {
+            fs::set_permissions(path, fs::Permissions::from_mode(0o600)).expect("the mode is set");
+            read_file(path)
+        },
+    );
+    assert_eq!(
+        read,
+        vec![b'b'; PAGE],
+        "the setattr left the pages cached before the host changed the file"
+    );
+}
+
+/// A granted record lock drops the cached pages of the file.
+///
+/// The host sets the modification time back, so no attribute shows the change.
+/// A guest that opens the file, takes a read lock and reads under it must read
+/// what the host wrote.
+#[test]
+fn a_granted_record_lock_drops_the_cached_pages() {
+    if !support::preflight() {
+        return;
+    }
+    let read = read_after_host_rewrite("lock-drops", &options(false), Duration::ZERO, |path| {
+        let file = fs::File::open(path).expect("readable");
+        rustix::fs::fcntl_lock(&file, FlockOperation::NonBlockingLockShared)
+            .expect("the range is free");
+        page_at_zero(&file)
+    });
+    assert_eq!(
+        read,
+        vec![b'b'; PAGE],
+        "the lock was granted and the read under it came from pages cached before"
+    );
+}
+
+/// Only the first lock granted through an open handle drops the cached pages,
+/// which is how often an open dropped them before the pages outlived it.
+///
+/// The guest opens the file, locks and unlocks it, the host rewrites it and
+/// sets the modification time back, and a second lock through the same handle
+/// still reads the pages the first lock left.
+#[test]
+fn a_second_lock_on_one_handle_keeps_the_cached_pages() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = Fixture::start("lock-once");
+    let host = fixture.host("tree/locked.bin");
+    fs::write(&host, vec![b'a'; PAGE]).expect("the host file is created");
+    let guest = fixture.mount_with(
+        "lock-once",
+        &fixture.tcp_url("plain", "/tree"),
+        &options(false),
+    );
+
+    let file = fs::File::open(guest.path("locked.bin")).expect("readable");
+    rustix::fs::fcntl_lock(&file, FlockOperation::NonBlockingLockShared)
+        .expect("the range is free");
+    assert_eq!(page_at_zero(&file), vec![b'a'; PAGE]);
+    rustix::fs::fcntl_lock(&file, FlockOperation::Unlock).expect("the lock is released");
+
+    let written = modified(&host);
+    rewrite(&host, b'b');
+    set_modified(&host, written);
+    rustix::fs::fcntl_lock(&file, FlockOperation::NonBlockingLockShared)
+        .expect("the range is free");
+    assert_eq!(
+        page_at_zero(&file),
+        vec![b'a'; PAGE],
+        "a second lock through the same handle dropped the cached pages"
+    );
+}
+
+/// A file that is opened again and then mapped shows a new modification time
+/// once the entry timeout has passed, even though a mapping refreshes no
+/// attributes: the lookup of the path walk fetches them.
+#[test]
+fn a_mapping_after_a_new_lookup_drops_the_cached_pages() {
+    if !support::preflight() {
+        return;
+    }
+    let options = MountOptions {
+        entry_timeout: Duration::ZERO,
+        ..options(false)
+    };
+    let read = read_after_host_rewrite("mapped-reopen", &options, Duration::from_secs(1), |path| {
+        let mapping = SharedMapping::open(path, PAGE).expect("the file maps");
+        mapping.bytes().to_vec()
+    });
+    assert_eq!(
+        read,
+        vec![b'b'; PAGE],
+        "the mapping read pages cached before the host changed the file"
+    );
+}
+
+/// A truncate of a file with a dirty shared mapping returns.
+///
+/// The kernel sends no write of a dirty page until the reply to a change of
+/// size, so pages dropped before that reply would wait for a write that
+/// cannot start, and the truncate would never return.
+#[test]
+fn a_truncate_under_a_dirty_mapping_returns() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = Fixture::start("truncate-mapped");
+    let guest = fixture.mount_with(
+        "truncate-mapped",
+        &fixture.tcp_url("plain", "/tree"),
+        &options(false),
+    );
+    let path = guest.path("mapped.bin");
+    fs::write(&path, vec![b'.'; PAGE]).expect("the file is created through the mount");
+
+    let mut mapping = SharedMapping::open(&path, PAGE).expect("the file maps");
+    mapping.bytes_mut()[0] = b'x';
+    let file = fs::OpenOptions::new()
+        .write(true)
+        .open(&path)
+        .expect("writable");
+    file.set_len(2 * PAGE as u64)
+        .expect("the file is truncated");
+    drop(mapping);
+    assert_eq!(
+        fs::metadata(&path).expect("the file exists").len(),
+        2 * PAGE as u64
     );
 }
 
