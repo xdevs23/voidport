@@ -291,7 +291,7 @@ impl Session {
         // already hold under that name.
         let found = host.node_identity();
         let fresh = host
-            .present(ino, mode, namespace.ownership(), privileged.of(&found))
+            .present(ino, namespace.ownership(), privileged.of(&found))
             .ok_or(Errno::NOENT)?;
         let kind = identity.kind;
         let key = NodeKey::of(&path, identity, mode);

@@ -34,8 +34,9 @@ wire_struct! {
     /// to name the file in wire operations, which is session-scoped and mode-keyed
     /// (see the "Inode identity and node ids" section of the design).
     ///
-    /// The `mode` bits are presentation only: a read-only graft strips write bits
-    /// here, while enforcement always happens on the server.
+    /// The `mode` bits are presentation only: they are the bits the host entry
+    /// has, whatever the share mode, and enforcement always happens on the
+    /// server.
     pub struct Attr {
         /// Guest-visible inode number.
         pub ino: U64,

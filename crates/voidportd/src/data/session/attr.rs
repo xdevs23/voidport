@@ -171,9 +171,8 @@ impl Session {
         if bits.is_empty() {
             return Ok(());
         }
-        // The predicate reads group-execute, and neither the presentation merge
-        // nor a read-only graft's write mask touches that bit — so the host
-        // mode answers it exactly.
+        // The predicate reads group-execute, and the presentation merge does
+        // not touch that bit, so the host mode answers it exactly.
         let fd = node.descriptor(namespace)?.ok_or(Errno::STALE)?;
         let mode = HostAttr::of(fd.as_fd())?.host_mode();
         self.records
@@ -267,7 +266,7 @@ impl Session {
         node: &Node,
     ) -> Result<Attr, Errno> {
         let ownership = namespace.ownership();
-        let NodeBacking::Host { mode, .. } = &node.backing else {
+        let NodeBacking::Host { .. } = &node.backing else {
             return Ok(synthesized_attr(
                 node.ino,
                 ownership,
@@ -276,7 +275,7 @@ impl Session {
         };
         let fd = node.descriptor(namespace)?.ok_or(Errno::STALE)?;
         HostAttr::of(fd.as_fd())?
-            .present(node.ino, *mode, ownership, privileged.of_node(node))
+            .present(node.ino, ownership, privileged.of_node(node))
             .ok_or(Errno::NOENT)
     }
 }

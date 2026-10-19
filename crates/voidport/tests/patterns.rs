@@ -16,7 +16,7 @@ use std::path::Path;
 use std::time::Duration;
 
 use rustix::io::Errno;
-use support::{Fixture, errno, eventually, presented_mode};
+use support::{Fixture, errno, eventually, refuses_writes};
 use voidport_control::{NamespaceName, NamespaceSpec, Reply, Request, Response, Rule, ShareMode};
 
 /// How long a test waits for something the cache timeouts bound.
@@ -108,7 +108,7 @@ fn start(label: &str) -> Fixture {
     fixture
 }
 
-/// Creates a host directory with a mode the presented bits can be read off.
+/// Creates a host directory with a fixed mode, whatever the umask is.
 fn make(path: &Path) {
     fs::create_dir_all(path).expect("the host is writable");
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("a settable mode");
@@ -218,14 +218,12 @@ fn the_specificity_chain_holds_through_a_real_mount() {
     let guest = fixture.mount("family", "family", "");
 
     // At one directory, three names, one winner each.
-    assert_eq!(
-        presented_mode(&guest.path("family/project-pinned")),
-        "r-x------",
+    assert!(
+        refuses_writes(&guest.path("family/project-pinned")),
         "a literal rule beats the pattern covering the same name"
     );
-    assert_eq!(
-        presented_mode(&guest.path("family/project-a")),
-        "rwx------",
+    assert!(
+        !refuses_writes(&guest.path("family/project-a")),
         "the pattern beats the bare `*`"
     );
     assert!(
@@ -235,14 +233,12 @@ fn the_specificity_chain_holds_through_a_real_mount() {
 
     // The fourth tier is observable only where no bare `*` shadows it, which
     // takes a second directory.
-    assert_eq!(
-        presented_mode(&guest.path("plain/keep-one")),
-        "r-x------",
+    assert!(
+        refuses_writes(&guest.path("plain/keep-one")),
         "the pattern beats the enclosing default"
     );
-    assert_eq!(
-        presented_mode(&guest.path("plain/misc")),
-        "rwx------",
+    assert!(
+        !refuses_writes(&guest.path("plain/misc")),
         "and the enclosing default decides the rest"
     );
 }
@@ -258,14 +254,12 @@ fn a_host_entry_named_with_a_star_is_still_a_literal_name() {
     let fixture = start("pattern-literal-star");
     let guest = fixture.mount("family", "family", "/plain");
 
-    assert_eq!(
-        presented_mode(&guest.path("b*")),
-        "r-x------",
+    assert!(
+        refuses_writes(&guest.path("b*")),
         "the rule `/plain/b*` governs the entry really called `b*`"
     );
-    assert_eq!(
-        presented_mode(&guest.path("bx")),
-        "rwx------",
+    assert!(
+        !refuses_writes(&guest.path("bx")),
         "and it governs nothing else: a path component is never a glob"
     );
     assert!(names(guest.root()).contains(&"b*".to_owned()));
@@ -281,12 +275,11 @@ fn a_match_reaches_a_dotfile_only_when_it_begins_with_a_dot() {
     let guest = fixture.mount("family", "family", "/dots");
 
     // `*-a` covers `x-a`...
-    assert_eq!(presented_mode(&guest.path("x-a")), "r-x------");
+    assert!(refuses_writes(&guest.path("x-a")));
     // ...and cannot reach `.c-a`, which therefore inherits the graft's own
     // read-write mode instead of the match's read-only one.
-    assert_eq!(
-        presented_mode(&guest.path(".c-a")),
-        "rwx------",
+    assert!(
+        !refuses_writes(&guest.path(".c-a")),
         "a match starting with `*` never covers a name starting with `.`"
     );
     // A match that begins with a literal `.` does cover dotfiles: this one is

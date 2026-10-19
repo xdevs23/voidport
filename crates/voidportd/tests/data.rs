@@ -14,7 +14,7 @@ use std::time::Duration;
 
 use support::fixture::{Fixture, supports_user_xattrs};
 use support::wire::{ROOT, status};
-use support::{Dial as _, open_descriptors};
+use support::{Dial as _, host_permissions, open_descriptors};
 use voidport_control::{NamespaceName, OwnershipSpec, Request, Rule, ShareMode, UnmappedPolicy};
 use voidport_proto::PROTOCOL_VERSION;
 use voidport_proto::frame::{FRAME_HEADER_LEN, FrameWriter, MAX_HELLO_FRAME_LEN};
@@ -264,7 +264,17 @@ fn the_worked_example_resolves_and_lists_as_designed() {
     assert_ne!(foo.permissions() & 0o200, 0, "foo keeps its write bits");
 
     let bar = client.lookup(ROOT, "bar").expect("bar is shared read-only");
-    assert_eq!(bar.permissions() & 0o222, 0, "a read-only graft strips w");
+    assert_eq!(
+        bar.permissions(),
+        host_permissions(&fixture.join("project/bar")),
+        "a read-only graft shows the host bits"
+    );
+    assert_eq!(
+        client
+            .mkdir(bar.node_id, "new", 0o755)
+            .expect_err("and the write still fails"),
+        status::ROFS
+    );
 
     let file = client.lookup(ROOT, "file.txt").expect("file.txt is shared");
     assert_ne!(file.permissions() & 0o200, 0);

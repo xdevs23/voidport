@@ -102,6 +102,14 @@ pub fn environment(state_dir: &Path) -> Environment {
     pinned_environment(state_dir)
 }
 
+/// The permission bits a host path has, file type excluded: what a presented
+/// entry is compared against.
+#[must_use]
+pub fn host_permissions(path: &Path) -> u32 {
+    use std::os::unix::fs::MetadataExt as _;
+    fs::metadata(path).expect("the host entry exists").mode() & 0o7777
+}
+
 /// Data-plane clients against a running server.
 ///
 /// The runner itself is shared with the other suites and knows nothing about

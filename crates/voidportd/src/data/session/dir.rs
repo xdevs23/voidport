@@ -123,7 +123,7 @@ impl Session {
         name: &Name,
         resolution: &Resolution,
     ) -> Option<Option<HostIdentity>> {
-        let Resolution::HostBacked { backing, mode } = resolution else {
+        let Resolution::HostBacked { backing, .. } = resolution else {
             return Some(None);
         };
         let host = self.stat_entry(namespace, parent, name, backing).ok()?;
@@ -132,7 +132,6 @@ impl Session {
         // this asks with the neutral value.
         host.present(
             0,
-            *mode,
             namespace.ownership(),
             crate::records::Privileged::Recorded(crate::records::PrivilegedBits::NONE),
         )?;

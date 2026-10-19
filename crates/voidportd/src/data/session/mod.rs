@@ -240,7 +240,7 @@ impl Session {
                 } else {
                     crate::records::Privileged::Masked
                 };
-                host.present(root_ino, *mode, namespace.ownership(), privileged)
+                host.present(root_ino, namespace.ownership(), privileged)
                     .ok_or(Errno::NOENT)?;
                 // The mount root is a cache slot like any other: it has no
                 // ancestor inside the namespace, so it re-pins by descending

@@ -21,8 +21,8 @@
 //!   the wire's `generation` field is reserved and carries 0.
 //! * **Non-directories are keyed by `(host_dev, host_ino, effective mode)`.**
 //!   One host inode reachable through rules with different share modes is one
-//!   node id per mode, each with its own enforcement and presented bits, while
-//!   all of them share one `ino`.
+//!   node id per mode, each with its own enforcement, while all of them share
+//!   one `ino`.
 //! * **Directories are keyed by namespace path.** Child resolution runs from
 //!   the parent's namespace path, so one host directory grafted at two
 //!   namespace paths is two nodes — their children may differ by policy.
@@ -80,9 +80,9 @@ pub enum NodeBacking {
         /// out of the table and do I/O without holding the table lock, and so
         /// every clone of the node agrees about the one slot.
         pin: Arc<NodePin>,
-        /// The share mode of the rule that admitted it. Enforcement and
-        /// presented bits both use this — the policy of the path that admitted
-        /// the entry, fixed at lookup.
+        /// The share mode of the rule that admitted it. Enforcement uses
+        /// this: the policy of the path that admitted the entry, fixed at
+        /// lookup.
         mode: EffectiveMode,
         /// What kind of host entry it is, as of the lookup that pinned it.
         kind: FileKind,

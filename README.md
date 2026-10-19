@@ -18,9 +18,13 @@ can change while the guest is mounted.
   bidirectional table (`map`) with a configurable policy for unmapped ids
   (squash / hide / passthrough). Mapping applies in reverse to files the
   guest creates.
-- **Enforcement is server-side.** The permission bits a guest sees are
-  presentation; every operation is checked against the live rules on the
-  server, so a guest kernel cannot talk its way past a read-only rule.
+- **Enforcement is server-side.** The permission bits a guest sees are the
+  bits the host entry has, in a read-only share as in a read-write one, so a
+  file copied out of a read-only share gets the host mode. Every operation is
+  checked against the live rules on the server, so a guest kernel cannot get
+  past a read-only rule. A check for write access (`access(W_OK)`,
+  `test -w`) by a caller the host bits admit reports writable through a
+  read-only share, and the write itself fails with EROFS.
 - **Live reconfiguration**: rules, ownership and modes change through a
   control socket while guests stay mounted; changes bind at the next
   lookup or open, without remounting.

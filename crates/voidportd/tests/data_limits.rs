@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use support::fixture::Fixture;
 use support::wire::{ROOT, WireClient, status, whole_file_lock};
-use support::{Dial as _, TempDir, daemon_config};
+use support::{Dial as _, TempDir, daemon_config, host_permissions};
 use voidport_control::{Reply, Request, Rule, ShareMode};
 use voidport_proto::ops::file::{SetlkRequest, lock_type};
 use voidport_proto::ops::node::{GetattrRequest, GetattrResponse};
@@ -747,9 +747,9 @@ fn a_directory_graft_downgraded_to_read_only_binds_at_the_next_child_operation()
         .lookup(tree.node_id, "data.bin")
         .expect("still resolves");
     assert_eq!(
-        child.permissions() & 0o222,
-        0,
-        "a read-only graft strips the write bits it presents"
+        child.permissions(),
+        host_permissions(&fixture.tree("data.bin")),
+        "a read-only graft shows the host bits"
     );
     assert_eq!(
         client.open(child.node_id, O_RDWR).expect_err("write open"),

@@ -146,7 +146,7 @@ impl fmt::Display for ShareMode {
 )]
 #[serde(rename_all = "lowercase")]
 pub enum PermissionMode {
-    /// Host bits as-is, less the write bits on a read-only graft.
+    /// Host bits as-is, on a read-only graft as on a read-write one.
     #[default]
     Passthrough,
 }

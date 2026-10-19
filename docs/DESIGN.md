@@ -46,7 +46,7 @@ Guest:
 mount voidport://10.0.2.2/@my-namespace/path/to/project /mnt/project
 ls -la /mnt/project
   rwx------ foo/
-  r-x------ bar/
+  rwx------ bar/            # read-only: writes fail with EROFS
   rw------- file.txt        # secret/ does not exist as far as the guest can tell
 ```
 
@@ -142,14 +142,28 @@ Precise semantics (decided 2026-08-12 after the rule-engine spec review):
 
 ### Permissions
 
-- **passthrough** (v1): host permission bits shown as-is, except that a
-  read-only graft strips write bits from the *presented* mode (`r-x` in the
-  example above).
+- **passthrough** (v1): host permission bits shown as-is, on a read-only
+  graft as on a read-write one (`bar/` in the example above shows the bits
+  it has on the host). The one fixed mode is the 0555 of a synthesized
+  directory, which has no host entry to pass through.
 - Future: mask / synthetic modes.
 
 Presentation is UX only. **Enforcement is server-side, always**: guest root
 is untrusted, and a write through a ro graft fails at the server regardless
 of what bits were displayed.
+
+(Amended 2026-10-19, release 1.0.7: up to 1.0.6 a read-only graft cleared
+the write bits of every entry it showed, so `bar/` above read `r-x------`.
+A file copied out of a read-only share got the cleared mode, so a build that
+appended to its copy failed on that copy. The bits are now the ones the host
+entry has, in either mode, and the server still fails every operation that
+writes, creates, removes or renames an entry through a read-only graft with
+EROFS. The cost is one result: the mount uses `default_permissions`, so the
+guest kernel decides a check for write access (`access(W_OK)`, `test -w`)
+from the shown bits alone, and only a read-only mount as a whole makes that
+check fail with EROFS. For a caller the host bits admit, the check therefore
+reports a read-only graft as writable, and the write itself fails with
+EROFS.)
 
 ## Rule table and resolution
 
@@ -252,9 +266,12 @@ deterministic and insertion-order-independent by construction.
 - **Ownership mapping** per the "Ownership" section's precise semantics:
   separate injective uid/gid tables, forward and reverse application,
   per-direction unmapped policies, injected server identity and squash ids.
-- **Presented permission bits** are a pure function of host mode and
-  effective share mode: ro clears the write bits (mask `0o222`) and
-  preserves everything else; rw passes through; hidden never surfaces.
+- **Presented permission bits** are the bits each admitted entry has on
+  the host, whatever its effective share mode. An entry marked hidden is
+  never shown. Only a synthesized directory presents a fixed mode, 0555.
+  (Amended 2026-10-19, release 1.0.7: until 1.0.6 the bits were a function
+  of the host mode and the share mode, and ro cleared the write bits, mask
+  `0o222`.)
 
 ### Acceptance criteria — increment 3 (rule engine)
 
@@ -290,6 +307,9 @@ retracted.
    for chown), numeric squash ids. All tested.
 6. Presented-bits computation is a pure function with tests (ro clears
    exactly `0o222`; rw preserves; synthesized directories present 0555).
+   (Amended 2026-10-19, release 1.0.7: the function is gone. A read-only
+   graft presents the host bits like a read-write one, and only the
+   synthesized directories' 0555 remains fixed.)
 7. The engine performs no I/O (no rustix/tokio/fs imports in its modules),
    takes identity inputs by injection, and is deterministic.
 8. `./check` passes.
@@ -330,8 +350,8 @@ below):
 Keying node ids by effective mode resolves the alias-policy conflict: when
 one host inode is reachable through rules with different share modes
 (hardlinks crossing rule boundaries), each mode surfaces as its own node id
-with its own enforcement and presented bits, while all aliases share one
-`ino`. Enforcement always uses the node's mode — the policy of the path
+with its own enforcement, while all aliases share one `ino` and present the
+same bits. Enforcement always uses the node's mode — the policy of the path
 that admitted it.
 
 Node lifecycle follows FUSE: lookup and readdirplus entries increment a
@@ -359,14 +379,13 @@ Refinements from the rule-engine spec review (decided 2026-08-12):
 - **Synthesized directories** have no host backing: their inos come from a
   disjoint synthetic ino space (tag bit), allocated per namespace path,
   stable for the server's lifetime. Their attributes are fixed: directory,
-  permission bits 0555 through the presented-bits function, ownership =
-  the forward-mapped server identity, nlink 2, timestamps an injected
-  constant — decided 2026-08-16 to be **the server's start time**,
-  injected once at startup (the original implementation injected
-  zero, which presents as 1970 and reads as breakage to users and
-  tools; start time keeps the same stability property — the
-  skeleton never appears to change under an attribute-caching
-  guest — while presenting a plausible clock).
+  permission bits 0555, ownership = the forward-mapped server identity,
+  nlink 2, timestamps an injected constant — decided 2026-08-16 to be
+  **the server's start time**, injected once at startup (the original
+  implementation injected zero, which presents as 1970 and reads as
+  breakage to users and tools; start time keeps the same stability
+  property — the skeleton never appears to change under an
+  attribute-caching guest — while presenting a plausible clock).
 - **Ino allocation** is a monotonic u64, never reused within a server
   lifetime. The synthesized-directory ino table is **server-global, keyed
   by (namespace name, namespace path), and survives snapshot swaps and
@@ -1757,8 +1776,8 @@ cannot do. The per-request caller identity drives ownership mapping on
 create and chown per the ownership contract.
 
 **Operation semantics.** Attributes are read fresh per getattr
-(fstatat-class calls; ownership forward-mapped, bits through the
-presented-bits function). Read/write are passthrough on the handle's fd at
+(fstatat-class calls; ownership forward-mapped, mode bits the ones the
+host entry has, whatever the share mode). Read/write are passthrough on the handle's fd at
 the requested offset. statfs reports the backing filesystem (fstatfs on
 the pinned fd) for host-backed nodes and zeroed synthetic values for
 synthesized directories. File locking implements getlk/setlk with OFD
@@ -1835,7 +1854,9 @@ node and handle counts) served by the control plane and exposed by
    unknown namespace, invalid subpath, subpath landing on a synthesized
    directory, and the pre-handshake size bound.
 2. The worked example over the wire: lookup and readdirplus show foo rw,
-   bar with write bits stripped, file.txt rw; `secret/` resolves ENOENT
+   bar read-only (write bits stripped when this criterion was written;
+   amended 2026-10-19, release 1.0.7: the host bits are shown and the
+   writes fail EROFS), file.txt rw; `secret/` resolves ENOENT
    and never appears in listings; a re-targeted literal graft absent from
    the host listing appears in readdirplus.
 3. Read/write round-trips through a rw graft; every write-class operation
@@ -2574,9 +2595,9 @@ never sees. Every contradicted sentence is replaced below.)
 - **The ACL guard, unconditional**: writes to `system.posix_acl_*`
   answer `EPERM` regardless of rules. Measured: a valid ACL blob
   written by the file's owner silently rewrites the mode bits — a
-  permission change the namespace's presented-bits and share-mode
-  machinery never sees — so an operator may not hand the permission
-  model away by glob. Reads follow policy. This answers the
+  permission change the namespace's share-mode machinery never sees —
+  so an operator may not hand the permission model away by glob. Reads
+  follow policy. This answers the
   standing "ACL and capability xattrs interact with privilege" note
   instead of silently retracting it.
 - **Denied reads hide**: a name whose read is denied is absent from
@@ -3966,7 +3987,8 @@ Revised 2026-08-13 after the spec review; the earlier set is retracted.
    fragment) with clear errors — unit-tested without a server.
 2. Mounting over tcp and over a unix socket both work end to end;
    `ls -la` of the worked example shows exactly the documented
-   presented modes (`rwx------`, `r-x------`, `rw-------`), and
+   presented modes (`rwx------`, `r-x------`, `rw-------`; amended
+   2026-10-19, release 1.0.7: `bar/` shows `rwx------` like the host), and
    `secret/` is ENOENT by direct path and absent from listings.
 3. File I/O through the mount: read/write round-trips, append,
    truncate, mmap read (exercised by demand-paging a mapped executable
@@ -3974,9 +3996,12 @@ Revised 2026-08-13 after the spec review; the earlier set is retracted.
    block outside the one ratified island); contents verified against
    the host side.
 4. ro enforcement through the mount, run as guest root so requests
-   pass the kernel's presented-bits check and reach the server: every
-   write-class operation in a ro graft fails with EROFS. One non-root
-   case asserts the kernel's own EACCES on the presented bits.
+   reach the server: every write-class operation in a ro graft fails
+   with EROFS. One non-root case asserts the kernel's own EACCES on the
+   presented bits. (Amended 2026-10-19, release 1.0.7: a ro graft shows
+   the host bits, so any caller the host bits admit passes the kernel's
+   presented-bits check, reaches the server and gets EROFS. EACCES is
+   left to a caller the bits exclude.)
 5. `--read-only`: the mount reports read-only to the kernel and every
    write-class operation fails even in an rw graft.
 6. Xattrs through the mount: user.* set/get/list/remove round-trip with

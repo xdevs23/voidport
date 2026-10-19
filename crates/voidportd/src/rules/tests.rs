@@ -9,7 +9,6 @@ use std::collections::BTreeSet;
 
 use super::mode::{EffectiveMode, ShareMode};
 use super::name::Name;
-use super::permissions::presented_mode;
 use super::resolve::DirContext;
 use super::table::{RuleSpec, RuleTable, TableError};
 use super::test_support::{describe, dir, enumerate, listing, name, path, table};
@@ -118,23 +117,6 @@ fn the_worked_example_resolves_whole_paths_as_a_lookup_would() {
     assert_eq!(resolve("/path/to/project/secret"), "Nonexistent");
     assert_eq!(resolve("/path/to/project/secret/inner"), "Nonexistent");
     assert_eq!(resolve("/elsewhere"), "Nonexistent");
-}
-
-#[test]
-fn the_worked_example_presents_the_documented_permission_bits() {
-    let table = worked_example();
-    let project = dir(&table, "/path/to/project");
-    let mode_of = |entry: &str| {
-        table
-            .resolve(&project, &name(entry))
-            .mode()
-            .expect("the entry is admitted")
-    };
-    // Host bits `rwx------` on the directories and `rw-------` on the file:
-    // the guest sees `rwx------ foo/`, `r-x------ bar/`, `rw------- file.txt`.
-    assert_eq!(presented_mode(0o040_700, mode_of("foo")), 0o040_700);
-    assert_eq!(presented_mode(0o040_700, mode_of("bar")), 0o040_500);
-    assert_eq!(presented_mode(0o100_600, mode_of("file.txt")), 0o100_600);
 }
 
 #[test]

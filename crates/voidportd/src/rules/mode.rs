@@ -10,8 +10,8 @@
 pub enum ShareMode {
     /// Read-write: the entry is admitted and writable.
     Rw,
-    /// Read-only: the entry is admitted; writes fail server-side and the
-    /// presented permission bits lose their write bits.
+    /// Read-only: the entry is admitted and presents its host permission
+    /// bits; writes fail server-side.
     Ro,
     /// Hidden: the entry does not resolve, does not stat, does not appear in
     /// a listing, and nothing beneath it is reachable through it.

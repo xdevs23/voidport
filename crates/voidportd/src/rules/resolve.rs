@@ -152,7 +152,7 @@ pub enum Resolution {
         /// beneath it.
         backing: HostBacking,
         /// The effective share mode the admitting rule gives it. Enforcement
-        /// and presented bits both use this mode.
+        /// uses this mode.
         mode: EffectiveMode,
     },
     /// The entry is a synthesized directory: it exists only because reachable

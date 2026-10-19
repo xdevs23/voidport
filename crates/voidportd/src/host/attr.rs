@@ -2,13 +2,11 @@
 //!
 //! Attributes are read fresh from the host on every request that needs them —
 //! the server is a passthrough proxy and the host filesystem is the truth — and
-//! then pass through exactly three policy transformations before they reach the
-//! wire:
+//! then pass through exactly two policy transformations before they are sent
+//! on the wire:
 //!
 //! * **ownership** is forward-mapped through the namespace's algebra, which may
-//!   also decide the file must not be seen at all (`unmapped: hide`),
-//! * **permission bits** go through the presented-bits function, which is where
-//!   a read-only graft loses its write bits, and
+//!   also decide the file must not be seen at all (`unmapped: hide`), and
 //! * **privileged bits** are merged from the namespace's record store — the
 //!   setuid and setgid bits the host backing must not carry — or masked away
 //!   where the namespace switch is off (see [`crate::records`]).
@@ -26,10 +24,7 @@ use voidport_proto::attr::{Attr, Timespec, file_type};
 use zerocopy::byteorder::little_endian::{U32, U64};
 
 use crate::records::Privileged;
-use crate::rules::{
-    EffectiveMode, HostIds, OwnerPresentation, Ownership, SYNTHESIZED_DIR_PERMISSIONS,
-    presented_mode,
-};
+use crate::rules::{HostIds, OwnerPresentation, Ownership, SYNTHESIZED_DIR_PERMISSIONS};
 
 /// The timestamp every synthesized directory carries: the server's start time,
 /// captured once.
@@ -372,19 +367,14 @@ impl HostAttr {
     /// [`Self::identity`]; the caller allocates it, because allocation is
     /// server-global state and this function is otherwise pure.
     ///
-    /// `privileged` is the third and last transformation of the presented mode:
-    /// the recorded setuid and setgid bits ORed in, or masked away where the
-    /// namespace switch is off. It is a plain value the caller resolved once
+    /// `privileged` is the one transformation of the presented mode: the
+    /// recorded setuid and setgid bits ORed in, or masked away where the
+    /// namespace switch is off. Every other bit is the one the host entry has,
+    /// whatever the share mode of the entry. It is a plain value the caller resolved once
     /// for the whole operation — no host syscall, no per-session cache — which
     /// is what keeps a listing's per-entry cost a table lookup.
     #[must_use]
-    pub fn present(
-        &self,
-        ino: u64,
-        mode: EffectiveMode,
-        ownership: &Ownership,
-        privileged: Privileged,
-    ) -> Option<Attr> {
+    pub fn present(&self, ino: u64, ownership: &Ownership, privileged: Privileged) -> Option<Attr> {
         let OwnerPresentation::Visible(guest) = ownership.forward(self.owner()) else {
             return None;
         };
@@ -395,7 +385,7 @@ impl HostAttr {
             atime: timespec(self.stat.stx_atime.tv_sec, self.stat.stx_atime.tv_nsec),
             mtime: timespec(self.stat.stx_mtime.tv_sec, self.stat.stx_mtime.tv_nsec),
             ctime: timespec(self.stat.stx_ctime.tv_sec, self.stat.stx_ctime.tv_nsec),
-            mode: U32::new(privileged.apply(presented_mode(self.host_mode(), mode))),
+            mode: U32::new(privileged.apply(self.host_mode())),
             nlink: U32::new(self.stat.stx_nlink as u32),
             uid: U32::new(guest.uid),
             gid: U32::new(guest.gid),
@@ -433,7 +423,7 @@ pub fn synthesized_attr(ino: u64, ownership: &Ownership, times: SynthesizedTimes
         atime: times.timestamp(),
         mtime: times.timestamp(),
         ctime: times.timestamp(),
-        mode: U32::new(S_IFDIR | presented_mode(SYNTHESIZED_DIR_PERMISSIONS, EffectiveMode::Ro)),
+        mode: U32::new(S_IFDIR | SYNTHESIZED_DIR_PERMISSIONS),
         nlink: U32::new(SYNTHESIZED_NLINK),
         uid: U32::new(guest.uid),
         gid: U32::new(guest.gid),
@@ -489,7 +479,6 @@ mod tests {
         let attr = host
             .present(
                 77,
-                EffectiveMode::Rw,
                 &passthrough(),
                 Privileged::Recorded(PrivilegedBits::NONE),
             )
@@ -499,23 +488,6 @@ mod tests {
         assert_eq!(attr.nlink.get(), 1);
         assert_eq!(attr.mode.get(), host.host_mode());
         assert_eq!(attr.uid.get(), host.owner().uid);
-    }
-
-    #[test]
-    fn read_only_presentation_clears_the_write_bits() {
-        let scratch = Scratch::new("attr");
-        let pinned = pin(&scratch.file("file", b"x"));
-        let host = HostAttr::of(pinned.as_fd()).expect("stattable");
-        let attr = host
-            .present(
-                1,
-                EffectiveMode::Ro,
-                &passthrough(),
-                Privileged::Recorded(PrivilegedBits::NONE),
-            )
-            .expect("visible");
-        assert_eq!(attr.mode.get() & 0o222, 0);
-        assert_eq!(attr.mode.get(), host.host_mode() & !0o222);
     }
 
     #[test]
@@ -544,10 +516,7 @@ mod tests {
             SquashIds::default(),
         )
         .expect("valid ownership");
-        assert!(
-            host.present(1, EffectiveMode::Rw, &ownership, Privileged::Masked)
-                .is_none()
-        );
+        assert!(host.present(1, &ownership, Privileged::Masked).is_none());
     }
 
     #[test]

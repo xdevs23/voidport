@@ -52,10 +52,10 @@
 //!
 //! The exception is the **ACL guard**: a write to `system.posix_acl_*` is
 //! refused whatever the rules say. A valid ACL blob written by a file's owner
-//! silently rewrites its mode bits — a permission change the namespace's
-//! presented-bits and share-mode machinery never sees — so an operator may not
-//! hand the permission model away by glob. It lives inside [`XattrRules::verdict`]
-//! and not at the call site, precisely so it cannot be forgotten by one.
+//! silently rewrites its mode bits, a permission change the namespace's
+//! share-mode machinery does not check. An operator therefore cannot skip the
+//! permission model with a glob. The check is inside [`XattrRules::verdict`],
+//! not at the call site, so no caller can forget it.
 
 use std::fmt;
 

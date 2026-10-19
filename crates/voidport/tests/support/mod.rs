@@ -443,7 +443,7 @@ fn build_tree(root: &Path) {
     let project = root.join("project");
     create_directory(&project);
     // The worked example's own modes: `foo` rwx------, `bar` rwx------ on the
-    // host and r-x------ through the read-only graft, `file.txt` rw-------.
+    // host and through the read-only graft alike, `file.txt` rw-------.
     make(&project.join("foo"), Kind::Directory, 0o700);
     make(&project.join("bar"), Kind::Directory, 0o700);
     make(&project.join("secret"), Kind::Directory, 0o700);
@@ -585,6 +585,29 @@ pub fn presented_mode(path: &Path) -> String {
     let metadata = fs::symlink_metadata(path)
         .unwrap_or_else(|error| panic!("{} should exist: {error}", path.display()));
     mode_string(metadata.permissions().mode())
+}
+
+/// Whether the mount fails a write through a path with `EROFS`.
+///
+/// The probe changes nothing that remains: a write open for a file, and a
+/// `mkdir` of a fresh name, removed again, for a directory. On a writable path
+/// the probe succeeds. On a read-only path it fails with `EROFS`, whatever bits
+/// the path presents.
+#[must_use]
+pub fn refuses_writes(path: &Path) -> bool {
+    let metadata = fs::metadata(path)
+        .unwrap_or_else(|error| panic!("{} should exist: {error}", path.display()));
+    let probe = if metadata.is_dir() {
+        let fresh = path.join("write-probe");
+        fs::create_dir(&fresh).and_then(|()| fs::remove_dir(&fresh))
+    } else {
+        fs::OpenOptions::new().write(true).open(path).map(drop)
+    };
+    match probe {
+        Ok(()) => false,
+        Err(error) if errno(&error) == rustix::io::Errno::ROFS.raw_os_error() => true,
+        Err(error) => panic!("{} failed the write probe with {error}", path.display()),
+    }
 }
 
 /// Waits until a condition holds, or gives up.

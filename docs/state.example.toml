@@ -156,8 +156,8 @@ max_listing_entries = 1048576  # entries in one materialized listing (EOVERFLOW)
 name = "project"
 
 # How host permission bits are presented. v1: `passthrough` — host bits as-is,
-# except that a read-only graft strips the write bits from the *presented*
-# mode. Presentation is UX only; enforcement is always server-side.
+# on a read-only graft as on a read-write one. Presentation is UX only;
+# enforcement is always server-side.
 permission = "passthrough"
 
 # Where this namespace's backing I/O sits with respect to the host page cache.
@@ -280,7 +280,7 @@ mode = "hidden"
 path = "/project/foo"
 mode = "rw"
 
-# Read-only: writes fail server-side and the presented bits lose `w`.
+# Read-only: writes fail server-side. The presented bits are the mode bits of the host entry.
 [[namespaces.rules]]
 path = "/project/bar"
 mode = "ro"
@@ -322,7 +322,7 @@ match = "family-*"
 # an allow rule buys visibility, not privilege. And a write to
 # `system.posix_acl_access` or `system.posix_acl_default` is ALWAYS refused: a
 # valid ACL blob silently rewrites the file's permission bits, which is a change
-# the share modes and presented bits would never see.
+# the share-mode checks do not cover.
 #
 #   match   a glob over attribute names — `*` covers any run of bytes including
 #           none, every other byte is literal, `/` included, and a bare `*` is

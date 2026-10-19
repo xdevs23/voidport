@@ -81,7 +81,7 @@ pub use ownership::{
 };
 pub use path::{MAX_RULE_PATH_LEN, NamespacePath, PathError, PatternKey, RulePath};
 pub use pattern::{Pattern, PatternError};
-pub use permissions::{SYNTHESIZED_DIR_PERMISSIONS, WRITE_BITS, presented_mode};
+pub use permissions::SYNTHESIZED_DIR_PERMISSIONS;
 pub use resolve::{DirContext, DirEntry, DirState, Resolution};
 pub use table::{HostBacking, HostTarget, LiteralRule, RuleSpec, RuleTable, TableError};
 pub use xattr::{

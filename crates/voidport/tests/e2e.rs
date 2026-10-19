@@ -3,8 +3,8 @@
 //! Every test here goes through the whole product — `voidport-proto` framing on
 //! a real socket, a real `voidportd`, the kernel's own FUSE layer, and ordinary
 //! `std::fs` and `rustix` calls made against the mountpoint. Nothing about the
-//! guest side is simulated: if a test says `ls` shows `r-x------`, that is what
-//! `stat(2)` returned.
+//! guest side is simulated: if a test asserts that `ls` shows `rw-r--r--`, that
+//! is what `stat(2)` returned.
 //!
 //! Design criteria 2–12 for increment 6 live in this file; the node-accounting
 //! criterion is in `accounting.rs` (it needs a server with a deliberately low
@@ -19,6 +19,7 @@ use std::fs;
 use std::io::{IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::mem::MaybeUninit;
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
+use std::os::unix::process::CommandExt as _;
 use std::path::Path;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -27,6 +28,7 @@ use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{FlockOperation, RawDir, XattrFlags};
 use support::{
     Fixture, MAPPED_GUEST_ID, MAPPED_HOST_ID, NOBODY_ID, errno, eventually, presented_mode,
+    refuses_writes,
 };
 use voidport::mount::MountOptions;
 
@@ -45,11 +47,14 @@ fn the_worked_example_is_what_the_guest_sees() {
     let fixture = Fixture::start("worked-example");
     let guest = fixture.mount("worked", "project", "/project");
 
-    // The design's own table: foo read-write, bar read-only with the write
-    // bits stripped, file.txt read-write.
+    // The design's own table: foo read-write, bar read-only, file.txt
+    // read-write, each showing the bits it has on the host.
     assert_eq!(presented_mode(&guest.path("foo")), "rwx------");
-    assert_eq!(presented_mode(&guest.path("bar")), "r-x------");
+    assert_eq!(presented_mode(&guest.path("bar")), "rwx------");
     assert_eq!(presented_mode(&guest.path("file.txt")), "rw-------");
+    assert!(!refuses_writes(&guest.path("foo")));
+    assert!(refuses_writes(&guest.path("bar")));
+    assert!(!refuses_writes(&guest.path("file.txt")));
 
     // `secret/` does not exist as far as the guest can tell.
     let hidden = fs::metadata(guest.path("secret")).expect_err("secret is hidden");
@@ -90,7 +95,7 @@ fn a_unix_socket_mount_serves_the_same_namespace() {
         fs::read(guest.path("file.txt")).expect("readable"),
         b"worked example"
     );
-    assert_eq!(presented_mode(&guest.path("bar")), "r-x------");
+    assert!(refuses_writes(&guest.path("bar")));
     let sessions = fixture.sessions();
     assert_eq!(sessions.len(), 1, "{sessions:?}");
     assert_eq!(sessions[0].transport, "unix");
@@ -264,6 +269,104 @@ fn every_write_class_operation_in_a_read_only_graft_fails() {
     // Nothing of the above reached the host.
     assert!(fixture.host("tree/new-file").symlink_metadata().is_err());
     assert!(fixture.host("tree/data.bin").exists());
+}
+
+#[test]
+fn a_file_in_a_read_only_graft_shows_its_host_mode_and_copies_out_writable() {
+    if !support::preflight() {
+        return;
+    }
+    let fixture = Fixture::start("read-only-mode");
+    // The caller below is not root, so only the owner bits of these entries
+    // can admit it: the host entries belong to it.
+    fs::set_permissions(
+        fixture.host("tree/data.bin"),
+        fs::Permissions::from_mode(0o644),
+    )
+    .expect("a settable mode");
+    for relative in ["tree", "tree/data.bin"] {
+        rustix::fs::chown(
+            fixture.host(relative),
+            Some(rustix::process::Uid::from_raw(NOBODY_ID)),
+            None,
+        )
+        .expect("the suite runs privileged enough to chown");
+    }
+    // `allow_other` is what lets another user's request reach the mount at
+    // all; without it FUSE's owner check would decide, not the mode bits.
+    let guest = fixture.mount_with(
+        "modes",
+        &fixture.tcp_url("plain", ""),
+        &MountOptions {
+            allow_other: true,
+            ..MountOptions::default()
+        },
+    );
+
+    // The read-only graft shows the mode the host file has.
+    let original = guest.path("readonly/data.bin");
+    assert_eq!(presented_mode(&original), "rw-r--r--");
+
+    // `cp` sets the copy to the mode the original showed, so the copy in the
+    // read-write graft can be appended to by its owner. The child drops to that
+    // owner itself, because a shell resets an effective uid that differs from
+    // the real one. The umask is fixed in the child, so the copy's mode does not
+    // depend on the one the test runs under. Its output goes to pipes, because
+    // the descriptors it would inherit may sit on a mount that fails the close
+    // of a caller other than the mount's owner.
+    let copy = guest.path("tree/copy.bin");
+    let copied = std::process::Command::new("sh")
+        .args(["-c", "umask 022 && cp \"$1\" \"$2\"", "sh"])
+        .arg(&original)
+        .arg(&copy)
+        .uid(NOBODY_ID)
+        .output()
+        .expect("cp runs");
+    assert!(
+        copied.status.success(),
+        "cp copies out of the read-only graft: {}",
+        String::from_utf8_lossy(&copied.stderr)
+    );
+    assert_eq!(presented_mode(&copy), "rw-r--r--");
+
+    let (appended, original_opened) = std::thread::spawn({
+        let (original, copy) = (original.clone(), copy.clone());
+        move || {
+            // Per-thread credentials: only this thread drops privilege, so the
+            // opens below are made by the file's owner, who is not root.
+            rustix::thread::set_thread_res_uid(
+                None,
+                Some(rustix::process::Uid::from_raw(NOBODY_ID)),
+                None,
+            )
+            .expect("a thread may drop privilege");
+            let appended = fs::OpenOptions::new()
+                .append(true)
+                .open(&copy)
+                .and_then(|mut file| file.write_all(b"-more"));
+            // The write bits the original shows do not make it writable: the
+            // server fails the write open with EROFS.
+            let original_opened = fs::OpenOptions::new().append(true).open(&original);
+            (
+                appended.map_err(|error| errno(&error)),
+                original_opened.map(drop).map_err(|error| errno(&error)),
+            )
+        }
+    })
+    .join()
+    .expect("the unprivileged thread finishes");
+
+    appended.expect("the copy is appendable by its owner");
+    assert_eq!(fs::read(&copy).expect("readable"), b"0123456789-more");
+    assert_eq!(
+        original_opened.expect_err("a write open must fail with EROFS"),
+        libc_errno::ROFS
+    );
+    assert_eq!(
+        fs::read(fixture.host("tree/data.bin")).expect("the host has it"),
+        b"0123456789",
+        "no write changed the host file"
+    );
 }
 
 #[test]

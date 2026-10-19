@@ -15,7 +15,7 @@
 //!   out of the graft can therefore never be followed out — the hard security
 //!   invariant of the design.
 //! * [`attr`] turns host metadata into the wire's presented attributes, through
-//!   the namespace's ownership algebra and presented-bits function.
+//!   the namespace's ownership algebra and the privileged-bits merge.
 //! * [`direct`] is what an *uncached* backing description demands of the
 //!   server's own buffers, and the aligned bounce that meets it.
 //! * [`xattr`] is the `user.*` passthrough; [`lock`] is byte-range OFD locking.
