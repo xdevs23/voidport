@@ -33,7 +33,7 @@ use std::os::fd::{AsRawFd as _, BorrowedFd, OwnedFd, RawFd};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, ExitStatus, Output};
 
-use self::launcher::{Launcher, Request, Source};
+use self::launcher::{Grouping, Launcher, Request, Source};
 
 const STREAMS: [RawFd; 3] = [0, 1, 2];
 
@@ -46,7 +46,7 @@ pub struct Program<'fd> {
     working_directory: Option<PathBuf>,
     clear_environment: bool,
     environment: Vec<(OsString, Option<OsString>)>,
-    new_process_group: bool,
+    grouping: Grouping,
     streams: [Stream<'fd>; 3],
     descriptors: BTreeMap<RawFd, BorrowedFd<'fd>>,
 }
@@ -89,7 +89,7 @@ impl<'fd> Program<'fd> {
             working_directory: None,
             clear_environment: false,
             environment: Vec::new(),
-            new_process_group: false,
+            grouping: Grouping::Inherited,
             streams: [Stream::Null; 3],
             descriptors: BTreeMap::new(),
         }
@@ -133,7 +133,15 @@ impl<'fd> Program<'fd> {
     }
 
     pub fn in_new_process_group(&mut self) -> &mut Self {
-        self.new_process_group = true;
+        self.grouping = Grouping::NewProcessGroup;
+        self
+    }
+
+    /// Starts the child as the leader of a new session whose controlling
+    /// terminal is the standard input of the child. The start fails with
+    /// [`SpawnError::Program`] when the standard input is not a terminal.
+    pub fn in_new_session_on_terminal(&mut self) -> &mut Self {
+        self.grouping = Grouping::NewSessionOnTerminal;
         self
     }
 
@@ -181,7 +189,7 @@ impl<'fd> Program<'fd> {
             working_directory: self.working_directory.clone(),
             clear_environment: self.clear_environment,
             environment: self.environment.clone(),
-            new_process_group: self.new_process_group,
+            grouping: self.grouping,
             streams: [stdin.0, stdout.0, stderr.0],
             descriptors: self
                 .descriptors
