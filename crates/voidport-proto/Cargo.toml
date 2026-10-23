@@ -4,6 +4,7 @@ description = "voidport wire protocol: opcodes, frame layout, and fixed-layout m
 version.workspace = true
 edition.workspace = true
 license = "MIT"
+autotests = false
 
 [features]
 # The kernel module leaves this off and supplies the bounds from its own
@@ -16,6 +17,10 @@ zerocopy = { workspace = true }
 
 [dev-dependencies]
 linux-raw-sys = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
 
 [lints]
 workspace = true

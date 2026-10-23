@@ -4,8 +4,6 @@
 //! randomized generators. The seed is unchanged, so a larger `n` extends the
 //! same stream. The truncation sweep is exhaustive and ignores the variable.
 
-#![forbid(unsafe_code)]
-
 use core::fmt;
 
 use voidport_proto::PROTOCOL_VERSION;

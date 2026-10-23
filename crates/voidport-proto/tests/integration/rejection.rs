@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use voidport_proto::PROTOCOL_VERSION;
 use voidport_proto::attr::EntryOut;
 use voidport_proto::error::FramingError;
