@@ -108,7 +108,7 @@ impl RelayState {
     /// client waiting for the answer the trap ate, with no `FIN` either way.
     fn serve(self: Arc<Self>, client: TcpStream) {
         let Ok(server) = UnixStream::connect(&self.server) else {
-            let _ = client.shutdown(Shutdown::Both);
+            let _peer_may_be_gone = client.shutdown(Shutdown::Both);
             return;
         };
         let (Ok(client_out), Ok(server_out)) = (client.try_clone(), server.try_clone()) else {
@@ -122,21 +122,21 @@ impl RelayState {
             let state = Arc::clone(&self);
             let ends = (client.try_clone(), server.try_clone());
             thread::spawn(move || {
-                let _ = pump(client, server, |frame| {
+                pump(client, server, |frame| {
                     state.record(frame);
                     Verdict::Forward
                 });
                 if let (Ok(client), Ok(server)) = ends {
-                    let _ = client.shutdown(Shutdown::Both);
-                    let _ = server.shutdown(Shutdown::Both);
+                    let _client_side_may_be_shut_already = client.shutdown(Shutdown::Both);
+                    let _server_side_may_be_shut_already = server.shutdown(Shutdown::Both);
                 }
             })
         };
 
-        let _ = pump(server_out, client_out, |frame| self.judge(frame));
-        let _ = client_end.shutdown(Shutdown::Both);
-        let _ = server_end.shutdown(Shutdown::Both);
-        let _ = upstream.join();
+        pump(server_out, client_out, |frame| self.judge(frame));
+        let _client_side_may_be_shut_already = client_end.shutdown(Shutdown::Both);
+        let _server_side_may_be_shut_already = server_end.shutdown(Shutdown::Both);
+        let _panic_was_printed = upstream.join();
     }
 
     fn record(&self, frame: &[u8]) {
@@ -165,7 +165,7 @@ impl RelayState {
             return Verdict::Forward;
         }
         let armed = trap.take().expect("just matched");
-        let _ = armed.sprung.send(());
+        let _unwatched_trap = armed.sprung.send(());
         Verdict::Discard
     }
 }
@@ -182,18 +182,15 @@ fn header_of(frame: &[u8]) -> Option<&FrameHeader> {
         .map(|(header, _)| header)
 }
 
-fn pump(
-    mut from: impl io::Read,
-    mut to: impl io::Write,
-    verdict: impl Fn(&[u8]) -> Verdict,
-) -> io::Result<()> {
-    loop {
-        let Ok(frame) = support::read_message(&mut from) else {
-            return Ok(());
+/// Returns once either side ends or a frame is discarded.
+fn pump(mut from: impl io::Read, mut to: impl io::Write, verdict: impl Fn(&[u8]) -> Verdict) {
+    while let Ok(frame) = support::read_message(&mut from) {
+        let forwarded = match verdict(&frame) {
+            Verdict::Forward => to.write_all(&frame).is_ok(),
+            Verdict::Discard => false,
         };
-        match verdict(&frame) {
-            Verdict::Forward => to.write_all(&frame)?,
-            Verdict::Discard => return Ok(()),
+        if !forwarded {
+            return;
         }
     }
 }

@@ -117,7 +117,7 @@ impl Relay {
         thread::spawn(move || {
             while let Ok((client, _)) = listener.accept() {
                 if !accepting.accepting.load(Ordering::SeqCst) {
-                    let _ = client.shutdown(Shutdown::Both);
+                    let _peer_may_be_gone = client.shutdown(Shutdown::Both);
                     accepting.refused.fetch_add(1, Ordering::SeqCst);
                     continue;
                 }
@@ -260,10 +260,10 @@ impl Relay {
 impl State {
     /// Whichever direction ends first ends the other.
     fn serve(self: Arc<Self>, number: usize, client: TcpStream) {
-        let _ = client.set_nodelay(true);
+        let _batching_only_slows_it = client.set_nodelay(true);
         let path = self.server.lock().expect("unpoisoned").clone();
         let Ok(server) = UnixStream::connect(&path) else {
-            let _ = client.shutdown(Shutdown::Both);
+            let _peer_may_be_gone = client.shutdown(Shutdown::Both);
             return;
         };
         let ends = Ends {
@@ -281,14 +281,10 @@ impl State {
                 client.try_clone().expect("a client handle"),
                 server.try_clone().expect("a server handle"),
             );
-            thread::spawn(move || {
-                let _ = state.requests(number, from, to);
-                ends.end();
-            })
+            thread::spawn(move || ends.end_after(&state.requests(number, from, to)))
         };
-        let _ = self.replies(number, server, client);
-        ends.end();
-        let _ = upstream.join();
+        ends.end_after(&self.replies(number, server, client));
+        let _panic_was_printed = upstream.join();
     }
 
     fn take(&self, opcode: u16, reply: bool) -> Option<(Cut, mpsc::Sender<usize>)> {
@@ -342,7 +338,7 @@ impl State {
                     copy(&mut from, &mut to, data)
                 })?,
                 Some((Cut::HoldRequest(latch), sprung)) => {
-                    let _ = sprung.send(number);
+                    let _unwatched_trap = sprung.send(number);
                     latch.wait();
                     self.carry(number, opcode, || {
                         to.write_all(&message)?;
@@ -370,7 +366,7 @@ impl State {
                         }
                     }
                     to.flush()?;
-                    let _ = sprung.send(number);
+                    let _unwatched_trap = sprung.send(number);
                     if let Cut::AfterRequestUntil(latch) = &cut {
                         latch.wait();
                     }
@@ -399,7 +395,7 @@ impl State {
                     }
                 }
                 Some((Cut::HoldReply(latch), sprung)) => {
-                    let _ = sprung.send(number);
+                    let _unwatched_trap = sprung.send(number);
                     latch.wait();
                     to.write_all(&message)?;
                     for piece in &pieces {
@@ -414,7 +410,7 @@ impl State {
                         }
                     }
                     to.flush()?;
-                    let _ = sprung.send(number);
+                    let _unwatched_trap = sprung.send(number);
                     return Ok(());
                 }
             }
@@ -439,8 +435,25 @@ impl Clone for Ends {
 
 impl Ends {
     fn end(&self) {
-        let _ = self.client.shutdown(Shutdown::Both);
-        let _ = self.server.shutdown(Shutdown::Both);
+        let _client_side_may_be_shut_already = self.client.shutdown(Shutdown::Both);
+        let _server_side_may_be_shut_already = self.server.shutdown(Shutdown::Both);
+    }
+
+    /// Ends both sides once one direction stopped. An error other than the end
+    /// of a side is printed, since the relay itself broke the connection then.
+    fn end_after(&self, passed: &io::Result<()>) {
+        if let Err(error) = passed
+            && !matches!(
+                error.kind(),
+                io::ErrorKind::UnexpectedEof
+                    | io::ErrorKind::ConnectionReset
+                    | io::ErrorKind::BrokenPipe
+                    | io::ErrorKind::NotConnected
+            )
+        {
+            eprintln!("the relay ended a connection: {error}");
+        }
+        self.end();
     }
 }
 

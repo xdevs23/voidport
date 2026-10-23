@@ -150,7 +150,12 @@ impl TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        let _ = fs::remove_dir_all(&self.path);
+        if let Err(error) = fs::remove_dir_all(&self.path) {
+            eprintln!(
+                "the temporary directory {} is not removed: {error}",
+                self.path.display()
+            );
+        }
     }
 }
 
