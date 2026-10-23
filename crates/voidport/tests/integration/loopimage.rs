@@ -8,8 +8,6 @@
 //! is mounted, and ends it between reading the guest copy and reading the host
 //! copy.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::fs;
@@ -28,7 +26,7 @@ const FILES: usize = 48;
 
 const FILE_BYTES: usize = 64 * 1024;
 
-const TEST: &str = "a_btrfs_image_on_the_mount_formats_mounts_and_checks_clean";
+const TEST: &str = "loopimage::a_btrfs_image_on_the_mount_formats_mounts_and_checks_clean";
 
 const IMAGE_DEVICE: &str = "VOIDPORT_TEST_IMAGE_DEVICE";
 

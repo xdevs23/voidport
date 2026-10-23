@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::fs;
@@ -824,7 +822,7 @@ fn a_killed_client_with_a_file_open_on_its_own_mount_exits_and_leaves_no_page_be
     let ground = Ground::start("own-file");
     let mountpoint = ground.directory.directory("mnt-own-file");
     let mut client = run_client_of_its_own_mount(
-        "a_killed_client_with_a_file_open_on_its_own_mount_exits_and_leaves_no_page_behind",
+        "teardown::a_killed_client_with_a_file_open_on_its_own_mount_exits_and_leaves_no_page_behind",
         &ground.server.url("work", ""),
         &mountpoint,
         ClientNamespace::OfTheTest,
@@ -865,7 +863,7 @@ fn a_killed_client_waiting_for_a_request_it_read_exits_and_leaves_no_page_behind
     let truncating = relay.arm(Opcode::Setattr, Cut::HoldRequest(Latch::default()));
     let mountpoint = ground.directory.directory("mnt-own-request");
     let client = run_client_of_its_own_mount(
-        "a_killed_client_waiting_for_a_request_it_read_exits_and_leaves_no_page_behind",
+        "teardown::a_killed_client_waiting_for_a_request_it_read_exits_and_leaves_no_page_behind",
         &relay.url("work", ""),
         &mountpoint,
         ClientNamespace::OfTheTest,
@@ -909,7 +907,7 @@ fn a_mount_dropped_without_fusectl_while_a_thread_waits_on_it_ends_and_its_proce
     let truncating = relay.arm(Opcode::Setattr, Cut::HoldRequest(Latch::default()));
     let mountpoint = ground.directory.directory("mnt-dropped-unaborted");
     let mut client = run_client_of_its_own_mount(
-        "a_mount_dropped_without_fusectl_while_a_thread_waits_on_it_ends_and_its_process_exits",
+        "teardown::a_mount_dropped_without_fusectl_while_a_thread_waits_on_it_ends_and_its_process_exits",
         &relay.url("work", ""),
         &mountpoint,
         ClientNamespace::Copy,
@@ -979,7 +977,7 @@ fn a_killed_test_process_leaves_no_server_and_no_mount_behind() {
         Program::new(std::env::current_exe().expect("the test binary"))
             .args([
                 "--exact",
-                "a_killed_test_process_leaves_no_server_and_no_mount_behind",
+                "teardown::a_killed_test_process_leaves_no_server_and_no_mount_behind",
                 "--nocapture",
             ])
             .env(KILLED_TEST, "1")

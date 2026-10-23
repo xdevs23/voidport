@@ -4,8 +4,6 @@
 //! shutdown. Nothing here builds a state file or a URL, so a wrong printed line
 //! fails the mount.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::fs;

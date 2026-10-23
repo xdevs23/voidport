@@ -7,8 +7,6 @@
 //! There is no VM here: the loopback cid is this machine talking to itself over
 //! the same transport a guest would use.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::fs;

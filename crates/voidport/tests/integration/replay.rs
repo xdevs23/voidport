@@ -4,8 +4,6 @@
 //! and kills the server, so whether a mutation was applied twice is a count of
 //! the request frames the relay carried.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::io;

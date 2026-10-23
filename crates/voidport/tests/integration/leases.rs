@@ -3,8 +3,6 @@
 //! filesystem must grant this process a lease, which is asked first on a file
 //! of its own: a test of the lease fails without one.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::fs::{self, File, OpenOptions};
@@ -160,7 +158,7 @@ impl Mapper {
         let mut process = Program::new(std::env::current_exe().expect("the test binary"))
             .args([
                 "--exact",
-                "a_mapping_in_its_own_process",
+                "leases::a_mapping_in_its_own_process",
                 "--test-threads=1",
                 "--nocapture",
             ])
