@@ -4,11 +4,12 @@ use voidport_test_server as support;
 
 use std::fs;
 use std::io::Read;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 
 use rustix::process::{Pid, Signal};
 use support::{ControlClient, TempDir};
 use voidport_control::{NamespaceName, NamespaceSpec, Reply, Request};
+use voidport_spawn::{Program, Stream};
 use voidport_test_support::{ReadinessSocket, Startup};
 
 fn ready(child: &Child, readiness: &ReadinessSocket) -> bool {
@@ -37,13 +38,13 @@ fn spawn(
     socket: &std::path::Path,
     readiness: &ReadinessSocket,
 ) -> Child {
-    Command::new(env!("CARGO_BIN_EXE_voidportd"))
+    Program::new(env!("CARGO_BIN_EXE_voidportd"))
         .arg("--state")
         .arg(state_file)
         .arg("--control-socket")
         .arg(socket)
         .env("NOTIFY_SOCKET", readiness.path())
-        .stderr(Stdio::piped())
+        .stderr(Stream::Piped)
         .spawn()
         .expect("the daemon binary runs")
 }
@@ -115,13 +116,13 @@ fn a_daemon_that_cannot_report_readiness_exits_with_an_error_and_unlinks_its_soc
     let state_file = directory.write("state.toml", &state(&directory));
     let socket = directory.join("control.sock");
 
-    let mut child = Command::new(env!("CARGO_BIN_EXE_voidportd"))
+    let mut child = Program::new(env!("CARGO_BIN_EXE_voidportd"))
         .arg("--state")
         .arg(&state_file)
         .arg("--control-socket")
         .arg(&socket)
         .env("NOTIFY_SOCKET", directory.join("nobody.notify"))
-        .stderr(Stdio::piped())
+        .stderr(Stream::Piped)
         .spawn()
         .expect("the daemon binary runs");
     let status = child.wait().expect("the daemon exits");
@@ -149,12 +150,12 @@ fn a_control_socket_from_the_state_file_uses_its_configured_spelling() {
 
     // The control socket is not a host target, so the process interprets its
     // relative spelling where the daemon was started.
-    let mut child = Command::new(env!("CARGO_BIN_EXE_voidportd"))
+    let mut child = Program::new(env!("CARGO_BIN_EXE_voidportd"))
         .arg("--state")
         .arg(&state_file)
         .current_dir(elsewhere.path())
         .env("NOTIFY_SOCKET", readiness.path())
-        .stderr(Stdio::piped())
+        .stderr(Stream::Piped)
         .spawn()
         .expect("the daemon binary runs");
 
@@ -255,7 +256,7 @@ fn an_invalid_state_file_refuses_startup_and_says_why() {
     );
     let socket = directory.join("control.sock");
 
-    let output = Command::new(env!("CARGO_BIN_EXE_voidportd"))
+    let output = Program::new(env!("CARGO_BIN_EXE_voidportd"))
         .arg("--state")
         .arg(&state_file)
         .arg("--control-socket")

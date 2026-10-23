@@ -3139,6 +3139,7 @@ dependencies = [
  "voidport-proto",
  "voidport-pty",
  "voidport-session",
+ "voidport-spawn",
  "voidport-test-host",
  "voidport-test-server",
  "voidport-test-support",
