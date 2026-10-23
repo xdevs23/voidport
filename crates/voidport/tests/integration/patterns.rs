@@ -8,6 +8,7 @@ use std::path::Path;
 use rustix::io::Errno;
 use support::{Fixture, errno, presented_mode};
 use voidport_control::{NamespaceName, NamespaceSpec, Reply, Request, Response, Rule, ShareMode};
+use voidport_test_support::create_directory;
 
 fn namespace(fixture: &Fixture) -> NamespaceSpec {
     NamespaceSpec {
@@ -75,7 +76,7 @@ fn start(label: &str) -> Fixture {
 }
 
 fn make(path: &Path) {
-    fs::create_dir_all(path).expect("the host is writable");
+    create_directory(path);
     fs::set_permissions(path, fs::Permissions::from_mode(0o700)).expect("a settable mode");
 }
 

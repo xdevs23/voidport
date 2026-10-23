@@ -4,6 +4,7 @@ use std::fs;
 use std::path::Path;
 
 use support::{Fixture, preflight};
+use voidport_test_support::create_directory;
 
 const BUDGET: usize = 64;
 
@@ -54,7 +55,7 @@ fn a_source_tree_walk_far_past_the_budget_never_exhausts_the_server() {
 }
 
 fn build_tree(root: &Path, depth: u32) -> usize {
-    fs::create_dir_all(root).expect("a creatable directory");
+    create_directory(root);
     let mut entries = 0;
     for index in 0..FILES_PER_DIR {
         fs::write(root.join(format!("file-{index}")), b"x").expect("a writable file");
