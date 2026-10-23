@@ -45,6 +45,7 @@ zerocopy = { workspace = true }
 [dev-dependencies]
 ed25519-dalek = { workspace = true, features = ["pem"] }
 voidport-pty = { workspace = true }
+voidport-spawn = { workspace = true }
 voidport-test-host = { workspace = true }
 voidport-test-support = { workspace = true }
 voidport-test-server = { workspace = true }

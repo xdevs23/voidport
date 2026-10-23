@@ -4,7 +4,6 @@ use voidport_test_server as support;
 
 use std::fs;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use rustix::fs::OFlags;
 use support::Dial as _;
@@ -13,6 +12,7 @@ use support::fixture::Fixture;
 use support::wire::{ROOT, WireClient, status};
 use voidport_control::{NamespaceName, NamespaceSpec, Reply, Request, Rule, ShareMode};
 use voidport_proto::ops::dir::rename_flags::EXCHANGE as RENAME_EXCHANGE;
+use voidport_spawn::{Program, Stream};
 use voidport_test_support::create_directory;
 
 const BUDGET: usize = 32;
@@ -744,7 +744,10 @@ impl Drop for Ext4Image {
         if !self.mounted {
             return;
         }
-        let status = Command::new("umount").arg(&self.mountpoint).status();
+        let status = Program::new("umount")
+            .arg(&self.mountpoint)
+            .stderr(Stream::Inherit)
+            .status();
         match status {
             Ok(status) if status.success() => {}
             other => eprintln!(
@@ -758,7 +761,7 @@ impl Drop for Ext4Image {
 }
 
 fn run(program: &str, arguments: &[&str]) {
-    let output = Command::new(program)
+    let output = Program::new(program)
         .args(arguments)
         .output()
         .unwrap_or_else(|error| {

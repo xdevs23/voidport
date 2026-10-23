@@ -7,7 +7,8 @@ use voidport_test_server as support;
 use std::fs::{self, File};
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::process::{Child, Command, Stdio};
+use std::os::fd::AsFd as _;
+use std::process::Child;
 use std::thread::JoinHandle;
 
 use frontend::{
@@ -21,6 +22,7 @@ use voidport_proto::frame::Frame;
 use voidport_proto::limits::LIMITS;
 use voidport_proto::ops::file::SetlkResponse;
 use voidport_proto::ops::node::GetattrRequest;
+use voidport_spawn::{Program, Stream};
 use voidport_test_support::{ReadinessSocket, Startup, until};
 use zerocopy::byteorder::little_endian::{U32, U64};
 
@@ -58,14 +60,13 @@ impl Fixture {
             .append(true)
             .open(self.directory.join("voidportd.log"))
             .expect("a log file");
-        let voidportd = Command::new(env!("CARGO_BIN_EXE_voidportd"))
+        let voidportd = Program::new(env!("CARGO_BIN_EXE_voidportd"))
             .arg("--state")
             .arg(self.directory.join("state.toml"))
             .arg("--control-socket")
             .arg(self.directory.join("control.sock"))
             .env("NOTIFY_SOCKET", self.readiness.path())
-            .stdout(Stdio::null())
-            .stderr(log)
+            .stderr(Stream::Descriptor(log.as_fd()))
             .spawn()
             .expect("the daemon binary runs");
         assert_eq!(
