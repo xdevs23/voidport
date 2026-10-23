@@ -154,7 +154,12 @@ impl Mapper {
 impl Drop for Mapper {
     fn drop(&mut self) {
         drop(self.process.stdin.take());
-        let _ = self.process.wait();
+        let reaped = self.process.wait();
+        // A panic while the test unwinds from a failed assertion would abort
+        // the run before that assertion is reported.
+        if !thread::panicking() {
+            reaped.expect("the mapping process is reaped");
+        }
     }
 }
 
