@@ -29,12 +29,19 @@ pub(crate) struct Request {
     pub(crate) working_directory: Option<PathBuf>,
     pub(crate) clear_environment: bool,
     pub(crate) environment: Vec<(OsString, Option<OsString>)>,
-    pub(crate) new_process_group: bool,
+    pub(crate) grouping: Grouping,
     /// The standard input, output and error, in this order.
     pub(crate) streams: [Source; 3],
     /// Each descriptor above the standard streams, as its number in the
     /// child and its number in the table of the thread that asks.
     pub(crate) descriptors: Vec<(RawFd, RawFd)>,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum Grouping {
+    Inherited,
+    NewProcessGroup,
+    NewSessionOnTerminal,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -171,8 +178,22 @@ fn start(request: &Request, asker: Pid) -> Result<Child, SpawnError> {
     if let Some(directory) = &request.working_directory {
         let _command = command.current_dir(directory);
     }
-    if request.new_process_group {
-        let _command = command.process_group(0);
+    match request.grouping {
+        Grouping::Inherited => {}
+        Grouping::NewProcessGroup => {
+            let _command = command.process_group(0);
+        }
+        Grouping::NewSessionOnTerminal => {
+            // SAFETY: Unavoidable: std makes a child the leader of a new
+            // session only through `pre_exec`, since its `setsid` is
+            // unstable. `pre_exec` requires a hook that is async-signal-safe,
+            // since it runs in the forked child after the standard streams are
+            // in place. The hook makes the two system calls directly through
+            // the rustix functions for them, which allocate nothing and take
+            // no lock, and an `Errno` becomes an `io::Error` without an
+            // allocation.
+            let _command = unsafe { command.pre_exec(lead_session_on_terminal) };
+        }
     }
     let copies = request
         .descriptors
@@ -188,6 +209,12 @@ fn start(request: &Request, asker: Pid) -> Result<Child, SpawnError> {
     let child = command.spawn().map_err(SpawnError::Program);
     drop(placed);
     child
+}
+
+fn lead_session_on_terminal() -> io::Result<()> {
+    let _session = rustix::process::setsid()?;
+    rustix::process::ioctl_tiocsctty(rustix::stdio::stdin())?;
+    Ok(())
 }
 
 /// A copy at `number` without close-on-exec, for a child. The table of the

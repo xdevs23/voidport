@@ -12,5 +12,8 @@ libc = { workspace = true }
 rustix = { workspace = true }
 thiserror = { workspace = true }
 
+[dev-dependencies]
+rustix = { workspace = true, features = ["pty"] }
+
 [lints]
 workspace = true

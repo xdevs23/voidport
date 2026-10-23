@@ -1,7 +1,9 @@
 use std::fs;
-use std::io::{BufRead as _, BufReader};
+use std::io::{BufRead as _, BufReader, Read as _};
 use std::os::fd::AsFd as _;
 use std::path::PathBuf;
+
+use rustix::pty::OpenptFlags;
 
 use super::*;
 
@@ -133,4 +135,44 @@ fn a_child_runs_in_the_working_directory_given() {
     let working = fs::read_link(format!("/proc/{}/cwd", child.id())).expect("the directory");
     assert_eq!(working, directory);
     finish(child);
+}
+
+#[test]
+fn a_child_in_a_new_session_has_its_input_as_the_controlling_terminal() {
+    let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+    let terminal = rustix::pty::openpt(flags).expect("a pseudoterminal");
+    rustix::pty::unlockpt(&terminal).expect("the pseudoterminal is unlocked");
+    let input = rustix::pty::ioctl_tiocgptpeer(&terminal, flags).expect("its other end");
+
+    // `/dev/tty` opens only the terminal that controls the calling process.
+    let mut child = Program::new("sh")
+        .args(["-c", "echo controlled > /dev/tty"])
+        .stdin(Stream::Descriptor(input.as_fd()))
+        .in_new_session_on_terminal()
+        .spawn()
+        .expect("sh starts");
+    drop(input);
+    assert!(child.wait().expect("the child ends").success());
+
+    // Once no process has the other end open, a read fails instead of
+    // returning an end of file.
+    let mut shown = Vec::new();
+    let _error = fs::File::from(terminal).read_to_end(&mut shown);
+    assert!(
+        String::from_utf8_lossy(&shown).contains("controlled"),
+        "{shown:?}"
+    );
+}
+
+#[test]
+fn a_child_in_a_new_session_does_not_start_on_an_input_that_is_not_a_terminal() {
+    let refused = Program::new("sh")
+        .args(["-c", "echo started"])
+        .stdin(Stream::Null)
+        .in_new_session_on_terminal()
+        .output();
+    assert!(
+        matches!(refused, Err(SpawnError::Program(_))),
+        "{refused:?}"
+    );
 }
