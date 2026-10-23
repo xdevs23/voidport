@@ -382,6 +382,30 @@ impl Drop for Waiter {
 }
 
 #[derive(Debug)]
+pub(crate) struct Pending<D> {
+    ticket: Ticket,
+    sent: Sent,
+    woken: oneshot::Receiver<(D, Delivery)>,
+}
+
+impl<D> Pending<D> {
+    pub(crate) async fn answer(self) -> (D, Result<Answer, Decision>) {
+        let (destination, delivery) = self
+            .woken
+            .await
+            .expect("every waiter wakes its request before it goes");
+        let outcome = match (self.sent, delivery) {
+            (Sent::Written, Delivery::Answered(answer)) => Ok(answer),
+            // The write failed and `Connection::bury` woke the waiter, or the
+            // waiter was never armed and its drop woke it, or the connection died
+            // under a request written whole.
+            (_, Delivery::Answered(_) | Delivery::Buried) => Err(self.ticket.decide(self.sent)),
+        };
+        (destination, outcome)
+    }
+}
+
+#[derive(Debug)]
 pub enum Notice {
     Message(Vec<u8>),
     Entry(Vec<u8>),
@@ -679,27 +703,36 @@ impl Connection {
 
     pub async fn call<D: Destination>(
         &self,
-        mut ticket: Ticket,
+        ticket: Ticket,
         frame: &[u8],
         data: &[u8],
         destination: D,
     ) -> (D, Result<Answer, Decision>) {
+        self.send_request(ticket, frame, data, destination)
+            .await
+            .answer()
+            .await
+    }
+
+    /// Once this returns, the connection has the request, with `frame` and
+    /// `data`, so its answer can be awaited by a task that outlives both.
+    pub(crate) async fn send_request<D: Destination>(
+        &self,
+        mut ticket: Ticket,
+        frame: &[u8],
+        data: &[u8],
+        destination: D,
+    ) -> Pending<D> {
         let (wake, woken) = oneshot::channel();
         let waiter = Waiter::new(wake, destination);
         let sent = self
             .transmit(frame, data, Some((&mut ticket, waiter)))
             .await;
-        let (destination, delivery) = woken
-            .await
-            .expect("every waiter wakes its request before it goes");
-        let outcome = match (sent, delivery) {
-            (Sent::Written, Delivery::Answered(answer)) => Ok(answer),
-            // The write failed and the burial woke the waiter, or the waiter was
-            // never armed and its drop woke it, or the connection died under a
-            // request written whole.
-            (_, Delivery::Answered(_) | Delivery::Buried) => Err(ticket.decide(sent)),
-        };
-        (destination, outcome)
+        Pending {
+            ticket,
+            sent,
+            woken,
+        }
     }
 
     pub async fn send(&self, frame: &[u8]) -> Sent {
