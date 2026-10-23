@@ -38,4 +38,6 @@ if [ "$bad" -ne 0 ]; then
   exit 1
 fi
 
+"$(dirname "$0")/check-test-targets"
+
 exec "$(dirname "$0")/check-vocab" "$@"

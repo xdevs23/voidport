@@ -1,0 +1,57 @@
+#!/usr/bin/env -S python3 -I
+"""Fails on a Rust file in the tests directory of a crate that the manifest of
+the crate does not declare as a test target.
+
+With `autotests = false`, a file that no `[[test]]` entry declares is never
+built, so its tests never run. The files and the manifests come from the index,
+so the check covers the commit as staged, also when only a manifest changes.
+"""
+import re
+import subprocess
+import sys
+import tomllib
+
+TEST_TARGET = re.compile(r"crates/([^/]+)/(tests/(?:[^/]+\.rs|[^/]+/main\.rs))")
+
+
+def indexed(path):
+    return subprocess.run(
+        ["git", "show", f":{path}"], check=True, capture_output=True, text=True
+    ).stdout
+
+
+def declared_test_paths(crate):
+    manifest = tomllib.loads(indexed(f"crates/{crate}/Cargo.toml"))
+    return {target.get("path") for target in manifest.get("test", [])}
+
+
+def main():
+    files = subprocess.run(
+        ["git", "ls-files", "-z"], check=True, capture_output=True, text=True
+    ).stdout.split("\0")
+    declared = {}
+    undeclared = []
+    for file in files:
+        match = TEST_TARGET.fullmatch(file)
+        if match is None:
+            continue
+        crate, path = match.groups()
+        if crate not in declared:
+            declared[crate] = declared_test_paths(crate)
+        if path not in declared[crate]:
+            undeclared.append(file)
+    for file in undeclared:
+        print(f"tests: '{file}' is not declared as a test target", file=sys.stderr)
+    if undeclared:
+        print(
+            "tests: the commit stops here. Make it a module of"
+            " tests/integration/main.rs of its crate, or declare it with a"
+            " [[test]] entry and its path in the manifest of the crate, with"
+            " the reason it runs apart.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
