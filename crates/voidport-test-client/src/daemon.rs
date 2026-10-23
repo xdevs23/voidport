@@ -577,46 +577,34 @@ impl Ground {
 }
 
 pub fn state_is(client: &Client, ready: impl Fn(MountState) -> bool) {
-    let mut changes = client.changes();
-    tokio::runtime::Builder::new_current_thread()
-        .build()
-        .expect("state waiter")
-        .block_on(async {
-            loop {
-                let state = client.state();
-                if ready(state) {
-                    return;
-                }
-                assert_ne!(
-                    state,
-                    MountState::Closed,
-                    "client closed before expected state"
-                );
-                changes
-                    .changed()
-                    .await
-                    .expect("state publisher remains live");
-            }
-        });
+    wait_until(client, |client| ready(client.state()));
 }
 
 /// Waits until the client is connected again, so an assertion on a reply does not
 /// depend on when the server came back.
 pub fn settle(client: &Client) {
+    state_is(client, |state| state == MountState::Connected);
+}
+
+fn wait_until(client: &Client, reached: impl Fn(&Client) -> bool) {
     let mut changes = client.changes();
     tokio::runtime::Builder::new_current_thread()
         .build()
         .expect("a state waiter")
         .block_on(async {
             loop {
-                match client.state() {
-                    MountState::Connected => return,
-                    MountState::Closed => panic!("the client closed before reconnecting"),
-                    _ => changes
-                        .changed()
-                        .await
-                        .expect("the client state publisher remains live"),
+                if reached(client) {
+                    return;
                 }
+                assert_ne!(
+                    client.state(),
+                    MountState::Closed,
+                    "the client closed before the awaited state"
+                );
+                changes
+                    .changed()
+                    .await
+                    .expect("the client state publisher remains live");
             }
         });
 }
