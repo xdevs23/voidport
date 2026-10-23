@@ -17,6 +17,7 @@ use voidport_control::{
     NamespaceName, Reply, Request, Response, Rule, SessionSummary, ShareMode, Timeouts,
 };
 use voidport_proto::opcode::Opcode;
+use voidport_test_support::create_directory;
 
 const STALL: Duration = Duration::from_secs(30);
 
@@ -648,7 +649,7 @@ fn a_listing_cut_off_part_way_is_answered_whole_from_the_kept_reply() {
     const ENTRIES: usize = 40;
     let rig = rig_with("connections-listing", |tree| {
         let many = tree.join("many");
-        fs::create_dir(&many).expect("a directory");
+        create_directory(&many);
         for index in 0..ENTRIES {
             fs::write(many.join(format!("f{index:02}")), b"x").expect("a file");
         }
@@ -693,7 +694,7 @@ fn a_listing_cut_off_part_way_is_answered_whole_from_the_kept_reply() {
 fn a_listing_cut_off_with_its_session_is_answered_by_the_next_session() {
     let rig = rig_with("connections-listing-ended", |tree| {
         let many = tree.join("many");
-        fs::create_dir(&many).expect("a directory");
+        create_directory(&many);
         for index in 0..8 {
             fs::write(many.join(format!("f{index}")), b"x").expect("a file");
         }

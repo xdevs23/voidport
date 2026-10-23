@@ -9,6 +9,7 @@ use rustix::io::Errno;
 use support::Fixture;
 use voidport_control::{NamespaceName, NamespaceSpec, Reply, Request, Response, Rule, ShareMode};
 use voidport_spawn::Program;
+use voidport_test_support::create_directory;
 
 /// One host tree, shared read-write at `/tree` and read-only at `/readonly`, so
 /// the `EROFS`-before-policy order is observable on the same file.
@@ -25,7 +26,7 @@ fn namespace(fixture: &Fixture) -> NamespaceSpec {
 
 fn start(label: &str) -> (Fixture, String) {
     let fixture = Fixture::start(label);
-    fs::create_dir_all(fixture.host("attrs")).expect("the host is writable");
+    create_directory(&fixture.host("attrs"));
     fs::write(fixture.host("attrs/file.bin"), b"contents").expect("the host is writable");
     fs::set_permissions(
         fixture.host("attrs/file.bin"),
