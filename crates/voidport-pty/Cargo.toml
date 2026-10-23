@@ -7,8 +7,9 @@ license.workspace = true
 publish = false
 
 [dependencies]
-libc = { workspace = true }
-portable-pty = { workspace = true }
+voidport-spawn = { workspace = true }
+
+rustix = { workspace = true, features = ["pty", "termios"] }
 vt100 = { workspace = true }
 
 [lints]

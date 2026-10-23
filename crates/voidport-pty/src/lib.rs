@@ -1,11 +1,16 @@
 #![forbid(unsafe_code)]
 
 use std::ffi::OsStr;
+use std::fs::File;
 use std::io::{Read as _, Write as _};
+use std::os::fd::{AsFd as _, OwnedFd};
 use std::path::Path;
+use std::process::{Child, ExitStatus};
 use std::sync::{Arc, Condvar, Mutex};
 
-use portable_pty::{Child, CommandBuilder, ExitStatus, MasterPty, PtySize, native_pty_system};
+use rustix::pty::{OpenptFlags, ioctl_tiocgptpeer, openpt, unlockpt};
+use rustix::termios::{LocalModes, Winsize, tcgetattr, tcsetwinsize};
+use voidport_spawn::{Program, Stream};
 
 pub const ENTER_ALTERNATE: &str = "\u{1b}[?1049h";
 pub const LEAVE_ALTERNATE: &str = "\u{1b}[?1049l";
@@ -14,9 +19,6 @@ pub const CTRL_Z: u8 = 0x1a;
 const COLUMNS: u16 = 120;
 const ROWS: u16 = 40;
 
-/// The working directory is required: `portable-pty` falls back to `$HOME`
-/// for a command without one, and a build sandbox points `$HOME` at a missing
-/// directory, so the spawn fails with a bare `ENOENT`.
 #[derive(Clone, Debug)]
 pub struct Spawn<'a> {
     pub program: &'a OsStr,
@@ -55,9 +57,9 @@ impl<'a> Spawn<'a> {
 }
 
 pub struct Pty {
-    master: Box<dyn MasterPty + Send>,
-    child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn std::io::Write + Send>,
+    master: OwnedFd,
+    child: Child,
+    writer: File,
     state: Arc<(Mutex<Screen>, Condvar)>,
     reader: Option<std::thread::JoinHandle<()>>,
 }
@@ -72,35 +74,46 @@ struct Screen {
 impl Pty {
     /// # Panics
     ///
-    /// If the pty cannot be created or the program cannot be started.
+    /// If the pty cannot be created or the program cannot be started in the
+    /// working directory.
     #[must_use]
     pub fn spawn(spawn: &Spawn<'_>) -> Self {
-        assert!(
-            spawn.directory.is_dir(),
-            "a pty command needs a working directory that exists: {}",
-            spawn.directory.display()
-        );
-        let pair = native_pty_system()
-            .openpty(PtySize {
-                rows: ROWS,
-                cols: COLUMNS,
-                pixel_width: 0,
-                pixel_height: 0,
-            })
-            .expect("a pty");
+        let flags = OpenptFlags::RDWR | OpenptFlags::NOCTTY | OpenptFlags::CLOEXEC;
+        let master = openpt(flags).expect("a pty");
+        unlockpt(&master).expect("the pty is unlocked");
+        tcsetwinsize(
+            &master,
+            Winsize {
+                ws_row: ROWS,
+                ws_col: COLUMNS,
+                ws_xpixel: 0,
+                ws_ypixel: 0,
+            },
+        )
+        .expect("the pty size is set");
+        let slave = ioctl_tiocgptpeer(&master, flags).expect("the slave of the pty");
 
-        let mut command = CommandBuilder::new(spawn.program);
-        for argument in &spawn.arguments {
-            command.arg(argument);
-        }
-        command.cwd(spawn.directory);
+        let mut program = Program::new(spawn.program);
+        program
+            .args(&spawn.arguments)
+            .current_dir(spawn.directory)
+            .stdin(Stream::Descriptor(slave.as_fd()))
+            .stdout(Stream::Descriptor(slave.as_fd()))
+            .stderr(Stream::Descriptor(slave.as_fd()))
+            .in_new_session_on_terminal();
         for (key, value) in &spawn.environment {
-            command.env(key, value);
+            program.env(key, value);
         }
-        let child = pair.slave.spawn_command(command).expect("the child starts");
+        let child = program.spawn().unwrap_or_else(|error| {
+            panic!(
+                "the child {} starts in {}: {error:?}",
+                spawn.program.display(),
+                spawn.directory.display()
+            )
+        });
         // While a slave is open, the pty is alive after the child exits, and its
         // EOF is hidden.
-        drop(pair.slave);
+        drop(slave);
 
         let state = Arc::new((
             Mutex::new(Screen {
@@ -111,7 +124,7 @@ impl Pty {
             }),
             Condvar::new(),
         ));
-        let mut reader = pair.master.try_clone_reader().expect("a pty reader");
+        let mut reader = File::from(master.try_clone().expect("a pty reader"));
         let reader = std::thread::spawn({
             let state = Arc::clone(&state);
             move || {
@@ -132,9 +145,9 @@ impl Pty {
                 state.1.notify_all();
             }
         });
-        let writer = pair.master.take_writer().expect("a pty writer");
+        let writer = File::from(master.try_clone().expect("a pty writer"));
         Self {
-            master: pair.master,
+            master,
             child,
             writer,
             state,
@@ -206,27 +219,25 @@ impl Pty {
 
     #[must_use]
     pub fn is_raw(&self) -> bool {
-        self.local_flags() & libc::ICANON == 0
+        !self.local_modes().contains(LocalModes::ICANON)
     }
 
     #[must_use]
     pub fn is_cooked(&self) -> bool {
-        let flags = self.local_flags();
-        flags & libc::ICANON != 0 && flags & libc::ECHO != 0
+        self.local_modes()
+            .contains(LocalModes::ICANON | LocalModes::ECHO)
     }
 
     /// On Linux the master end reports the termios of the line.
-    fn local_flags(&self) -> libc::tcflag_t {
-        self.master
-            .get_termios()
+    fn local_modes(&self) -> LocalModes {
+        tcgetattr(&self.master)
             .expect("the pty has line settings")
-            .local_flags
-            .bits()
+            .local_modes
     }
 
     #[must_use]
     pub fn pid(&self) -> u32 {
-        self.child.process_id().expect("a running child")
+        self.child.id()
     }
 
     pub fn wait(&mut self) -> ExitStatus {
