@@ -25,9 +25,12 @@ impl NoPeriodicWriteback {
 
 impl Drop for NoPeriodicWriteback {
     fn drop(&mut self) {
-        // A failure to restore the period cannot fail a case that already
-        // ended, and the guest powers off after its run.
-        let _ = std::fs::write(WRITEBACK_PERIOD, &self.0);
+        let restored = std::fs::write(WRITEBACK_PERIOD, &self.0);
+        // A panic while the case unwinds from a failed assertion would abort
+        // the run before that assertion is reported.
+        if !std::thread::panicking() {
+            restored.expect("the writeback period is restored");
+        }
     }
 }
 
