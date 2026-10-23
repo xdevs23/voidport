@@ -5,6 +5,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 publish = false
+autotests = false
 
 [dependencies]
 # The mount itself: the harness drives real FUSE mounts of a real server, and
@@ -38,6 +39,10 @@ zerocopy = { workspace = true }
 # The smoke variant runs a real server, started exactly as its binary starts
 # it, from the runner the other suites share.
 voidport-test-support = { workspace = true }
+
+[[test]]
+name = "smoke"
+path = "tests/smoke.rs"
 
 [lints]
 workspace = true
