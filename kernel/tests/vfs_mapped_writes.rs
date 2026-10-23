@@ -1,10 +1,12 @@
 // SPDX-License-Identifier: GPL-2.0
 
-use super::writable::{FIRST_FILE, Held, Peer, Received, mount, path, pattern, unmount};
+use super::writable::{
+    FIRST_FILE, Held, Mapping, Peer, Received, mount, path, pattern, unmount,
+};
 use crate::{Result, load_module, unload_module};
 use std::fs::OpenOptions;
 use std::ops::Range;
-use std::os::fd::{AsRawFd, IntoRawFd};
+use std::os::fd::IntoRawFd;
 use std::os::unix::fs::FileExt;
 
 const FILE: u64 = FIRST_FILE;
@@ -26,59 +28,6 @@ impl Drop for NoPeriodicWriteback {
         // A failure to restore the period cannot fail a case that already
         // ended, and the guest powers off after its run.
         let _ = std::fs::write(WRITEBACK_PERIOD, &self.0);
-    }
-}
-
-struct Mapping {
-    address: *mut u8,
-    len: usize,
-}
-
-impl Mapping {
-    fn new(file: &std::fs::File, len: usize) -> Result<Self> {
-        let address = unsafe {
-            libc::mmap(
-                std::ptr::null_mut(),
-                len,
-                libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED,
-                file.as_raw_fd(),
-                0,
-            )
-        };
-        if address == libc::MAP_FAILED {
-            return Err(std::io::Error::last_os_error().into());
-        }
-        Ok(Self {
-            address: address.cast(),
-            len,
-        })
-    }
-
-    fn store(&self, seed: u8, range: Range<u64>) {
-        let bytes = pattern(seed, range.clone());
-        assert!(range.end as usize <= self.len);
-        unsafe {
-            std::ptr::copy_nonoverlapping(
-                bytes.as_ptr(),
-                self.address.add(range.start as usize),
-                bytes.len(),
-            )
-        };
-    }
-
-    fn sync(&self) -> std::io::Result<()> {
-        if unsafe { libc::msync(self.address.cast(), self.len, libc::MS_SYNC) } == 0 {
-            Ok(())
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    }
-}
-
-impl Drop for Mapping {
-    fn drop(&mut self) {
-        unsafe { libc::munmap(self.address.cast(), self.len) };
     }
 }
 

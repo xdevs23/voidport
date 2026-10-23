@@ -20,6 +20,8 @@ pub(crate) struct Options {
     /// How long requests stall on a lost server before failing.
     pub(crate) stall: Duration,
     pub(crate) mask_privileged: bool,
+    /// Every read and write goes past the page cache, as with `O_DIRECT`.
+    pub(crate) direct_io: bool,
 }
 
 pub(crate) struct Mount {
@@ -61,6 +63,10 @@ impl Mount {
 
     pub(crate) fn mask_privileged(&self) -> bool {
         self.options.mask_privileged
+    }
+
+    pub(crate) fn direct_io(&self) -> bool {
+        self.options.direct_io
     }
 
     /// A caller reads it before it sends a request whose reply includes

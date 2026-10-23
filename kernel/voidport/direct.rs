@@ -8,17 +8,33 @@ use kernel::sync::Arc;
 use crate::buffer::Buffer;
 use crate::connection::{ReadPages, ReadRange};
 use crate::handle::handle_of;
-use crate::helpers::NoFsScope;
-use crate::node::session_and_id;
+use crate::helpers::{voidport_iov_iter_extract_will_pin, NoFsScope};
+use crate::node::{inode_mount, session_and_id};
 use crate::wire::Caller;
+
+/// Whether a request on `file` goes past the page cache: the request asks for
+/// it with `o_direct`, or the mount that contains the file has `direct_io`.
+///
+/// # Safety
+///
+/// `file` is a live voidport file.
+pub(crate) unsafe fn bypasses_cache(file: *const bindings::file, o_direct: bool) -> bool {
+    // SAFETY: the inode of a live voidport file belongs to a live voidport
+    // superblock.
+    o_direct || unsafe { inode_mount((*file).f_inode) }.direct_io()
+}
 
 /// Reads into `to` from the position of `iocb`, and returns the bytes read.
 /// An error after some bytes returns those bytes.
 ///
+/// A reply streams into the buffer of the read also after a fatal signal ended
+/// the caller, which only pages held in memory allow. A destination whose pages the
+/// extraction does not pin, such as the kernel iterator of a splice, is read
+/// into a buffer of the module first.
+///
 /// # Safety
 ///
-/// `iocb` is a live request on a voidport file, and `to` is its destination,
-/// whose pages the extraction holds.
+/// `iocb` is a live request on a voidport file, and `to` is its destination.
 pub(crate) unsafe fn read(
     iocb: *mut bindings::kiocb,
     to: *mut bindings::iov_iter,
@@ -41,8 +57,15 @@ pub(crate) unsafe fn read(
     let offset = u64::try_from(unsafe { (*iocb).ki_pos }).map_err(|_| EINVAL)?;
     // SAFETY: the request is live.
     to_result(unsafe { bindings::kiocb_write_and_wait(iocb, length) })?;
-    // SAFETY: the destination is live, and this task holds no lock.
-    let buffer = Arc::new(unsafe { Buffer::take(to, length)? }, GFP_KERNEL)?;
+    // SAFETY: the destination is live.
+    let bounced = unsafe { !voidport_iov_iter_extract_will_pin(to) };
+    let buffer = if bounced {
+        Buffer::bounce(length)?
+    } else {
+        // SAFETY: the destination is live, and this task holds no lock.
+        unsafe { Buffer::take(to, length)? }
+    };
+    let buffer = Arc::new(buffer, GFP_KERNEL)?;
     let mut done = 0;
     let failure = loop {
         if done == buffer.len() {
@@ -63,12 +86,18 @@ pub(crate) unsafe fn read(
             break Some(EIO);
         }
     };
-    // SAFETY: the request and its destination are live. The destination still
-    // has room for the bytes the read did not fill.
-    unsafe {
-        bindings::iov_iter_revert(to, buffer.len() - done);
-        (*iocb).ki_pos += done as bindings::loff_t;
-    }
+    let done = if bounced {
+        // SAFETY: the destination is live, and the replies that filled the
+        // bytes have ended.
+        unsafe { buffer.copy_to_iter(done, to) }
+    } else {
+        // SAFETY: the destination is live, and still has room for the bytes
+        // the read did not fill.
+        unsafe { bindings::iov_iter_revert(to, buffer.len() - done) };
+        done
+    };
+    // SAFETY: the request is live.
+    unsafe { (*iocb).ki_pos += done as bindings::loff_t };
     match failure {
         Some(error) if done == 0 => Err(error),
         _ => isize::try_from(done).map_err(|_| EOVERFLOW),

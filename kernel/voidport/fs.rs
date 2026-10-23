@@ -52,6 +52,7 @@ static PARAMETERS: Parameters<{ MountOption::ALL.len() }> = Parameters::new([
     parameter(MountOption::EntryTimeout),
     parameter(MountOption::ReconnectStall),
     parameter(MountOption::NoPrivilegedBits),
+    parameter(MountOption::DirectIo),
     parameter(MountOption::Tag),
 ]);
 
@@ -120,6 +121,7 @@ pub(crate) struct Context {
     entry: Option<Duration>,
     stall: Option<Duration>,
     mask_privileged: bool,
+    direct_io: bool,
     tree_attempted: bool,
     /// The mount whose session `get_tree` opened, moved into the superblock
     /// by `fill_super`.
@@ -136,6 +138,7 @@ impl Context {
             entry: None,
             stall: None,
             mask_privileged: false,
+            direct_io: false,
             tree_attempted: false,
             mount: None,
         }
@@ -349,6 +352,10 @@ pub(crate) unsafe extern "C" fn voidport_rs_parse_param(
             context.mask_privileged = true;
             0
         }
+        MountOption::DirectIo => {
+            context.direct_io = true;
+            0
+        }
     }
 }
 
@@ -399,6 +406,7 @@ pub(crate) unsafe extern "C" fn voidport_rs_get_tree(fc: *mut bindings::fs_conte
         entry_timeout: duration_to_jiffies(context.entry.unwrap_or(DEFAULT_CACHE_LIFETIME)),
         stall: context.stall.unwrap_or(DEFAULT_RECONNECT_STALL),
         mask_privileged: context.mask_privileged,
+        direct_io: context.direct_io,
     };
     // Copies, because a failed connection attempt leaves the context
     // retryable.
@@ -470,7 +478,8 @@ pub(crate) unsafe extern "C" fn voidport_rs_reconfigure(fc: *mut bindings::fs_co
             .entry
             .is_some_and(|entry| duration_to_jiffies(entry) != options.entry_timeout)
         || context.stall.is_some_and(|stall| stall != options.stall)
-        || (context.mask_privileged && !options.mask_privileged);
+        || (context.mask_privileged && !options.mask_privileged)
+        || (context.direct_io && !options.direct_io);
     if changed {
         diag(fc, c"filesystem option changes require a new mount");
         return EINVAL.to_errno();

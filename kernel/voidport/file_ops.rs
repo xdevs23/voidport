@@ -4,10 +4,7 @@ use kernel::bindings;
 use kernel::prelude::*;
 
 use crate::handle::{attach, detach, handle_of, shared_handle, Handle};
-use crate::helpers::{
-    voidport_dir_emit, voidport_iov_iter_extract_will_pin, FatalSignalsOnly, Hold, Locked,
-    NoFsScope,
-};
+use crate::helpers::{voidport_dir_emit, FatalSignalsOnly, Hold, Locked, NoFsScope};
 use crate::node::{
     inode_mount, placed_locks, refresh_if_stale, resize, session_and_id, take_flush, write_back_all,
 };
@@ -21,7 +18,7 @@ pub(crate) static FILE_FILE_OPS: Table<bindings::file_operations> =
         open: Some(open_file),
         release: Some(release),
         read_iter: Some(read_iter),
-        splice_read: Some(bindings::filemap_splice_read),
+        splice_read: Some(splice_read),
         write_iter: Some(crate::write::write_iter),
         splice_write: Some(bindings::iter_file_splice_write),
         flush: Some(flush),
@@ -84,21 +81,36 @@ unsafe fn open_truncating(inode: *mut bindings::inode, file: *mut bindings::file
     Ok(())
 }
 
-/// The reply to a direct read goes into the pages of its destination after
-/// a fatal signal ended its caller, which only pages held in memory allow. A
-/// direct read into the pages of a kernel iterator, such as the one
-/// `splice(2)` reads into, goes through the page cache.
 unsafe extern "C" fn read_iter(iocb: *mut bindings::kiocb, to: *mut bindings::iov_iter) -> isize {
     // SAFETY: the VFS passes a live request on a voidport file and its
     // destination.
     unsafe {
-        if !crate::vfs::direct(iocb) {
-            return bindings::generic_file_read_iter(iocb, to);
+        if crate::direct::bypasses_cache((*iocb).ki_filp, crate::vfs::direct(iocb)) {
+            length(crate::direct::read(iocb, to))
+        } else {
+            bindings::generic_file_read_iter(iocb, to)
         }
-        if !voidport_iov_iter_extract_will_pin(to) {
-            return bindings::filemap_read(iocb, to, 0);
+    }
+}
+
+/// A splice past the page cache reads through [`read_iter`] into pages that
+/// it then adds to the pipe.
+unsafe extern "C" fn splice_read(
+    file: *mut bindings::file,
+    position: *mut bindings::loff_t,
+    pipe: *mut bindings::pipe_inode_info,
+    len: usize,
+    flags: c_uint,
+) -> isize {
+    // SAFETY: the VFS passes a live voidport file, the position in it and the
+    // pipe that the splice fills.
+    unsafe {
+        let o_direct = (*file).f_flags & bindings::O_DIRECT != 0;
+        if crate::direct::bypasses_cache(file, o_direct) {
+            bindings::copy_splice_read(file, position, pipe, len, flags)
+        } else {
+            bindings::filemap_splice_read(file, position, pipe, len, flags)
         }
-        length(crate::direct::read(iocb, to))
     }
 }
 

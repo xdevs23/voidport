@@ -450,6 +450,8 @@ let
 
     peer_case direct-io --direct
 
+    peer_case direct-io-mount --direct-mount
+
     peer_case lock-wait --record-locks
 
     ${lib.optionalString (configuration == "debug") ''

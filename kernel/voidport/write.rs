@@ -61,8 +61,8 @@ pub(crate) fn send_until_written(
     }
 }
 
-/// A direct write through a handle that does not append takes the lock
-/// shared, and takes it again exclusively when the checks show that it
+/// A write with `O_DIRECT` through a handle that does not append takes the
+/// lock shared, and takes it again exclusively when the checks show that it
 /// extends past the end of the file, since only that lock lets it change the
 /// size.
 ///
@@ -74,7 +74,13 @@ unsafe fn write(iocb: *mut bindings::kiocb, from: *mut bindings::iov_iter) -> Re
     // SAFETY: the request is on a live file, whose inode lives as long.
     let (file, o_direct) = unsafe { ((*iocb).ki_filp, crate::vfs::direct(iocb)) };
     // SAFETY: as above.
-    let (inode, handle) = unsafe { ((*file).f_inode, file_handle(file).ok_or(EIO)?) };
+    let (inode, handle, bypasses_cache) = unsafe {
+        (
+            (*file).f_inode,
+            file_handle(file).ok_or(EIO)?,
+            crate::direct::bypasses_cache(file, o_direct),
+        )
+    };
     let mut hold = if o_direct && !handle.appends() {
         Hold::Shared
     } else {
@@ -99,34 +105,35 @@ unsafe fn write(iocb: *mut bindings::kiocb, from: *mut bindings::iov_iter) -> Re
             continue;
         }
         // SAFETY: the promises of the caller hold, and this task holds the
-        // inode lock of the file, exclusively unless the write is direct and
-        // inside the file.
-        return unsafe { write_locked(iocb, from, inode, handle, length, o_direct) };
+        // inode lock of the file, exclusively unless the write has `O_DIRECT`
+        // and lies inside the file.
+        return unsafe { write_locked(iocb, from, inode, handle, length, bypasses_cache) };
     }
 }
 
 /// # Safety
 ///
 /// As [`write`], `handle` is the handle of the file, the checks of the write
-/// have passed `length` bytes, `o_direct` says whether the file was opened
-/// with `O_DIRECT`, and the caller holds the lock of `inode`, the inode of the
-/// file: shared only for a direct write inside the file.
+/// have passed `length` bytes, `bypasses_cache` shows whether the write goes
+/// past the page cache, and the caller has the lock of `inode`, the inode of
+/// the file: shared only for a write with `O_DIRECT` inside the file.
 unsafe fn write_locked(
     iocb: *mut bindings::kiocb,
     from: *mut bindings::iov_iter,
     inode: *mut bindings::inode,
     handle: &Handle,
     length: usize,
-    o_direct: bool,
+    bypasses_cache: bool,
 ) -> Result<isize> {
     // SAFETY: the request is live.
     let offset = u64::try_from(unsafe { (*iocb).ki_pos }).map_err(|_| EINVAL)?;
     // The server appends every write through an appending handle at its own
     // end of the file, whatever the position of the write, and the cache past
-    // the presented end is dropped for it, also for one with `O_DIRECT`.
+    // the presented end is dropped for it, also for a write that bypasses the
+    // page cache.
     let placement = if handle.appends() {
         Placement::End
-    } else if o_direct {
+    } else if bypasses_cache {
         Placement::Direct { offset }
     } else {
         Placement::At { offset }

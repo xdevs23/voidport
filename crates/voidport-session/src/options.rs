@@ -25,11 +25,14 @@ pub enum MountOption {
     ReconnectStall,
     /// Shows no setuid or setgid bits, and rejects a chmod that sets one.
     NoPrivilegedBits,
+    /// Reads and writes the data of every file past the page cache of the
+    /// guest, apart from mappings.
+    DirectIo,
     Tag,
 }
 
 impl MountOption {
-    pub const ALL: [Self; 11] = [
+    pub const ALL: [Self; 12] = [
         Self::Source,
         Self::Namespace,
         Self::Addr,
@@ -40,6 +43,7 @@ impl MountOption {
         Self::EntryTimeout,
         Self::ReconnectStall,
         Self::NoPrivilegedBits,
+        Self::DirectIo,
         Self::Tag,
     ];
 
@@ -56,6 +60,7 @@ impl MountOption {
             Self::EntryTimeout => c"entry_timeout",
             Self::ReconnectStall => c"reconnect_stall",
             Self::NoPrivilegedBits => c"no_privileged_bits",
+            Self::DirectIo => c"direct_io",
             Self::Tag => c"tag",
         }
     }
@@ -78,7 +83,7 @@ impl MountOption {
             | Self::EntryTimeout
             | Self::ReconnectStall
             | Self::Tag => ValueKind::String,
-            Self::NoPrivilegedBits => ValueKind::Flag,
+            Self::NoPrivilegedBits | Self::DirectIo => ValueKind::Flag,
         }
     }
 
