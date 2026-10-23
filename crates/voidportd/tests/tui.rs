@@ -10,8 +10,7 @@ use voidport_control::Request;
 use voidport_pty::{ENTER_ALTERNATE, LEAVE_ALTERNATE, Pty, Spawn};
 
 /// The working directory is the temporary directory of the case, so nothing
-/// resolved relatively ends up in the source tree and the spawn does not fall
-/// back to a `$HOME` that does not exist.
+/// resolved relatively ends up in the source tree.
 fn voidportd(directory: &TempDir, arguments: &[&str]) -> Pty {
     Pty::spawn(&Spawn::new(env!("CARGO_BIN_EXE_voidportd"), directory.path()).args(arguments))
 }
