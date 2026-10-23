@@ -63,26 +63,5 @@ clap_mangen = { workspace = true }
 name = "integration"
 path = "tests/integration/main.rs"
 
-# The daemon, descriptors, keeper and tui suites start child processes from
-# the test process. A child has a copy of every descriptor of the test process
-# until it starts the program it was created for. A state lock or a mount
-# released by a suite in the same test process would still be taken meanwhile,
-# so each of these suites is a test binary of its own.
-[[test]]
-name = "daemon"
-path = "tests/daemon.rs"
-
-[[test]]
-name = "descriptors"
-path = "tests/descriptors.rs"
-
-[[test]]
-name = "keeper"
-path = "tests/keeper.rs"
-
-[[test]]
-name = "tui"
-path = "tests/tui.rs"
-
 [lints]
 workspace = true
