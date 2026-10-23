@@ -571,7 +571,7 @@ impl Ground {
         let url = self.server.url("work", "");
         let parsed = MountUrl::parse(&url).unwrap_or_else(|error| panic!("{url}: {error}"));
         let mount = Mount::new(&parsed, &mountpoint, options, &crate::guardian())
-            .unwrap_or_else(|error| panic!("mounting {url} failed: {error}"));
+            .unwrap_or_else(|error| panic!("mounting {url} failed: {error:?}"));
         Guest::adopt(mount, mountpoint)
     }
 }

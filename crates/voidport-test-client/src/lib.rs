@@ -234,7 +234,7 @@ impl Fixture {
         let mountpoint = self.directory.directory(&format!("mnt-{label}"));
         let parsed = MountUrl::parse(url).unwrap_or_else(|error| panic!("{url}: {error}"));
         let mount = Mount::new(&parsed, &mountpoint, options, &guardian())
-            .unwrap_or_else(|error| panic!("mounting {url} on {mountpoint:?} failed: {error}"));
+            .unwrap_or_else(|error| panic!("mounting {url} on {mountpoint:?} failed: {error:?}"));
         Guest { mount, mountpoint }
     }
 
