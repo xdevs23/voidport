@@ -629,6 +629,61 @@ fn a_forget_lost_with_its_connection_is_applied_once() {
     recovered(&retired, node);
 }
 
+/// The only connection of the session waits for a reply that the relay
+/// withholds, and the relay closes every new connection, so the first forget
+/// waits for a connection of the session and the second one is queued behind
+/// it. The relay then ends that connection, which ends the session, and sends
+/// new connections to another server.
+#[test]
+fn a_queued_forget_of_an_ended_session_never_reaches_the_newer_one() {
+    let rig = rig("connections-queued-forget");
+    let other = Ground::start("connections-queued-forget-other");
+    let (caller, root) = (Caller::default(), rig.client.root_node_id());
+    let forgets = rig.relay.carried(Opcode::Forget);
+    let latch = Latch::default();
+    let held = rig
+        .relay
+        .arm(Opcode::Getattr, Cut::HoldReply(latch.clone()));
+    let client = Arc::clone(&rig.client);
+    let first = rig
+        .runtime
+        .spawn(async move { client.getattr(caller, root, None).await });
+    held.recv().expect("the reply is withheld");
+
+    rig.relay.refuse_new(true);
+    let refused = rig.relay.refused();
+    rig.client.queue_forget(caller, rig.tree, 1);
+    rig.ground.server.until(|| rig.relay.refused() > refused);
+    rig.client.queue_forget(caller, rig.tree, 1);
+    reconnected_after(&rig.client, || {
+        rig.relay.redirect(other.server.data_socket());
+        rig.relay.refuse_new(false);
+        rig.relay.end_carriers(Opcode::Getattr);
+    });
+    latch.release();
+    rig.runtime
+        .block_on(first)
+        .expect("joined")
+        .expect("sent again in the new session");
+
+    let tree = rig
+        .runtime
+        .block_on(rig.client.lookup(caller, root, b"tree"))
+        .expect("the graft resolves in the new session")
+        .node_id;
+    let looked_up = sessions_of(&other)[0].nodes;
+    rig.client.queue_forget(caller, tree, 1);
+    other
+        .server
+        .until(|| sessions_of(&other)[0].nodes < looked_up);
+    rig.fence();
+    assert_eq!(
+        rig.relay.carried(Opcode::Forget),
+        forgets + 1,
+        "a forget of the ended session reached the newer one"
+    );
+}
+
 #[derive(Default)]
 struct Recording(Arc<Mutex<Vec<Vec<u8>>>>);
 

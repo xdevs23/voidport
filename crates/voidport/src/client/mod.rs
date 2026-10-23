@@ -8,6 +8,7 @@
 
 mod caching;
 mod connection;
+mod forgets;
 
 pub use caching::Pages;
 mod interrupt;
@@ -51,7 +52,7 @@ use zerocopy::byteorder::little_endian::U64;
 mod clock;
 
 use crate::url::Endpoint;
-use connection::{Answer, Connection, Destination, Nothing, Unsent, kept_answer};
+use connection::{Answer, Connection, Destination, Forget, Nothing, Unsent, kept_answer};
 pub use pool::Connections;
 use pool::Pool;
 pub use voidport_session::handshake::ROOT_NODE_ID;
@@ -152,6 +153,12 @@ pub struct Client {
     /// consumer. Unset until something subscribes, so a mount that never
     /// subscribes is byte-identical on the wire.
     notifications: Mutex<Option<tokio::sync::mpsc::UnboundedSender<Notice>>>,
+    /// Unbounded, because a dispatch thread queues on it and must not wait.
+    /// Each forget gives back lookups that the server answered, so the queue
+    /// grows only as fast as lookups complete, and each pass of the sending
+    /// task empties it.
+    forgets: tokio::sync::mpsc::UnboundedSender<forgets::QueuedForget>,
+    sending_forgets: tokio::task::AbortHandle,
 }
 
 #[derive(Debug)]
@@ -225,7 +232,11 @@ impl Client {
         let (changes, _) = watch::channel(0);
         let runtime = tokio::runtime::Handle::current();
         let mut unwatched = None;
+        let (forgets, queued) = tokio::sync::mpsc::unbounded_channel();
         let client = Arc::new_cyclic(|me| {
+            let sending_forgets = runtime
+                .spawn(forgets::send_queued(me.clone(), queued))
+                .abort_handle();
             let (pool, first) = Pool::open(
                 me.clone(),
                 target.clone(),
@@ -252,6 +263,8 @@ impl Client {
                 runtime,
                 me: OnceLock::new(),
                 notifications: Mutex::new(None),
+                forgets,
+                sending_forgets,
             }
         });
         let _fresh_lock_is_empty = client.me.set(Arc::downgrade(&client));
@@ -333,6 +346,8 @@ impl Client {
         let mut state = self.lock();
         let installed = state.machine.close();
         state.cancel_probe();
+        // The forgets still queued name nodes of the session that ends here.
+        self.sending_forgets.abort();
         if let Some(pool) = installed {
             pool.close(Death::Closed);
         }
@@ -691,18 +706,18 @@ impl Client {
 
     /// It never stalls, and a mount with no session installed drops it, since a
     /// `forget` whose session is gone names a node that died with the session.
-    async fn forget_now(&self, caller: Caller, node_id: u64, nlookup: u64) {
+    async fn forget_now(&self, forget: Forget) {
         if let Some(pool) = self.current() {
-            pool.forget(caller, node_id, nlookup).await;
+            pool.forget(&[forget]).await;
         }
     }
 
-    /// A mount with another session installed, or none, drops it: the lookup it
-    /// gives back was counted by a session that is gone.
-    async fn forget_within(&self, generation: u64, caller: Caller, node_id: u64, nlookup: u64) {
+    /// A mount with another session installed, or none, drops them: the
+    /// lookups they give back were counted by a session that is gone.
+    async fn forget_within(&self, generation: u64, forgets: &[Forget]) {
         let serving = self.lock().machine.serving(generation).map(Arc::clone);
         if let Some(pool) = serving {
-            pool.forget(caller, node_id, nlookup).await;
+            pool.forget(forgets).await;
         }
     }
 

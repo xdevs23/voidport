@@ -46,6 +46,11 @@ pub fn preflight() {
 
 pub use voidport_test_support::vsock::preflight as vsock_preflight;
 
+/// The kernel sends a forget for every node of a mount whose dentry it drops.
+pub fn drop_dentry_cache() {
+    fs::write("/proc/sys/vm/drop_caches", b"2\n").expect("a prunable dentry cache (needs root)");
+}
+
 #[derive(Debug)]
 pub struct TempDir {
     path: PathBuf,

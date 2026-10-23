@@ -2,10 +2,11 @@
 //! request at a time, so a callback that waited for the server would stall every
 //! other operation of that loop, and a blocking `setlk` would stall it for as
 //! long as another mount holds the lock. Each callback captures what it needs,
-//! hands the work to the async runtime of the mount, and replies from there. The
-//! loops call into one shared adapter, so the adapter has no state that a
-//! callback mutates in place. [`VoidportFs::negotiate`] runs during the
-//! FUSE_INIT exchange, before any loop exists.
+//! hands the work to the async runtime of the mount, and replies from there. A
+//! forget is queued with the client, which sends it from a task. The loops call
+//! into one shared adapter, so the adapter has no state that a callback mutates
+//! in place. [`VoidportFs::negotiate`] runs during the FUSE_INIT exchange, before
+//! any loop exists.
 //!
 //! The kernel node id is the server node id, and the presented `st_ino` is the
 //! node id too.
@@ -267,16 +268,12 @@ impl VoidportFs {
         });
     }
 
-    /// Sending each forget before the next callback is read keeps the forgets of
-    /// a burst, which the kernel sends by the thousand when it prunes its
-    /// caches, to one connection at a time. The wire has no batch form, so a
-    /// batch becomes one FORGET per node.
+    /// The wire has only a single-node form, so a batch becomes one FORGET
+    /// per node.
     fn forget(&self, request: Request, forget: Forget) {
         self.pages.forget(forget.node, forget.lookups);
-        let (client, caller) = (self.client(), caller_of(request));
-        self.runtime.block_on(async move {
-            client.forget(caller, forget.node, forget.lookups).await;
-        });
+        self.client
+            .queue_forget(caller_of(request), forget.node, forget.lookups);
     }
 
     /// An interrupt for a request whose callback is not registered yet, because

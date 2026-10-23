@@ -36,7 +36,7 @@ use voidport_proto::opcode::Opcode;
 use voidport_session::Window;
 use voidport_session::replay::OpenFlags;
 
-use super::connection::{Answer, Connection, Nothing};
+use super::connection::{Answer, Connection, Forget, Nothing};
 use super::{
     Caller, Client, Data, Entries, Entry, EntrySink, Interrupt, Outgoing, Pages, errno_of,
     interpret,
@@ -270,15 +270,24 @@ impl Client {
     /// ends, so it never fails loudly. One whose connection is lost while the
     /// session lives is settled on another connection of the session.
     pub async fn forget(&self, caller: Caller, node_id: u64, nlookup: u64) {
-        self.forget_now(caller, node_id, nlookup).await;
+        self.forget_now(Forget {
+            caller,
+            node_id,
+            nlookup,
+        })
+        .await;
     }
 
     /// It is sent only within that session. When that session has ended, the
     /// forget is dropped: the lookups it gives back went with it, and a newer
     /// session never counted them.
     pub async fn forget_on(&self, caller: Caller, generation: u64, node_id: u64, nlookup: u64) {
-        self.forget_within(generation, caller, node_id, nlookup)
-            .await;
+        let forget = Forget {
+            caller,
+            node_id,
+            nlookup,
+        };
+        self.forget_within(generation, &[forget]).await;
     }
 
     pub async fn getattr(

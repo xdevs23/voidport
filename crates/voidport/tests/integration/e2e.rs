@@ -730,7 +730,7 @@ fn a_listing_larger_than_the_kernel_buffer_resumes_and_leaves_nothing_behind() {
     assert_eq!(names.len(), ENTRIES, "an entry was listed twice");
     assert_eq!(names, expected, "the walk and the directory disagree");
 
-    fs::write("/proc/sys/vm/drop_caches", b"2\n").expect("a prunable dentry cache (needs root)");
+    support::drop_dentry_cache();
     assert!(
         eventually(PATIENCE, || session_nodes(&fixture) <= baseline),
         "a {ENTRIES}-entry walk left the session holding {} nodes against a baseline of {baseline}",
