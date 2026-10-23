@@ -135,8 +135,8 @@ impl Foreground {
 
     fn kill(&mut self) {
         let mut child = self.child.take().expect("the mount is still running");
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill().expect("the mount is killed");
+        child.wait().expect("the killed mount exits");
     }
 }
 
@@ -145,11 +145,18 @@ impl Drop for Foreground {
     /// mountpoint breaks every later run.
     fn drop(&mut self) {
         if let Some(child) = self.child.as_mut() {
-            let _ = child.kill();
-            let _ = child.wait();
+            let ended = child.kill().and_then(|()| child.wait());
+            if let Err(error) = ended {
+                eprintln!("the mount process is not ended: {error}");
+            }
         }
-        if probe(&self.mountpoint) != Mountpoint::Unmounted {
-            let _ = fuse_client().arg("umount").arg(&self.mountpoint).status();
+        if probe(&self.mountpoint) != Mountpoint::Unmounted
+            && let Err(error) = fuse_client().arg("umount").arg(&self.mountpoint).status()
+        {
+            eprintln!(
+                "the mount at {} is not taken down: {error}",
+                self.mountpoint.display()
+            );
         }
     }
 }
@@ -213,8 +220,10 @@ struct KilledOnDrop(Child);
 
 impl Drop for KilledOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        let ended = self.0.kill().and_then(|()| self.0.wait());
+        if let Err(error) = ended {
+            eprintln!("the child process is not ended: {error}");
+        }
     }
 }
 
@@ -318,7 +327,7 @@ fn a_signalled_mount_unmounts_itself_while_its_server_is_gone() {
     );
     ground.server.kill();
     // Wait out the window, so the mount is degraded.
-    let _ = fs::metadata(guest.mountpoint().join("tree/never-seen"));
+    let _fails_once_the_window_ends = fs::metadata(guest.mountpoint().join("tree/never-seen"));
     std::thread::sleep(STALL);
     let (clean, took) = guest.signal(Signal::TERM);
     assert!(
@@ -846,7 +855,7 @@ fn hold_a_file_of_its_own_mount(url: &str, mountpoint: &Path) {
     let mut read = [0; 5];
     held.read_exact_at(&mut read, 0).expect("the file reads");
     println!("{HOLDING}");
-    let _ = std::io::stdin().read_line(&mut String::new());
+    let _test_moved_on = std::io::stdin().read_line(&mut String::new());
 }
 
 /// The request is the truncate of an open, which a relay delays on its way to
@@ -878,7 +887,7 @@ fn a_killed_client_waiting_for_a_request_it_read_exits_and_leaves_no_page_behind
 
 fn truncate_a_file_of_its_own_mount(url: &str, mountpoint: &Path) {
     let _mount = mount_in_this_process(url, mountpoint, 2);
-    let _ = fs::OpenOptions::new()
+    let _never_answered = fs::OpenOptions::new()
         .write(true)
         .truncate(true)
         .open(mountpoint.join("tree/beta"));
@@ -1031,7 +1040,7 @@ fn start_a_server_and_a_mount() {
     println!("server {}", server.as_raw_nonzero());
     println!("detacher {}", detacher.as_raw_nonzero());
     println!("mountpoint {}", guest.root().display());
-    let _ = std::io::stdin().read_line(&mut String::new());
+    let _test_moved_on = std::io::stdin().read_line(&mut String::new());
 }
 
 #[test]

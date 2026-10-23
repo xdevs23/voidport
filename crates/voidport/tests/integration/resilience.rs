@@ -312,7 +312,7 @@ fn a_wedged_peer_does_not_hold_the_mount_past_the_deadline() {
     let killed = Instant::now();
     ground.server.kill();
     let socket = ground.socket();
-    let _ = fs::remove_file(&socket);
+    fs::remove_file(&socket).expect("the killed server left its socket file behind");
     let listener = UnixListener::bind(&socket).expect("the socket path is free");
     let wedged = Arc::new(AtomicBool::new(false));
     let accepted = Arc::clone(&wedged);
