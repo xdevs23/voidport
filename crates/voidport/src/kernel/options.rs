@@ -89,9 +89,10 @@ impl KernelMountOptions {
         })
         .to_vec();
         if !options.privileged_bits {
-            given.push(Given::Flag(
-                option_name(MountOption::NoPrivilegedBits).into_owned(),
-            ));
+            given.push(Given::flag(MountOption::NoPrivilegedBits));
+        }
+        if options.direct_io {
+            given.push(Given::flag(MountOption::DirectIo));
         }
         Self {
             flags: GenericFlags {
@@ -139,6 +140,10 @@ pub(super) enum Given {
 }
 
 impl Given {
+    fn flag(option: MountOption) -> Self {
+        Self::Flag(option_name(option).into_owned())
+    }
+
     pub(super) fn name(&self) -> &str {
         match self {
             Self::Flag(name) | Self::Value { name, .. } => name,

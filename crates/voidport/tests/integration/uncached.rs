@@ -11,7 +11,7 @@ use support::relay::Relay;
 use voidport::mount::MountOptions;
 use voidport_proto::opcode::Opcode;
 
-const PAGE: usize = 4096;
+use crate::page_cache::{PAGE, page_at_zero};
 
 fn options() -> MountOptions {
     MountOptions {
@@ -32,14 +32,6 @@ fn rewrite(path: &Path, byte: u8) {
     file.write_all_at(&vec![byte; PAGE], 0)
         .expect("the host file is rewritten");
     file.sync_all().expect("the host file is flushed");
-}
-
-/// Reads from an already-open descriptor with `pread`: reopening the path would
-/// issue a `lookup` and a fresh `open`.
-fn page_at_zero(file: &fs::File) -> Vec<u8> {
-    let mut page = vec![0u8; PAGE];
-    file.read_exact_at(&mut page, 0).expect("the page reads");
-    page
 }
 
 #[test]

@@ -116,8 +116,8 @@ It needs `/dev/fuse` and runs in the foreground until the mount ends.
 `SIGINT` and `SIGTERM` unmount. Options: `--read-only`, `--allow-other`,
 `--attr-timeout` and `--entry-timeout` (seconds, default 1),
 `--dispatch-threads`, `--reconnect-stall` (seconds, default 5),
-`--no-auto-unmount` and `--no-privileged-bits`. Started with `NOTIFY_SOCKET`
-set, it sends `READY=1` once the mount is up.
+`--no-auto-unmount`, `--no-privileged-bits` and `--direct-io`. Started with
+`NOTIFY_SOCKET` set, it sends `READY=1` once the mount is up.
 
 ### Kernel module
 
@@ -140,8 +140,8 @@ voidport://build-host:9000/@project/src /mnt/src voidport _netdev 0 0
 ```
 
 The generic mount options work, and the module takes `attr_timeout`,
-`entry_timeout`, `reconnect_stall` and `no_privileged_bits`. Busybox mount
-does not pass the generic options, such as `ro`, to the helper.
+`entry_timeout`, `reconnect_stall`, `no_privileged_bits` and `direct_io`.
+Busybox mount does not pass the generic options, such as `ro`, to the helper.
 
 A virtual machine can also connect to the server through a virtio device.
 Add a vhost-user listener, start the keeper before QEMU, and give QEMU the
