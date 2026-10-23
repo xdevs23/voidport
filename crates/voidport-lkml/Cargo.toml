@@ -4,6 +4,7 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 repository.workspace = true
+autotests = false
 
 [lints]
 workspace = true
@@ -36,3 +37,7 @@ voidport-fuse.workspace = true
 clap.workspace = true
 clap_mangen.workspace = true
 voidport-lkml-cli.workspace = true
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"

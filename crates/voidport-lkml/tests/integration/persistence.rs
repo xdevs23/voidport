@@ -1,9 +1,5 @@
-#![forbid(unsafe_code)]
-#[path = "support/corpus.rs"]
-mod corpus;
-mod faulty_filesystem;
-use corpus::*;
-use faulty_filesystem::{FaultyFilesystem, wait_for_held_sync};
+use crate::corpus::*;
+use crate::faulty_filesystem::{FaultyFilesystem, wait_for_held_sync};
 use rustix::process::{
     DumpableBehavior, Resource, Rlimit, getrlimit, set_dumpable_behavior, setrlimit,
 };
@@ -134,7 +130,7 @@ fn failed_publication_keeps_the_previous_generation() {
         } else {
             drop(corpus);
             run_with_write_limit(
-                "failed_publication_keeps_the_previous_generation",
+                "persistence::failed_publication_keeps_the_previous_generation",
                 &path,
                 failure == "write termination",
             );
@@ -244,7 +240,7 @@ fn stop_after_the_rename_keeps_the_new_generation() {
     let previous = corpus.state().generation;
     drop(corpus);
     let arrived = filesystem.hold_next_sync();
-    let mut copy = rerun("stop_after_the_rename_keeps_the_new_generation")
+    let mut copy = rerun("persistence::stop_after_the_rename_keeps_the_new_generation")
         .env("LKML_STOPPED_CORPUS", &filesystem.mountpoint)
         .spawn()
         .unwrap();
@@ -292,7 +288,7 @@ fn failed_raw_store_is_uncommitted_and_retryable() {
         match failure {
             "write error" | "write termination" => {
                 run_with_write_limit(
-                    "failed_raw_store_is_uncommitted_and_retryable",
+                    "persistence::failed_raw_store_is_uncommitted_and_retryable",
                     &path,
                     failure == "write termination",
                 );

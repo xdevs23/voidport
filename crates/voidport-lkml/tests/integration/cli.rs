@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use clap::{CommandFactory, Parser};
 use voidport_lkml::cli::{Cli, Command};
 
