@@ -4,7 +4,6 @@
 //! binary starts it and served on its own thread by the runner the workspace's
 //! suites share; the CLI is the real compiled binary, run as a separate
 //! process. Only the process boundary between them is simulated.
-#![allow(dead_code, reason = "the test file uses part of this")]
 
 use std::fs;
 use std::path::{Path, PathBuf};
