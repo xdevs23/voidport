@@ -558,7 +558,8 @@ pub(crate) unsafe fn register(owner: *mut bindings::module) -> Result {
 /// Must be called once, at unload, after [`register`] succeeded.
 pub(crate) unsafe fn unregister() {
     // SAFETY: `FS_TYPE` was registered by `register` and no mount remains.
-    unsafe {
-        let _ = kernel::error::to_result(bindings::unregister_filesystem(FS_TYPE.0.get()));
+    let unregistered = unsafe { bindings::unregister_filesystem(FS_TYPE.0.get()) };
+    if let Err(error) = kernel::error::to_result(unregistered) {
+        pr_warn!("voidport: the filesystem type was not unregistered: {error:?}\n");
     }
 }
