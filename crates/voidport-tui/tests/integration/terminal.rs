@@ -1,17 +1,13 @@
-#![forbid(unsafe_code)]
-
-#[path = "support/pty.rs"]
-mod pty;
-mod support;
-
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
-use pty::{
-    ACKNOWLEDGEMENT, SCENARIO, SOCKET, STATE_FILE, acknowledge, await_observation, spawn, unique,
+use voidport_pty::{CTRL_Z, ENTER_ALTERNATE, LEAVE_ALTERNATE, Pty, Spawn};
+use voidport_test_support::{RunningServer, daemon_config, scratch_root, test_name};
+
+use crate::support;
+use crate::support::pty::{
+    ACKNOWLEDGEMENT, SCENARIO, SOCKET, STATE_FILE, acknowledge, await_observation, unique,
 };
-use voidport_pty::{CTRL_Z, ENTER_ALTERNATE, LEAVE_ALTERNATE, Pty};
-use voidport_test_support::{RunningServer, daemon_config};
 use voidport_tui::model::{Mode, Model};
 use voidport_tui::terminal::Terminal;
 use voidport_tui::{Options, Presentation};
@@ -138,6 +134,19 @@ fn missing_socket_child() {
         .expect_err("nothing is listening there");
     eprintln!("{REFUSED}: {error}");
     std::process::exit(4);
+}
+
+fn spawn(scenario: &str, environment: &[(&str, &str)]) -> Pty {
+    let program = std::env::current_exe().expect("the test binary");
+    let child_test = test_name!(pty_child);
+    let arguments = ["--exact", child_test.as_str(), "--nocapture"];
+    let mut spawn = Spawn::new(&program, scratch_root())
+        .args(&arguments)
+        .env(SCENARIO, scenario);
+    for (key, value) in environment {
+        spawn = spawn.env(key, value);
+    }
+    Pty::spawn(&spawn)
 }
 
 fn attached(scenario: &str, label: &str) -> (support::TempDir, RunningServer, Pty) {

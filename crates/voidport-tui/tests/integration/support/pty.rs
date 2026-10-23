@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
-use voidport_pty::{Pty, Spawn};
-use voidport_test_support::scratch_root;
+use voidport_pty::Pty;
 
 pub const SCENARIO: &str = "VOIDPORT_TUI_PTY_SCENARIO";
 
@@ -39,8 +38,6 @@ pub fn acknowledge(listener: &std::os::unix::net::UnixListener, pty: &Pty) {
         .expect("the child accepts the acknowledgement");
 }
 
-pub const CHILD_TEST: &str = "pty_child";
-
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
 #[must_use]
@@ -50,18 +47,4 @@ pub fn unique(label: &str) -> String {
         std::process::id(),
         SEQUENCE.fetch_add(1, Ordering::Relaxed)
     )
-}
-
-/// The child runs in [`scratch_root`], which the pty harness requires to
-/// exist.
-#[must_use]
-pub fn spawn(scenario: &str, environment: &[(&str, &str)]) -> Pty {
-    let program = std::env::current_exe().expect("the test binary");
-    let mut spawn = Spawn::new(&program, scratch_root())
-        .args(&["--exact", CHILD_TEST, "--nocapture"])
-        .env(SCENARIO, scenario);
-    for (key, value) in environment {
-        spawn = spawn.env(key, value);
-    }
-    Pty::spawn(&spawn)
 }
