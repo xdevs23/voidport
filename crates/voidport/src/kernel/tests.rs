@@ -295,6 +295,7 @@ fn the_client_options_are_the_modules_own() {
     let options = KernelMountOptions::for_client(&MountOptions {
         attr_timeout: Duration::from_millis(1500),
         privileged_bits: false,
+        direct_io: true,
         read_only: true,
         ..MountOptions::default()
     });
@@ -304,8 +305,16 @@ fn the_client_options_are_the_modules_own() {
             "attr_timeout",
             "entry_timeout",
             "reconnect_stall",
-            "no_privileged_bits"
+            "no_privileged_bits",
+            "direct_io"
         ]
+    );
+    assert!(
+        KernelMountOptions::for_client(&MountOptions::default())
+            .given
+            .iter()
+            .all(|given| matches!(given, Given::Value { .. })),
+        "a flag the options leave off is not passed"
     );
     assert_eq!(
         options.given[0],

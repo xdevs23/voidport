@@ -19,6 +19,8 @@ use voidport::mount::{MountOptions, TeardownError};
 use voidport_spawn::{Program, Stream};
 use voidport_test_support::test_name;
 
+use crate::page_cache::PAGE;
+
 const PATIENCE: Duration = Duration::from_secs(10);
 
 #[test]
@@ -121,29 +123,37 @@ fn file_io_round_trips_through_the_mount() {
 fn an_executable_maps_and_runs_from_the_mount() {
     support::preflight();
     // Executing a binary is an mmap read of it: the kernel demand-pages the file
-    // through the page cache, which works under writethrough caching.
+    // through the page cache, which works under writethrough caching. The
+    // mapping is private, which a mount with `direct_io` also allows.
     let fixture = Fixture::start("mmap-exec");
-    let guest = fixture.mount("mmap", "plain", "/tree");
+    let direct_io = MountOptions {
+        direct_io: true,
+        ..MountOptions::default()
+    };
+    for (label, options) in [
+        ("mmap", MountOptions::default()),
+        ("mmap-direct", direct_io),
+    ] {
+        let guest = fixture.mount_with(label, &fixture.tcp_url("plain", "/tree"), &options);
+        let target = guest.path("voidport-ctl");
+        fs::copy(support::ctl_binary(), &target).expect("the binary copies through the mount");
+        fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("executable");
 
-    let source = support::ctl_binary();
-    let target = guest.path("voidport-ctl");
-    fs::copy(&source, &target).expect("the binary copies through the mount");
-    fs::set_permissions(&target, fs::Permissions::from_mode(0o755)).expect("executable");
-
-    let output = Program::new(&target)
-        .arg("--version")
-        .output()
-        .expect("the binary runs from the mount");
-    assert!(
-        output.status.success(),
-        "{}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&output.stdout).contains("voidport-ctl"),
-        "{:?}",
-        String::from_utf8_lossy(&output.stdout)
-    );
+        let output = Program::new(&target)
+            .arg("--version")
+            .output()
+            .expect("the binary runs from the mount");
+        assert!(
+            output.status.success(),
+            "{label}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains("voidport-ctl"),
+            "{label}: {:?}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
 }
 
 /// This is the mechanism a SQLite WAL depends on: a shared mapping of `-shm`
@@ -152,7 +162,6 @@ fn an_executable_maps_and_runs_from_the_mount() {
 #[test]
 fn a_shared_mapping_of_a_written_file_reads_and_writes() {
     support::preflight();
-    const PAGE: usize = 4096;
     let fixture = Fixture::start("mmap-shared");
     let guest = fixture.mount("mmap", "plain", "/tree");
 

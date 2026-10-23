@@ -55,6 +55,7 @@ fn run(arguments: Cli, matches: &ArgMatches) -> Result<()> {
             reconnect_stall,
             no_auto_unmount,
             no_privileged_bits,
+            direct_io,
         } => {
             let parsed = MountUrl::parse(&url).with_context(|| format!("cannot mount {url}"))?;
             let options = MountOptions {
@@ -66,6 +67,7 @@ fn run(arguments: Cli, matches: &ArgMatches) -> Result<()> {
                 reconnect_stall: seconds(reconnect_stall)?,
                 auto_unmount: !no_auto_unmount,
                 privileged_bits: !no_privileged_bits,
+                direct_io,
             };
             // The module dials only TCP and unix sockets, and a process that
             // may not mount gets its mount from the FUSE client.

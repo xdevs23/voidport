@@ -65,11 +65,38 @@ fn fopen_flags(pages: Pages) -> FopenFlags {
     }
 }
 
+/// How the guest kernel reads and writes the data of a file.
 #[derive(Clone, Copy, Debug)]
-struct Presentation {
-    attr_ttl: Duration,
-    entry_ttl: Duration,
-    privileged: Privileged,
+pub(crate) enum FileIo {
+    /// Through the page cache whenever the server allows it for the open.
+    AsServed,
+    /// Past the page cache for every open.
+    Direct,
+}
+
+impl FileIo {
+    pub(crate) fn of(direct: bool) -> Self {
+        if direct { Self::Direct } else { Self::AsServed }
+    }
+
+    /// `Direct` adds `FOPEN_DIRECT_IO` to the flags for what the server
+    /// returns. The flags of a leased file still contain `FOPEN_KEEP_CACHE`,
+    /// since without it every open drops the pages that private mappings of
+    /// the file use, such as those of a program that runs from it.
+    #[must_use]
+    fn open_flags(self, pages: Pages) -> FopenFlags {
+        match self {
+            Self::AsServed => fopen_flags(pages),
+            Self::Direct => fopen_flags(pages) | FopenFlags::DIRECT_IO,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct Presentation {
+    pub(crate) attr_ttl: Duration,
+    pub(crate) entry_ttl: Duration,
+    pub(crate) privileged: Privileged,
 }
 
 impl Presentation {
@@ -101,29 +128,26 @@ pub struct VoidportFs {
     client: Arc<Client>,
     runtime: tokio::runtime::Handle,
     present: Presentation,
+    file_io: FileIo,
     inflight: Arc<InFlight>,
     pages: Arc<PageCache>,
 }
 
 impl VoidportFs {
     #[must_use]
-    pub fn new(
+    pub(crate) fn new(
         client: Arc<Client>,
         runtime: tokio::runtime::Handle,
-        attr_ttl: Duration,
-        entry_ttl: Duration,
-        privileged: Privileged,
+        present: Presentation,
+        file_io: FileIo,
         inflight: Arc<InFlight>,
         feed: Arc<Feed>,
     ) -> Self {
         Self {
             client,
             runtime,
-            present: Presentation {
-                attr_ttl,
-                entry_ttl,
-                privileged,
-            },
+            present,
+            file_io,
             inflight,
             pages: Arc::new(PageCache::new(feed)),
         }
@@ -166,6 +190,7 @@ impl VoidportFs {
         EntryReply {
             pages: self.pages(),
             present: self.present,
+            file_io: self.file_io,
         }
     }
 
@@ -411,13 +436,13 @@ impl VoidportFs {
     /// nothing here filters it out. Interpreting flags on this side would put
     /// the decision in two places.
     fn open(&self, request: Request, open: Open, reply: ReplyOpen) {
-        let (client, caller) = (self.client(), caller_of(request));
+        let (client, caller, file_io) = (self.client(), caller_of(request), self.file_io);
         self.spawn_interruptible(request, |interrupt| async move {
             match client
                 .open_file(caller, &interrupt, open.node, open.flags.bits())
                 .await
             {
-                Ok((handle, pages)) => reply.opened(handle, fopen_flags(pages)),
+                Ok((handle, pages)) => reply.opened(handle, file_io.open_flags(pages)),
                 Err(error) => reply.error(error),
             }
         });
@@ -911,6 +936,7 @@ async fn serial_write(
 struct EntryReply {
     pages: Arc<PageCache>,
     present: Presentation,
+    file_io: FileIo,
 }
 
 impl EntryReply {
@@ -928,7 +954,8 @@ impl EntryReply {
     ) {
         match created {
             Ok((entry, handle, pages)) => {
-                reply.created(&self.counted(&entry), handle, fopen_flags(pages));
+                let flags = self.file_io.open_flags(pages);
+                reply.created(&self.counted(&entry), handle, flags);
             }
             Err(error) => reply.error(error),
         }
@@ -1058,6 +1085,17 @@ impl DirectorySink for PlainSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_direct_io_mount_opens_every_file_past_the_page_cache() {
+        for (pages, flags) in [
+            (Pages::Kept, FopenFlags::DIRECT_IO | FopenFlags::KEEP_CACHE),
+            (Pages::UntilClose, FopenFlags::DIRECT_IO),
+            (Pages::Uncached, FopenFlags::DIRECT_IO),
+        ] {
+            assert_eq!(FileIo::Direct.open_flags(pages), flags, "{pages:?}");
+        }
+    }
 
     #[test]
     fn the_terminal_ioctls_are_told_apart_from_the_others() {

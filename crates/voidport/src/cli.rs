@@ -87,6 +87,17 @@ pub enum Command {
         /// a chmod through this mount cannot clear them.
         #[arg(long)]
         no_privileged_bits: bool,
+        /// Read and write file data past the page cache of this guest, so
+        /// guests that read the same host file no longer each have a copy of
+        /// it. Reads and writes go to the server, which costs re-read
+        /// throughput. Attributes and names are cached as without it. Only a
+        /// mapping of a file still uses the page cache. A mount over FUSE
+        /// fails a shared mapping of any file on the mount with ENODEV, and
+        /// each new mapping of a file drops the cached pages of that file for
+        /// every process. A private mapping, such as that of a program or a
+        /// library, works on both kinds of mount.
+        #[arg(long)]
+        direct_io: bool,
     },
     /// Unmount a voidport mountpoint, made through the kernel module or over
     /// FUSE. A busy mountpoint remains mounted.

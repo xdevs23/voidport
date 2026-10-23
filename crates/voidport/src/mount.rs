@@ -53,8 +53,9 @@ use voidport_fuse::{Fusermount, Session, StartError};
 pub use self::connection::{AbortError, AbortHandle};
 use self::connection::{KernelConnection, report_unended};
 use crate::client::{Caller, Client, ConnectError, DEFAULT_RECONNECT_STALL, Resilience};
+use crate::fuse::attr::Privileged;
 use crate::fuse::pages::{Lapse, PageCache, answer_recalls, relinquish, renew_window};
-use crate::fuse::{InFlight, VoidportFs};
+use crate::fuse::{FileIo, InFlight, Presentation, VoidportFs};
 use crate::guardian::{
     Guardian, GuardianError, Launch, Serving, SessionError, Unserved, Unstarted,
 };
@@ -99,6 +100,9 @@ pub struct MountOptions {
     /// stored on the server back unchanged, so mounts that show them are
     /// unaffected.
     pub privileged_bits: bool,
+    /// When set, reads and writes through this mount go past the page cache of
+    /// the guest, which only mappings of a file use.
+    pub direct_io: bool,
 }
 
 impl Default for MountOptions {
@@ -112,6 +116,7 @@ impl Default for MountOptions {
             reconnect_stall: DEFAULT_RECONNECT_STALL,
             auto_unmount: true,
             privileged_bits: true,
+            direct_io: false,
         }
     }
 }
@@ -196,9 +201,12 @@ impl Mount {
         let filesystem = VoidportFs::new(
             Arc::clone(&client),
             runtime.handle().clone(),
-            options.attr_timeout,
-            options.entry_timeout,
-            crate::fuse::attr::Privileged::of(!options.privileged_bits),
+            Presentation {
+                attr_ttl: options.attr_timeout,
+                entry_ttl: options.entry_timeout,
+                privileged: Privileged::of(!options.privileged_bits),
+            },
+            FileIo::of(options.direct_io),
             Arc::clone(&inflight),
             Arc::clone(&feed.feed),
         );

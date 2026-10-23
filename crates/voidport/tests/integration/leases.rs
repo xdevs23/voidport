@@ -13,46 +13,16 @@ use std::os::unix::process::ExitStatusExt as _;
 use std::path::Path;
 use std::sync::mpsc;
 use std::thread;
-use std::time::Duration;
 
 use support::mapping::SharedMapping;
 use support::relay::{Cut, Latch, Relay};
 use support::signal;
 use support::{Fixture, Guest};
-use voidport::mount::MountOptions;
 use voidport_proto::opcode::Opcode;
 use voidport_spawn::{Program, Stream};
 use voidport_test_support::test_name;
-use voidportd::host::lease;
 
-const PAGE: usize = 4096;
-
-fn grants_leases(directory: &Path) -> bool {
-    let probe = directory.join("lease-probe");
-    fs::write(&probe, b"probe").expect("writable");
-    let file = File::open(&probe).expect("readable");
-    let granted = lease::take(file.as_fd(), lease::Kind::Read).is_ok();
-    if granted {
-        lease::give_up(file.as_fd());
-    }
-    drop(file);
-    fs::remove_file(&probe).expect("removable");
-    granted
-}
-
-fn page_at_zero(file: &File) -> Vec<u8> {
-    let mut page = vec![0u8; PAGE];
-    file.read_exact_at(&mut page, 0).expect("the page reads");
-    page
-}
-
-fn cached_for_an_hour() -> MountOptions {
-    MountOptions {
-        attr_timeout: Duration::from_secs(3600),
-        entry_timeout: Duration::from_secs(3600),
-        ..MountOptions::default()
-    }
-}
+use crate::page_cache::{PAGE, cached_for_an_hour, page_at_zero, require_leases};
 
 /// Sets the modification time back, so the change shows in no attribute the
 /// guest could notice it by.
@@ -78,10 +48,7 @@ fn a_leased_file_is_read_from_guest_memory_until_a_host_writer_recalls_it() {
     let fixture = Fixture::start("lease-kept");
     let host = fixture.host("tree/kept.bin");
     fs::write(&host, vec![b'a'; PAGE]).expect("the host file is created");
-    assert!(
-        grants_leases(&fixture.host("tree")),
-        "the filesystem of the fixture grants a lease"
-    );
+    require_leases(&fixture);
 
     let relay = Relay::start(fixture.server.data_unix());
     let guest = fixture.mount_with("kept", &relay.url("plain", "/tree"), &cached_for_an_hour());
@@ -114,10 +81,7 @@ fn a_recall_drops_the_pages_a_guest_has_mapped() {
     let fixture = Fixture::start("lease-mapped");
     let host = fixture.host("tree/mapped.bin");
     fs::write(&host, vec![b'a'; PAGE]).expect("the host file is created");
-    assert!(
-        grants_leases(&fixture.host("tree")),
-        "the filesystem of the fixture grants a lease"
-    );
+    require_leases(&fixture);
     let guest = fixture.mount_with(
         "mapped",
         &fixture.unix_url("plain", "/tree"),
@@ -214,10 +178,7 @@ fn an_unmount_gives_the_lease_of_a_cached_file_up_before_it_returns() {
     let fixture = Fixture::start("lease-unmounted");
     let host = fixture.host("tree/unmounted.bin");
     fs::write(&host, vec![b'a'; PAGE]).expect("the host file is created");
-    assert!(
-        grants_leases(&fixture.host("tree")),
-        "the filesystem of the fixture grants a lease"
-    );
+    require_leases(&fixture);
     let relay = Relay::start(fixture.server.data_unix());
     let mut guest = fixture.mount_with(
         "unmounted",
@@ -250,10 +211,7 @@ fn a_mount_whose_guardian_is_killed_gives_its_leases_up() {
     let fixture = Fixture::start("lease-guardian");
     let host = fixture.host("tree/guarded.bin");
     fs::write(&host, vec![b'a'; PAGE]).expect("the host file is created");
-    assert!(
-        grants_leases(&fixture.host("tree")),
-        "the filesystem of the fixture grants a lease"
-    );
+    require_leases(&fixture);
     let relay = Relay::start(fixture.server.data_unix());
     let guest = fixture.mount_with(
         "guarded",
@@ -305,10 +263,7 @@ fn a_handle_beside_a_writer_reads_what_a_host_writer_wrote() {
     let fixture = Fixture::start("lease-written");
     let host = fixture.host("tree/written.bin");
     fs::write(&host, vec![b'a'; PAGE]).expect("the host file is created");
-    assert!(
-        grants_leases(&fixture.host("tree")),
-        "the filesystem of the fixture grants a lease"
-    );
+    require_leases(&fixture);
     let guest = fixture.mount_with(
         "written",
         &fixture.unix_url("plain", "/tree"),
@@ -341,10 +296,7 @@ fn a_write_waiting_for_a_host_reader_ends_with_eintr_on_a_signal_and_writes_noth
     let fixture = Fixture::start("lease-cancelled-write");
     let host = fixture.host("tree/held.bin");
     fs::write(&host, vec![b'a'; PAGE]).expect("the host file is created");
-    assert!(
-        grants_leases(&fixture.host("tree")),
-        "the filesystem of the fixture grants a lease"
-    );
+    require_leases(&fixture);
     let relay = Relay::start(fixture.server.data_unix());
     let guest = fixture.mount_with("held", &relay.url("plain", "/tree"), &cached_for_an_hour());
     let file = OpenOptions::new()
@@ -431,10 +383,7 @@ impl ReadBehindHostWriter {
         let fixture = Fixture::start(label);
         let host = fixture.host("tree/held.bin");
         fs::write(&host, vec![b'a'; PAGE]).expect("the host file is created");
-        assert!(
-            grants_leases(&fixture.host("tree")),
-            "the filesystem of the fixture grants a lease"
-        );
+        require_leases(&fixture);
         let relay = Relay::start(fixture.server.data_unix());
         let guest = fixture.mount_with("held", &relay.url("plain", "/tree"), &cached_for_an_hour());
         let held = File::open(guest.path("held.bin")).expect("readable");
