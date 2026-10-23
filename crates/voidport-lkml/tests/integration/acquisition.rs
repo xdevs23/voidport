@@ -1,27 +1,13 @@
-#![forbid(unsafe_code)]
-#[path = "cases/cancellation.rs"]
 mod cancellation;
-#[path = "cases/cleanup.rs"]
 mod cleanup;
-#[path = "support/collector.rs"]
-mod collector;
-#[path = "support/corpus.rs"]
-mod corpus;
-#[path = "cases/daemon_pid.rs"]
 mod daemon_pid;
-#[path = "cases/directory_sync.rs"]
 mod directory_sync;
-mod faulty_filesystem;
-#[path = "cases/ingestion.rs"]
 mod ingestion;
-#[path = "cases/inventory.rs"]
 mod inventory;
-#[path = "cases/publication_writes.rs"]
 mod publication_writes;
-#[path = "cases/status.rs"]
 mod status;
-use collector::*;
-use corpus::*;
+use crate::collector::*;
+use crate::corpus::*;
 use serde::Serialize;
 use std::{collections::BTreeMap, fs, os::fd::AsFd as _, path::Path};
 use voidport_lkml::{
@@ -355,7 +341,7 @@ fn large_tmp_is_not_read_or_ingested() {
         let status = Program::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "large_tmp_is_not_read_or_ingested",
+                "acquisition::large_tmp_is_not_read_or_ingested",
                 "--nocapture",
             ])
             .env("LKML_LIMIT_TMP_READ", "1")

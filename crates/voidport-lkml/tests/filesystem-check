@@ -9,6 +9,9 @@ import sys
 import tempfile
 
 
+SUITES = ["persistence::", "acquisition::"]
+
+
 def run(arguments, **kwargs):
     print(json.dumps({"command": [str(arg) for arg in arguments]}), flush=True)
     return subprocess.run(arguments, check=True, **kwargs)
@@ -33,8 +36,7 @@ def cleanup(mount, device, mounted):
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--persistence-test", type=Path, required=True)
-    parser.add_argument("--acquisition-test", type=Path, required=True)
+    parser.add_argument("--test-binary", type=Path, required=True)
     parser.add_argument("--inside-private-namespace", action="store_true", help=argparse.SUPPRESS)
     args = parser.parse_args()
     try:
@@ -43,14 +45,13 @@ def main():
     except OSError as error:
         print(f"NOT-PROVEN: collector filesystem persistence requires loop mounts: {error}")
         return 1
-    binaries = [args.persistence_test.resolve(), args.acquisition_test.resolve()]
-    for binary in binaries:
-        if not binary.is_file():
-            parser.error(f"missing compiled integration test: {binary}")
+    binary = args.test_binary.resolve()
+    if not binary.is_file():
+        parser.error(f"missing compiled integration test: {binary}")
     if not args.inside_private_namespace:
         return run(["unshare", "--mount", "--propagation", "private", sys.executable,
                     str(Path(__file__).resolve()), "--inside-private-namespace",
-                    "--persistence-test", str(binaries[0]), "--acquisition-test", str(binaries[1])]).returncode
+                    "--test-binary", str(binary)]).returncode
     cache = Path.home() / ".cache/voidport-lkml-filesystems"
     cache.mkdir(parents=True, exist_ok=True)
     with tempfile.TemporaryDirectory(prefix="proof-", dir=cache) as scratch:
@@ -68,8 +69,7 @@ def main():
                 run(["mount", "-t", filesystem, device, str(mount)])
                 mounted = True
                 environment = dict(os.environ, VOIDPORT_LKML_TEST_ROOT=str(mount))
-                for binary in binaries:
-                    run([str(binary), "--nocapture", "--include-ignored"], env=environment)
+                run([str(binary), *SUITES, "--nocapture", "--include-ignored"], env=environment)
                 print(f"PROVEN: collector assertions on {filesystem}", flush=True)
             finally:
                 cleanup(mount, device, mounted)

@@ -1,4 +1,3 @@
-#![forbid(unsafe_code)]
 use std::collections::BTreeMap;
 use voidport_lkml::{
     mail::{self, Basis, Class},
