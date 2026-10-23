@@ -1,17 +1,15 @@
 #![forbid(unsafe_code)]
 
-mod frontend;
-
 use voidport_test_server as support;
 
 use std::fs::{self, File};
+use std::os::fd::AsFd as _;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
-use std::os::fd::AsFd as _;
 use std::process::Child;
 use std::thread::JoinHandle;
 
-use frontend::{
+use crate::frontend::{
     Device, EVENT_INDEX, FEATURES, INDIRECT, REPLY_LEN, Wait, body, frame, frame_chain,
     guest_memory, hello, lock, open, state_with_vhost_user,
 };
