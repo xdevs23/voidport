@@ -34,11 +34,15 @@ use zerocopy::byteorder::little_endian::{U32, U64};
 use voidport_proto::message::ResponseBody;
 use voidport_proto::opcode::Opcode;
 use voidport_session::Window;
+use voidport_session::interrupt;
 use voidport_session::replay::OpenFlags;
 
 use super::connection::{Answer, Connection, Entries, Forget, Nothing};
+use super::exchange::Reply;
+use super::pool::Counted;
 use super::{
-    Caller, Client, Data, Entry, EntrySink, Interrupt, Outgoing, Pages, errno_of, interpret,
+    Caller, Client, Data, Entry, EntrySink, Interrupted, Origin, Outgoing, Pages, errno_of,
+    interpret,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -265,13 +269,25 @@ fn open_flags(flags: u32) -> OpenFlags {
 }
 
 impl Client {
-    pub async fn lookup(&self, caller: Caller, parent: u64, name: &[u8]) -> Result<Entry, Errno> {
+    /// The interrupt of `origin` ends a lookup at once, and the lookup that a
+    /// later reply counts is forgotten.
+    pub async fn lookup(
+        &self,
+        origin: Origin<'_>,
+        parent: u64,
+        name: &[u8],
+    ) -> Result<Entry, Errno> {
         let body = LookupRequest {
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, LookupResponse, _>(caller, parent, &body, name, |body, _| {
-            Ok(Entry::of(&body.entry))
-        })
+        self.call::<_, LookupResponse, _>(
+            origin,
+            parent,
+            &body,
+            name,
+            |body, _| Ok(Entry::of(&body.entry)),
+            Counted::lookup,
+        )
         .await
     }
 
@@ -300,9 +316,16 @@ impl Client {
         self.forget_within(generation, &[forget]).await;
     }
 
+    /// One lookup of each node, sent as [`Self::forget_on`] sends it.
+    pub async fn forget_each_on(&self, caller: Caller, generation: u64, nodes: &[u64]) {
+        if let Some(pool) = self.serving(generation) {
+            pool.forget_each(caller, nodes).await;
+        }
+    }
+
     pub async fn getattr(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         node_id: u64,
         handle: Option<u64>,
     ) -> Result<Attr, Errno> {
@@ -315,20 +338,26 @@ impl Client {
             }),
             reserved: U32::ZERO,
         };
-        self.call::<_, GetattrResponse, _>(caller, node_id, &body, &[], |body, _| Ok(body.attr))
-            .await
+        self.call::<_, GetattrResponse, _>(
+            origin,
+            node_id,
+            &body,
+            &[],
+            |body, _| Ok(body.attr),
+            Counted::nothing,
+        )
+        .await
     }
 
-    /// `interrupt` ends a change that waits in the server, a truncate of a file
-    /// that another opener has open.
+    /// The interrupt of `origin` ends a change that waits in the server, a
+    /// truncate of a file that another opener has open.
     ///
     /// # Errors
     ///
     /// `EINTR` for a change ended by the interrupt.
     pub async fn setattr(
         &self,
-        caller: Caller,
-        interrupt: &Interrupt,
+        origin: Origin<'_>,
         node_id: u64,
         change: AttrChange,
     ) -> Result<Attr, Errno> {
@@ -376,31 +405,32 @@ impl Client {
             mtime: instant(change.mtime),
             ctime: change.ctime.unwrap_or_else(|| Timespec::new(0, 0)),
         };
-        self.call_interruptible::<_, SetattrResponse, _>(
-            caller,
-            interrupt,
+        self.call::<_, SetattrResponse, _>(
+            origin,
             node_id,
             &body,
             &[],
             |body, _| Ok(body.attr),
+            Counted::nothing,
         )
         .await
     }
 
-    pub async fn readlink(&self, caller: Caller, node_id: u64) -> Result<Vec<u8>, Errno> {
+    pub async fn readlink(&self, origin: Origin<'_>, node_id: u64) -> Result<Vec<u8>, Errno> {
         self.call::<_, ReadlinkResponse, _>(
-            caller,
+            origin,
             node_id,
             &ReadlinkRequest {},
             &[],
             |_, payload| Ok(payload.to_vec()),
+            Counted::nothing,
         )
         .await
     }
 
     pub async fn symlink(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         parent: u64,
         name: &[u8],
         target: &[u8],
@@ -411,15 +441,20 @@ impl Client {
         };
         let mut payload = name.to_vec();
         payload.extend_from_slice(target);
-        self.call::<_, SymlinkResponse, _>(caller, parent, &body, &payload, |body, _| {
-            Ok(Entry::of(&body.entry))
-        })
+        self.call::<_, SymlinkResponse, _>(
+            origin,
+            parent,
+            &body,
+            &payload,
+            |body, _| Ok(Entry::of(&body.entry)),
+            Counted::lookup,
+        )
         .await
     }
 
     pub async fn mkdir(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         parent: u64,
         name: &[u8],
         mode: u32,
@@ -431,9 +466,14 @@ impl Client {
             name_len: U32::new(length(name)?),
             reserved: U32::ZERO,
         };
-        self.call::<_, MkdirResponse, _>(caller, parent, &body, name, |body, _| {
-            Ok(Entry::of(&body.entry))
-        })
+        self.call::<_, MkdirResponse, _>(
+            origin,
+            parent,
+            &body,
+            name,
+            |body, _| Ok(Entry::of(&body.entry)),
+            Counted::lookup,
+        )
         .await
     }
 
@@ -441,7 +481,7 @@ impl Client {
     /// and a socket file and returns `EPERM` for anything else.
     pub async fn mknod(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         parent: u64,
         name: &[u8],
         mode: u32,
@@ -454,31 +494,50 @@ impl Client {
             rdev: U32::new(rdev),
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, MknodResponse, _>(caller, parent, &body, name, |body, _| {
-            Ok(Entry::of(&body.entry))
-        })
+        self.call::<_, MknodResponse, _>(
+            origin,
+            parent,
+            &body,
+            name,
+            |body, _| Ok(Entry::of(&body.entry)),
+            Counted::lookup,
+        )
         .await
     }
 
-    pub async fn unlink(&self, caller: Caller, parent: u64, name: &[u8]) -> Result<(), Errno> {
+    pub async fn unlink(&self, origin: Origin<'_>, parent: u64, name: &[u8]) -> Result<(), Errno> {
         let body = UnlinkRequest {
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, UnlinkResponse, _>(caller, parent, &body, name, |_, _| Ok(()))
-            .await
+        self.call::<_, UnlinkResponse, _>(
+            origin,
+            parent,
+            &body,
+            name,
+            |_, _| Ok(()),
+            Counted::nothing,
+        )
+        .await
     }
 
-    pub async fn rmdir(&self, caller: Caller, parent: u64, name: &[u8]) -> Result<(), Errno> {
+    pub async fn rmdir(&self, origin: Origin<'_>, parent: u64, name: &[u8]) -> Result<(), Errno> {
         let body = RmdirRequest {
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, RmdirResponse, _>(caller, parent, &body, name, |_, _| Ok(()))
-            .await
+        self.call::<_, RmdirResponse, _>(
+            origin,
+            parent,
+            &body,
+            name,
+            |_, _| Ok(()),
+            Counted::nothing,
+        )
+        .await
     }
 
     pub async fn rename(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         parent: u64,
         name: &[u8],
         new_parent: u64,
@@ -494,13 +553,20 @@ impl Client {
         };
         let mut payload = name.to_vec();
         payload.extend_from_slice(new_name);
-        self.call::<_, RenameResponse, _>(caller, parent, &body, &payload, |_, _| Ok(()))
-            .await
+        self.call::<_, RenameResponse, _>(
+            origin,
+            parent,
+            &body,
+            &payload,
+            |_, _| Ok(()),
+            Counted::nothing,
+        )
+        .await
     }
 
     pub async fn link(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         target: u64,
         parent: u64,
         name: &[u8],
@@ -510,19 +576,32 @@ impl Client {
             name_len: U32::new(length(name)?),
             reserved: U32::ZERO,
         };
-        self.call::<_, LinkResponse, _>(caller, parent, &body, name, |body, _| {
-            Ok(Entry::of(&body.entry))
-        })
+        self.call::<_, LinkResponse, _>(
+            origin,
+            parent,
+            &body,
+            name,
+            |body, _| Ok(Entry::of(&body.entry)),
+            Counted::lookup,
+        )
         .await
     }
 
-    pub async fn open(&self, caller: Caller, node_id: u64, flags: u32) -> Result<u64, Errno> {
-        self.open_file(caller, &Interrupt::none(), node_id, flags)
+    /// For a node whose page-cache flags the caller does not need, as a
+    /// directory has none.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::open_file`].
+    pub async fn open(&self, origin: Origin<'_>, node_id: u64, flags: u32) -> Result<u64, Errno> {
+        self.open_file(origin, node_id, flags)
             .await
             .map(|(handle, _)| handle)
     }
 
-    /// `interrupt` ends an open that waits in the server for another opener of
+    /// The interrupt of `origin` ends an open at once, and the handle that a
+    /// later reply opens is released. It ends an open that creates or
+    /// truncates only while the open waits in the server for another opener of
     /// the file.
     ///
     /// # Errors
@@ -530,8 +609,7 @@ impl Client {
     /// `EINTR` for an open ended by the interrupt.
     pub async fn open_file(
         &self,
-        caller: Caller,
-        interrupt: &Interrupt,
+        origin: Origin<'_>,
         node_id: u64,
         flags: u32,
     ) -> Result<(u64, Pages), Errno> {
@@ -547,23 +625,28 @@ impl Client {
             payload: &[],
             data: &[],
         };
-        self.call_on::<_, OpenResponse, _>(caller, interrupt, &request, |body, _| {
-            Ok((body.handle.get(), Pages::of(body.flags.get())))
-        })
+        self.call_on::<_, OpenResponse, _>(
+            origin,
+            &request,
+            |body, _| Ok((body.handle.get(), Pages::of(body.flags.get()))),
+            |&(handle, _)| Counted {
+                lookups: Vec::new(),
+                handle: Some(handle),
+            },
+        )
         .await
         .map(|(opened, _)| opened)
     }
 
-    /// `interrupt` ends a create that waits in the server for another opener of
-    /// the file.
+    /// The interrupt of `origin` ends a create that waits in the server for
+    /// another opener of the file.
     ///
     /// # Errors
     ///
     /// `EINTR` for a create ended by the interrupt.
     pub async fn create(
         &self,
-        caller: Caller,
-        interrupt: &Interrupt,
+        origin: Origin<'_>,
         file: NewFile<'_>,
     ) -> Result<(Entry, u64, Pages), Errno> {
         let body = CreateRequest {
@@ -572,9 +655,8 @@ impl Client {
             umask: U32::new(file.umask),
             name_len: U32::new(length(file.name)?),
         };
-        self.call_interruptible::<_, CreateResponse, _>(
-            caller,
-            interrupt,
+        self.call::<_, CreateResponse, _>(
+            origin,
             file.parent,
             &body,
             file.name,
@@ -585,6 +667,10 @@ impl Client {
                     Pages::of(body.flags.get()),
                 ))
             },
+            |&(entry, handle, _)| Counted {
+                lookups: vec![entry.node_id],
+                handle: Some(handle),
+            },
         )
         .await
     }
@@ -594,22 +680,19 @@ impl Client {
     /// included, and with a waiter dropped undelivered, as a reader dropped by a
     /// runtime shutting down drops it. A read that received pieces before an
     /// errno reports the errno in [`Streamed::failed`], and the bytes stand.
-    /// `interrupt` ends a read that waits in the server for another opener of
-    /// the file.
     ///
     /// # Errors
     ///
-    /// The errno of the server when nothing was read, and `EINTR` for a read
-    /// ended by the interrupt.
+    /// [`Interrupted`] once the interrupt of `origin` ends the read, and `data`
+    /// then goes with the reply that may still come.
     pub async fn read(
         &self,
-        caller: Caller,
-        interrupt: &Interrupt,
+        origin: Origin<'_>,
         node_id: u64,
         handle: u64,
         offset: u64,
         mut data: Data,
-    ) -> (Data, Result<Streamed, Errno>) {
+    ) -> Result<(Data, Result<Streamed, Errno>), Interrupted> {
         data.begin();
         let body = ReadRequest {
             handle: U64::new(handle),
@@ -627,13 +710,14 @@ impl Client {
         // A read changes nothing on the server: it is sent again, and nothing
         // of its reply is kept.
         let (data, answered) = self
-            .exchange(caller, interrupt, Opcode::Read, &request, data, 0)
-            .await;
-        let outcome = answered.and_then(|answered| {
-            let (connection, answer) = answered.ok_or(Errno::IO)?;
-            streamed::<ReadResponse>(&connection, &answer)
+            .exchange(origin, Opcode::Read, &request, data, 0)
+            .await
+            .or_hand_over(|_, _| Ok(Counted::default()))?;
+        let outcome = answered.and_then(|answered| match answered {
+            Reply::Answered(connection, answer) => streamed::<ReadResponse>(&connection, &answer),
+            Reply::Moot => Err(Errno::IO),
         });
-        (data, outcome)
+        Ok((data, outcome))
     }
 
     /// The data follows the request on the socket, written under the same writer
@@ -651,16 +735,15 @@ impl Client {
     /// with the continuation of a short write too, since stripping twice
     /// changes nothing.
     ///
-    /// `interrupt` ends a write that waits in the server for another opener of
-    /// the file, before any of it was written.
+    /// The interrupt of `origin` ends a write that waits in the server for
+    /// another opener of the file, before any of it was written.
     ///
     /// # Errors
     ///
     /// `EINTR` for a write ended by the interrupt.
     pub async fn write(
         &self,
-        caller: Caller,
-        interrupt: &Interrupt,
+        origin: Origin<'_>,
         at: Placement,
         data: &[u8],
         strip_privileged: bool,
@@ -686,15 +769,18 @@ impl Client {
         };
         let (Nothing, answered) = self
             .exchange(
-                caller,
-                interrupt,
+                origin,
                 Opcode::Write,
                 &request,
                 Nothing,
                 super::kept_bound::<WriteResponse>(),
             )
-            .await;
-        let (connection, answer) = answered?.ok_or(Errno::IO)?;
+            .await
+            .or_hand_over(|_, _| Ok(Counted::default()))
+            .map_err(|Interrupted| Errno::INTR)?;
+        let Reply::Answered(connection, answer) = answered? else {
+            return Err(Errno::IO);
+        };
         interpret::<WriteResponse, u32>(&connection, &answer.frame, |body, _| {
             Ok(body.written.get())
         })
@@ -715,19 +801,7 @@ impl Client {
         lock_owner: Option<u64>,
         flush: bool,
     ) -> Result<(), Errno> {
-        let mut release = 0;
-        if flush {
-            release |= release_flags::FLUSH;
-        }
-        if lock_owner.is_some() {
-            release |= release_flags::UNLOCK;
-        }
-        let body = ReleaseRequest {
-            handle: U64::new(handle),
-            lock_owner: U64::new(lock_owner.unwrap_or_default()),
-            flags: U32::new(flags),
-            release_flags: U32::new(release),
-        };
+        let body = release_request(handle, flags, lock_owner, flush);
         self.call_moot::<_, ReleaseResponse>(caller, node_id, &body, &[])
             .await
     }
@@ -776,9 +850,14 @@ impl Client {
             payload: &[],
             data: &[],
         };
-        self.call_on::<_, RenewResponse, _>(caller, &Interrupt::none(), &request, window)
-            .await
-            .map(|(window, generation)| Granted { window, generation })
+        self.call_on::<_, RenewResponse, _>(
+            Origin::detached(caller),
+            &request,
+            window,
+            Counted::nothing,
+        )
+        .await
+        .map(|(window, generation)| Granted { window, generation })
     }
 
     /// # Errors
@@ -798,20 +877,26 @@ impl Client {
         // A mutation, and not on the idempotent list: the server drops the
         // record-lock owner of the caller here, so a written attempt that lost
         // its answer is taken as applied and is not sent again.
-        self.call::<_, FlushResponse, _>(caller, node_id, &body, &[], |_, _| Ok(()))
-            .await
+        self.call::<_, FlushResponse, _>(
+            Origin::detached(caller),
+            node_id,
+            &body,
+            &[],
+            |_, _| Ok(()),
+            Counted::nothing,
+        )
+        .await
     }
 
-    /// `interrupt` ends a sync that waits in the server for another opener of
-    /// the file.
+    /// The interrupt of `origin` ends a sync that waits in the server for
+    /// another opener of the file.
     ///
     /// # Errors
     ///
     /// `EINTR` for a sync ended by the interrupt.
     pub async fn fsync(
         &self,
-        caller: Caller,
-        interrupt: &Interrupt,
+        origin: Origin<'_>,
         node_id: u64,
         handle: u64,
         datasync: bool,
@@ -823,29 +908,36 @@ impl Client {
         };
         // A durability barrier is not re-issued by the client on its own, so a
         // written attempt that lost its answer fails.
-        self.call_interruptible::<_, FsyncResponse, _>(
-            caller,
-            interrupt,
+        self.call::<_, FsyncResponse, _>(
+            origin,
             node_id,
             &body,
             &[],
             |_, _| Ok(()),
+            Counted::nothing,
         )
         .await
     }
 
-    pub async fn statfs(&self, caller: Caller, node_id: u64) -> Result<StatfsResponse, Errno> {
-        self.call::<_, StatfsResponse, _>(caller, node_id, &StatfsRequest {}, &[], |body, _| {
-            Ok(*body)
-        })
+    pub async fn statfs(&self, origin: Origin<'_>, node_id: u64) -> Result<StatfsResponse, Errno> {
+        self.call::<_, StatfsResponse, _>(
+            origin,
+            node_id,
+            &StatfsRequest {},
+            &[],
+            |body, _| Ok(*body),
+            Counted::nothing,
+        )
         .await
     }
 
     /// What the sink took is the caller's to account for, which the kernel does
-    /// for `readdirplus` and nobody does for a plain `readdir`.
+    /// for `readdirplus` and nobody does for a plain `readdir`. The interrupt of
+    /// `origin` ends the listing at once, and every entry of a reply that comes
+    /// later is given back.
     pub async fn readdirplus(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         node_id: u64,
         handle: u64,
         cookie: u64,
@@ -866,18 +958,31 @@ impl Client {
             payload: &[],
             data: &[],
         };
-        let (entries, answered) = self
+        let exchanged = self
             .exchange(
-                caller,
-                &Interrupt::none(),
+                origin,
                 Opcode::Readdirplus,
                 &request,
                 Entries::new(piece),
                 listing_reply_bound(size),
             )
-            .await;
+            .await
+            .or_hand_over(|entries, _| {
+                Ok(Counted {
+                    lookups: entries.lookups(),
+                    handle: None,
+                })
+            });
+        let Ok((entries, answered)) = exchanged else {
+            return Listing {
+                sink,
+                accepted: Vec::new(),
+                generation: None,
+                outcome: Err(Errno::INTR),
+            };
+        };
         let (generation, settled) = match answered {
-            Ok(Some((connection, answer))) => (
+            Ok(Reply::Answered(connection, answer)) => (
                 Some(connection.generation()),
                 settle(
                     sink.as_mut(),
@@ -885,7 +990,7 @@ impl Client {
                     streamed::<ReaddirplusResponse>(&connection, &answer),
                 ),
             ),
-            Ok(None) => (
+            Ok(Reply::Moot) => (
                 None,
                 Settled {
                     give_back: Vec::new(),
@@ -903,9 +1008,8 @@ impl Client {
             ),
         };
         if let Some(generation) = generation {
-            for node_id in settled.give_back {
-                self.forget_on(caller, generation, node_id, 1).await;
-            }
+            self.forget_each_on(origin.caller, generation, &settled.give_back)
+                .await;
         }
         Listing {
             sink,
@@ -917,7 +1021,7 @@ impl Client {
 
     pub async fn getxattr(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         node_id: u64,
         name: &[u8],
         size: u32,
@@ -926,18 +1030,25 @@ impl Client {
             size: U32::new(size),
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, GetxattrResponse, _>(caller, node_id, &body, name, |body, payload| {
-            Ok(XattrValue {
-                size: body.size.get(),
-                value: payload.to_vec(),
-            })
-        })
+        self.call::<_, GetxattrResponse, _>(
+            origin,
+            node_id,
+            &body,
+            name,
+            |body, payload| {
+                Ok(XattrValue {
+                    size: body.size.get(),
+                    value: payload.to_vec(),
+                })
+            },
+            Counted::nothing,
+        )
         .await
     }
 
     pub async fn setxattr(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         node_id: u64,
         name: &[u8],
         value: &[u8],
@@ -951,8 +1062,15 @@ impl Client {
         };
         let mut payload = name.to_vec();
         payload.extend_from_slice(value);
-        self.call::<_, SetxattrResponse, _>(caller, node_id, &body, &payload, |_, _| Ok(()))
-            .await
+        self.call::<_, SetxattrResponse, _>(
+            origin,
+            node_id,
+            &body,
+            &payload,
+            |_, _| Ok(()),
+            Counted::nothing,
+        )
+        .await
     }
 
     /// `size` is measured in guest bytes, the length of the NUL-separated list
@@ -963,7 +1081,7 @@ impl Client {
     /// `EIO` for a malformed name stream, which poisons the connection.
     pub async fn listxattr(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         node_id: u64,
         size: u32,
     ) -> Result<XattrNames, Errno> {
@@ -971,33 +1089,46 @@ impl Client {
             size: U32::new(size),
             reserved: U32::ZERO,
         };
-        self.call::<_, ListxattrResponse, _>(caller, node_id, &body, &[], |body, payload| {
-            XattrNameIter::new(payload)
-                .map(|item| Ok(item?.tail.to_vec()))
-                .collect::<Result<Vec<_>, _>>()
-                .map(|names| XattrNames {
-                    size: body.size.get(),
-                    names,
-                })
-        })
+        self.call::<_, ListxattrResponse, _>(
+            origin,
+            node_id,
+            &body,
+            &[],
+            |body, payload| {
+                XattrNameIter::new(payload)
+                    .map(|item| Ok(item?.tail.to_vec()))
+                    .collect::<Result<Vec<_>, _>>()
+                    .map(|names| XattrNames {
+                        size: body.size.get(),
+                        names,
+                    })
+            },
+            Counted::nothing,
+        )
         .await
     }
 
     pub async fn removexattr(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         node_id: u64,
         name: &[u8],
     ) -> Result<(), Errno> {
         let body = RemovexattrRequest {
             name_len: U32::new(length(name)?),
         };
-        self.call::<_, RemovexattrResponse, _>(caller, node_id, &body, name, |_, _| Ok(()))
-            .await
+        self.call::<_, RemovexattrResponse, _>(
+            origin,
+            node_id,
+            &body,
+            name,
+            |_, _| Ok(()),
+            Counted::nothing,
+        )
+        .await
     }
 
-    /// `interrupt` ends a test that waits in the server for another opener of the
-    /// file.
+    /// The interrupt of `origin` ends a test at once.
     ///
     /// # Errors
     ///
@@ -1006,8 +1137,7 @@ impl Client {
     /// define.
     pub async fn getlk(
         &self,
-        caller: Caller,
-        interrupt: &Interrupt,
+        origin: Origin<'_>,
         node_id: u64,
         handle: u64,
         lock: Lock,
@@ -1016,21 +1146,22 @@ impl Client {
             handle: U64::new(handle),
             lock: lock.wire(),
         };
-        self.call_interruptible::<_, GetlkResponse, _>(
-            caller,
-            interrupt,
+        self.call::<_, GetlkResponse, _>(
+            origin,
             node_id,
             &body,
             &[],
             |body, _| Ok(Lock::of(&body.lock)),
+            Counted::nothing,
         )
         .await?
         .ok_or(Errno::IO)
     }
 
-    /// `interrupt` ends a request that places a lock and waits in the server, for
-    /// the lock or for another opener of the file. It never ends a release, so a
-    /// program interrupted while it releases a lock leaves no lock behind.
+    /// The interrupt of `origin` ends a request that places a lock and waits in
+    /// the server, for the lock or for another opener of the file. It never ends
+    /// a release, so a program interrupted while it releases a lock leaves no
+    /// lock behind.
     ///
     /// # Errors
     ///
@@ -1039,8 +1170,7 @@ impl Client {
     /// interrupt.
     pub async fn setlk(
         &self,
-        caller: Caller,
-        interrupt: &Interrupt,
+        origin: Origin<'_>,
         node_id: u64,
         handle: u64,
         lock: Lock,
@@ -1052,17 +1182,18 @@ impl Client {
             flags: U32::new(if wait { setlk_flags::WAIT } else { 0 }),
             reserved: U32::ZERO,
         };
-        let interrupt = match lock.kind {
-            LockKind::Unlock => &Interrupt::none(),
-            LockKind::Read | LockKind::Write => interrupt,
+        let origin = if interrupt::setlk_cut_short(lock.kind.as_raw()) {
+            origin
+        } else {
+            Origin::detached(origin.caller)
         };
-        self.call_interruptible::<_, SetlkResponse, _>(
-            caller,
-            interrupt,
+        self.call::<_, SetlkResponse, _>(
+            origin,
             node_id,
             &body,
             &[],
             |_, _| Ok(()),
+            Counted::nothing,
         )
         .await
     }
@@ -1155,6 +1286,27 @@ impl Client {
         };
         pool.unsubscribed(&connection);
         answered
+    }
+}
+
+pub(crate) fn release_request(
+    handle: u64,
+    flags: u32,
+    lock_owner: Option<u64>,
+    flush: bool,
+) -> ReleaseRequest {
+    let mut release = 0;
+    if flush {
+        release |= release_flags::FLUSH;
+    }
+    if lock_owner.is_some() {
+        release |= release_flags::UNLOCK;
+    }
+    ReleaseRequest {
+        handle: U64::new(handle),
+        lock_owner: U64::new(lock_owner.unwrap_or_default()),
+        flags: U32::new(flags),
+        release_flags: U32::new(release),
     }
 }
 

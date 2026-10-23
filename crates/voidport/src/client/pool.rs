@@ -1,7 +1,9 @@
+use std::future::Future;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, MutexGuard, Weak};
 
 use tokio::sync::Notify;
+use tokio::task::JoinSet;
 use voidport_memory::{Buffer, Memory, Refused};
 use voidport_session::Instant;
 use voidport_session::handshake::Failure;
@@ -17,8 +19,9 @@ use super::storage::grow_vacant;
 use super::{Client, Death, Target};
 
 mod requests;
+pub(crate) use requests::Counted;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Ended;
@@ -63,6 +66,8 @@ pub struct Pool {
     /// Raised on every change a waiting request may be waiting for: a
     /// connection given back, lost or added, and the end of the session.
     changed: Notify,
+    /// The tasks that receive the answers of requests whose callers left.
+    unattended: Mutex<JoinSet<()>>,
 }
 
 #[derive(Clone, Debug)]
@@ -202,6 +207,7 @@ impl Pool {
             origin: tokio::time::Instant::now(),
             state: Mutex::new(core),
             changed: Notify::new(),
+            unattended: Mutex::new(JoinSet::new()),
         });
         let unwatched = Unwatched {
             pool: Arc::clone(&pool),
@@ -400,10 +406,26 @@ impl Pool {
         }
     }
 
+    /// Runs `work` until it ends or the session closes.
+    pub(crate) fn finish_after_caller(&self, work: impl Future<Output = ()> + Send + 'static) {
+        let mut unattended = self.unattended();
+        while let Some(ended) = unattended.try_join_next() {
+            if let Err(error) = ended
+                && error.is_panic()
+            {
+                tracing::error!(%error, "a task receiving a late answer panicked");
+            }
+        }
+        let _aborted_by_close = unattended.spawn_on(work, &self.runtime);
+    }
+
     /// Ends the session, unless a decision of the core already did, and
     /// closes every connection still open in it, one at a time with the lock
-    /// of the core let go, without reporting anything to the mount.
+    /// of the core let go, without reporting anything to the mount. A late
+    /// answer has nothing to give back to a session that ended, so the tasks
+    /// receiving them are aborted.
     pub(crate) fn close(&self, death: Death) {
+        self.unattended().abort_all();
         self.lock().end();
         self.changed.notify_waiters();
         loop {
@@ -484,6 +506,12 @@ impl Pool {
 
     fn now(&self) -> Instant {
         Instant::from_duration(self.origin.elapsed())
+    }
+
+    fn unattended(&self) -> MutexGuard<'_, JoinSet<()>> {
+        self.unattended
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner())
     }
 
     fn lock(&self) -> MutexGuard<'_, Core> {

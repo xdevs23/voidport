@@ -11,7 +11,7 @@ use std::thread::JoinHandle;
 use std::time::Duration;
 
 use rustix::io::Errno;
-use voidport::client::{Caller, Client, ConnectError, Resilience};
+use voidport::client::{Client, ConnectError, Origin, Resilience};
 use voidport::url::Endpoint;
 use voidport_proto::PROTOCOL_VERSION;
 use voidport_proto::frame::{
@@ -152,12 +152,12 @@ fn assert_poisons(fault: Fault) {
         )
         .await
         .expect("the handshake succeeds");
-        let caller = Caller::default();
+        let origin = Origin::default();
 
         // The request outstanding when the fault arrives. The connection was
         // the session's only one, so its loss is the session's.
         let lookup = client
-            .lookup(caller, client.root_node_id(), b"anything")
+            .lookup(origin, client.root_node_id(), b"anything")
             .await;
         assert_eq!(
             lookup.err(),
@@ -168,7 +168,7 @@ fn assert_poisons(fault: Fault) {
         for round in 0..3 {
             assert_eq!(
                 client
-                    .getattr(caller, client.root_node_id(), None)
+                    .getattr(origin, client.root_node_id(), None)
                     .await
                     .err(),
                 Some(Errno::IO),

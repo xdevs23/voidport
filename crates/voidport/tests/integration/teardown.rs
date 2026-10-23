@@ -20,7 +20,7 @@ use support::mapping::SharedMapping;
 use support::namespace::{NamespaceCopy, in_copy};
 use support::relay::{Cut, Latch, Relay};
 use support::{fuse_client, preflight};
-use voidport::client::{Caller, MountState};
+use voidport::client::{MountState, Origin};
 use voidport::guardian::Launch;
 use voidport::mount::{Mount, MountError, MountOptions};
 use voidport::url::MountUrl;
@@ -375,10 +375,10 @@ fn a_death_after_the_teardown_began_opens_no_window_behind_it() {
     let mut ground = Ground::start("stop-connected");
     let runtime = runtime();
     let client = ground.connect(&runtime, STALL);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the mount serves");
 
     client.stop_reconnecting();
@@ -398,7 +398,7 @@ fn a_death_after_the_teardown_began_opens_no_window_behind_it() {
     let started = Instant::now();
     assert_eq!(
         runtime
-            .block_on(client.getattr(caller, root, None))
+            .block_on(client.getattr(origin, root, None))
             .expect_err("the mount is ending"),
         Errno::IO
     );

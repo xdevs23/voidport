@@ -65,7 +65,7 @@ async fn pool_at(path: &std::path::Path, first: Established) -> Arc<Pool> {
     pool
 }
 
-fn endpoint_path(name: &str) -> PathBuf {
+pub(crate) fn endpoint_path(name: &str) -> PathBuf {
     let path =
         std::env::temp_dir().join(format!("voidport-pool-{}-{name}.sock", std::process::id()));
     let _absent_on_a_fresh_run = std::fs::remove_file(&path);
@@ -345,7 +345,7 @@ async fn joining<F: Future>(
 /// is passed by more than one step.
 const TICK: std::time::Duration = std::time::Duration::from_millis(1);
 
-fn join_reply(request_id: u64, connection_id: u64, token: &[u8]) -> Vec<u8> {
+pub(crate) fn join_reply(request_id: u64, connection_id: u64, token: &[u8]) -> Vec<u8> {
     use voidport_proto::ops::handshake::HelloReply;
     use zerocopy::byteorder::little_endian::U32;
 
@@ -520,7 +520,7 @@ async fn after_the_last_connection_is_lost_neither_a_waiter_nor_a_join_is_served
 /// return from its first poll, which hangs the test.
 #[tokio::test]
 async fn a_request_that_finds_its_session_ended_waits_for_the_mount() {
-    use crate::client::{Caller, ROOT_NODE_ID};
+    use crate::client::{Origin, ROOT_NODE_ID};
 
     let path = endpoint_path("unreported-end");
     let listener = tokio::net::UnixListener::bind(&path).expect("a listener");
@@ -535,7 +535,7 @@ async fn a_request_that_finds_its_session_ended_waits_for_the_mount() {
     let client = client.expect("the mount");
 
     client.current().expect("the session").close(Death::Closed);
-    let mut request = std::pin::pin!(client.statfs(Caller::default(), ROOT_NODE_ID));
+    let mut request = std::pin::pin!(client.statfs(Origin::default(), ROOT_NODE_ID));
     assert!(
         poll_once(request.as_mut()).await.is_pending(),
         "it waits for the mount"
@@ -544,4 +544,27 @@ async fn a_request_that_finds_its_session_ended_waits_for_the_mount() {
     client.close();
     assert_eq!(request.await.err(), Some(rustix::io::Errno::IO));
     let _absent_on_a_fresh_run = std::fs::remove_file(&path);
+}
+
+#[test]
+fn counted_references_fit_only_what_the_session_core_owes() {
+    use voidport_proto::opcode::Opcode;
+    use voidport_session::owed;
+
+    let looked_up = Counted {
+        lookups: vec![7],
+        handle: None,
+    };
+    assert!(looked_up.fits(owed::of(Opcode::Lookup)));
+    assert!(
+        !looked_up.fits(owed::of(Opcode::Create)),
+        "a create opens a handle too"
+    );
+    assert!(!looked_up.fits(owed::of(Opcode::Getattr)));
+    assert!(!Counted::default().fits(owed::of(Opcode::Open)));
+    let listed = Counted {
+        lookups: vec![7, 7, 9],
+        handle: None,
+    };
+    assert!(listed.fits(owed::of(Opcode::Readdirplus)));
 }

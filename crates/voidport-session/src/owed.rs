@@ -18,7 +18,7 @@ pub struct Owed {
 }
 
 impl Owed {
-    const NOTHING: Self = Self {
+    pub const NOTHING: Self = Self {
         forget: Lookups::None,
         release: false,
     };

@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use support::Fixture;
 use support::relay::{Cut, Latch, Relay};
-use voidport::client::{Caller, Client};
+use voidport::client::{Caller, Client, Origin};
 use voidport::fuse::attr::Privileged;
 use voidport::fuse::dir::{DirectoryEntry, DirectoryRead, DirectorySink, read_directory};
 use voidport::url::MountUrl;
@@ -91,11 +91,11 @@ fn at(node_id: u64, handle: u64, cookie: u64) -> DirectoryRead {
 
 async fn read(
     client: &Client,
-    caller: Caller,
+    origin: Origin<'_>,
     read: DirectoryRead,
     sink: Collector,
 ) -> Result<Collector, rustix::io::Errno> {
-    let (sink, outcome) = read_directory(client, caller, read, Privileged::Present, sink).await;
+    let (sink, outcome) = read_directory(client, origin, read, Privileged::Present, sink).await;
     outcome.map(|()| sink.expect("the sink comes back"))
 }
 
@@ -105,7 +105,7 @@ fn nodes(fixture: &Fixture, runtime: &tokio::runtime::Runtime, client: &Client) 
     // applied, when the pool has no other connection.
     assert_eq!(client.connections().expect("a session").pooled, 1);
     runtime
-        .block_on(client.getattr(Caller::default(), client.root_node_id(), None))
+        .block_on(client.getattr(Origin::default(), client.root_node_id(), None))
         .expect("the stream fence replies");
     let sessions = fixture.sessions();
     assert_eq!(sessions.len(), 1, "{sessions:?}");
@@ -121,6 +121,7 @@ fn repeated_lookups_and_forgets_leave_nothing_behind() {
         .expect("a runtime");
     let client = session(&fixture, &runtime);
     let caller = Caller::default();
+    let origin = Origin::default();
 
     assert_eq!(nodes(&fixture, &runtime, &client), 1);
 
@@ -129,7 +130,7 @@ fn repeated_lookups_and_forgets_leave_nothing_behind() {
     runtime.block_on(async {
         for round in 0..320 {
             let entry = client
-                .lookup(caller, client.root_node_id(), b"data.bin")
+                .lookup(origin, client.root_node_id(), b"data.bin")
                 .await
                 .unwrap_or_else(|error| panic!("lookup {round} failed: {error:?}"));
             client.forget(caller, entry.node_id, 1).await;
@@ -152,6 +153,7 @@ fn a_plain_directory_read_gives_every_counted_lookup_back() {
         .expect("a runtime");
     let client = session(&fixture, &runtime);
     let caller = Caller::default();
+    let origin = Origin::default();
 
     let listed = runtime.block_on(async {
         let root = client.root_node_id();
@@ -160,10 +162,10 @@ fn a_plain_directory_read_gives_every_counted_lookup_back() {
         // server counted must come straight back.
         for round in 0..64 {
             let handle = client
-                .open(caller, root, 0)
+                .open(origin, root, 0)
                 .await
                 .unwrap_or_else(|error| panic!("opendir {round} failed: {error:?}"));
-            let sink = read(&client, caller, at(root, handle, 0), Collector::plain())
+            let sink = read(&client, origin, at(root, handle, 0), Collector::plain())
                 .await
                 .unwrap_or_else(|error| panic!("readdir {round} failed: {error:?}"));
             client
@@ -192,13 +194,14 @@ fn entries_a_full_buffer_refuses_are_given_back() {
         .expect("a runtime");
     let client = session(&fixture, &runtime);
     let caller = Caller::default();
+    let origin = Origin::default();
 
     let delivered = runtime.block_on(async {
         let root = client.root_node_id();
-        let handle = client.open(caller, root, 0).await.expect("opendir");
+        let handle = client.open(origin, root, 0).await.expect("opendir");
         // A buffer with room for exactly one entry: the client asks the wire for
         // a page of entries and the "kernel" refuses all but one of them.
-        let sink = read(&client, caller, at(root, handle, 0), Collector::counting(1))
+        let sink = read(&client, origin, at(root, handle, 0), Collector::counting(1))
             .await
             .expect("readdir");
         assert_eq!(sink.names.len(), 1);
@@ -231,6 +234,7 @@ fn two_reads_of_one_handle_at_once_leave_nothing_behind() {
         .block_on(Client::mount(&relay.endpoint(), "plain", b"/tree"))
         .expect("the mount is accepted");
     let caller = Caller::default();
+    let origin = Origin::default();
     let latch = Latch::default();
     let held = relay.arm(Opcode::Readdirplus, Cut::HoldReply(latch.clone()));
 
@@ -244,13 +248,13 @@ fn two_reads_of_one_handle_at_once_leave_nothing_behind() {
 
         runtime.block_on(async {
             let root = client.root_node_id();
-            let handle = client.open(caller, root, 0).await.expect("opendir");
+            let handle = client.open(origin, root, 0).await.expect("opendir");
             // Two reads of one handle at the same cookie, in flight together.
             // The kernel serializes readdir per open file description, so a
             // mount never does this; the accounting may not depend on that.
             let (one, two) = tokio::join!(
-                read(&client, caller, at(root, handle, 0), Collector::counting(1)),
-                read(&client, caller, at(root, handle, 0), Collector::counting(1)),
+                read(&client, origin, at(root, handle, 0), Collector::counting(1)),
+                read(&client, origin, at(root, handle, 0), Collector::counting(1)),
             );
             let (first, second) = (one.expect("the first read"), two.expect("the second read"));
 
@@ -286,13 +290,14 @@ fn a_one_entry_at_a_time_walk_counts_every_entry_exactly_once() {
         .expect("a runtime");
     let client = session(&fixture, &runtime);
     let caller = Caller::default();
+    let origin = Origin::default();
 
     let names = runtime.block_on(async {
         let root = client.root_node_id();
         let mut names: Vec<Vec<u8>> = Vec::new();
         for round in 0..64 {
             let handle = client
-                .open(caller, root, 0)
+                .open(origin, root, 0)
                 .await
                 .unwrap_or_else(|error| panic!("opendir {round} failed: {error:?}"));
             let mut cookie = 0;
@@ -300,7 +305,7 @@ fn a_one_entry_at_a_time_walk_counts_every_entry_exactly_once() {
             loop {
                 let sink = read(
                     &client,
-                    caller,
+                    origin,
                     at(root, handle, cookie),
                     Collector::counting(1),
                 )
