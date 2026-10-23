@@ -1,7 +1,5 @@
 //! The suite runs as root, which is what a guest's `root` is in this model.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::fs;
@@ -1060,7 +1058,7 @@ fn lock_waiter(path: &std::path::Path) -> std::process::Child {
     Program::new(std::env::current_exe().expect("the test binary"))
         .args([
             "--exact",
-            "a_blocking_lock_waiter_in_its_own_process",
+            "e2e::a_blocking_lock_waiter_in_its_own_process",
             "--test-threads=1",
         ])
         .env(LOCK_WAITER, path)

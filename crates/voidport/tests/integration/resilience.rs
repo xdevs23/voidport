@@ -2,8 +2,6 @@
 //! brought back on the same unix socket, because the subject is a server that
 //! dies without warning, not one that shuts down politely.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::fs;

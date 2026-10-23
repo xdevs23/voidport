@@ -2,8 +2,6 @@
 //! and every mount such a thread reaches is mounted with `allow_other`, so the
 //! refusal under test is never the owner check of FUSE.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::io::{self, Read, Write};

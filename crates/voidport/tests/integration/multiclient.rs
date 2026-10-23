@@ -1,7 +1,5 @@
 //! Runs as root, which is what a guest's `root` is in this model.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::fs;

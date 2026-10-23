@@ -2,8 +2,6 @@
 //! the wire, and a mount would let the kernel's caching decide which of them
 //! were still in play.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::collections::HashSet;

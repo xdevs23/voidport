@@ -5,8 +5,6 @@
 //! that reconnected would reconnect to the very server whose answers it cannot
 //! read, and every assertion would measure a stall window.
 
-#![forbid(unsafe_code)]
-
 use std::io::{Read as _, Write as _};
 use std::net::{Shutdown, SocketAddr, TcpListener};
 use std::thread::JoinHandle;

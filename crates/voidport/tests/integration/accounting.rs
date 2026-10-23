@@ -3,8 +3,6 @@
 //! `readdir`, so the compensating forgets of that path cannot be reached
 //! through a mount.
 
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::sync::Arc;

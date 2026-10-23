@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::io::{BufRead as _, BufReader};

@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use voidport_test_client as support;
 
 use std::os::unix::fs::MetadataExt as _;
@@ -10,8 +8,9 @@ use support::{Fixture, fuse_client};
 use voidport_spawn::{Program, Stream};
 use voidport_test_support::{ReadinessSocket, Startup};
 
-/// This process never opens a file or directory inside a mount, so no
-/// descriptor of it can make the mount busy when the test unmounts it.
+/// These tests never open a file or directory inside their mounts, so no
+/// descriptor of the test process can make such a mount busy when the test
+/// unmounts it.
 fn read_in_child(path: &Path) -> Vec<u8> {
     let output = Program::new("cat").arg(path).output().expect("cat runs");
     assert!(
