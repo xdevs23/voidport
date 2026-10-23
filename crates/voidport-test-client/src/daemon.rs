@@ -580,10 +580,20 @@ pub fn state_is(client: &Client, ready: impl Fn(MountState) -> bool) {
     wait_until(client, |client| ready(client.state()));
 }
 
-/// Waits until the client is connected again, so an assertion on a reply does not
-/// depend on when the server came back.
-pub fn settle(client: &Client) {
-    state_is(client, |state| state == MountState::Connected);
+/// Runs `ending`, which ends the session the client is connected over, and waits
+/// until the client is connected over a newer one. A client that has not yet
+/// noticed the loss still reports `Connected` over the ended session, so waiting
+/// for that state right after the loss can return before the session is replaced.
+pub fn reconnected_after(client: &Client, ending: impl FnOnce()) {
+    let ended = client
+        .connected_generation()
+        .expect("the client was connected when the session was ended");
+    ending();
+    wait_until(client, |client| {
+        client
+            .connected_generation()
+            .is_some_and(|generation| generation > ended)
+    });
 }
 
 fn wait_until(client: &Client, reached: impl Fn(&Client) -> bool) {

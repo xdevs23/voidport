@@ -16,7 +16,7 @@ use std::thread;
 use std::time::Duration;
 
 use rustix::io::Errno;
-use support::daemon::{Ground, runtime, settle, state_is};
+use support::daemon::{Ground, reconnected_after, runtime, state_is};
 use voidport::client::{Caller, MountState};
 use voidport::fuse::attr::Privileged;
 use voidport::fuse::dir::{DirectoryEntry, DirectoryRead, DirectorySink, read_directory};
@@ -211,23 +211,25 @@ fn a_written_mutation_that_lost_its_answer_fails_and_is_not_applied_twice() {
         .block_on(client.lookup(caller, root, b"tree"))
         .expect("the graft resolves");
 
-    let sprung = relay.discard_next_reply(Opcode::Mkdir);
-    let refused = runtime
-        .block_on(client.mkdir(caller, tree.node_id, b"made", 0o755, 0))
-        .expect_err("a mutation that may already have been applied must not be re-sent");
-    assert_eq!(refused, Errno::IO);
-    sprung
-        .recv()
-        .expect("the relay discarded the server's answer");
+    reconnected_after(&client, || {
+        let sprung = relay.discard_next_reply(Opcode::Mkdir);
+        let refused = runtime
+            .block_on(client.mkdir(caller, tree.node_id, b"made", 0o755, 0))
+            .expect_err("a mutation that may already have been applied must not be re-sent");
+        assert_eq!(refused, Errno::IO);
+        sprung
+            .recv()
+            .expect("the relay discarded the server's answer");
+    });
 
-    ground.server.kill();
-    assert!(
-        ground.tree.join("made").is_dir(),
-        "the server applied the mkdir once, and that is what makes the count meaningful"
-    );
-
-    ground.server.start_again();
-    settle(&client);
+    reconnected_after(&client, || {
+        ground.server.kill();
+        assert!(
+            ground.tree.join("made").is_dir(),
+            "the server applied the mkdir once, and that is what makes the count meaningful"
+        );
+        ground.server.start_again();
+    });
     assert_eq!(
         relay.forwarded(Opcode::Mkdir),
         1,
@@ -303,18 +305,21 @@ fn a_written_flush_that_lost_its_answer_fails_and_is_not_resent() {
         .block_on(client.open(caller, alpha.node_id, 0))
         .expect("the file opens");
 
-    let sprung = relay.discard_next_reply(Opcode::Flush);
-    let refused = runtime
-        .block_on(client.flush(caller, alpha.node_id, handle, 0))
-        .expect_err("a flush that may already have been applied must not be re-sent");
-    assert_eq!(refused, Errno::IO);
-    sprung
-        .recv()
-        .expect("the relay discarded the server's answer");
+    reconnected_after(&client, || {
+        let sprung = relay.discard_next_reply(Opcode::Flush);
+        let refused = runtime
+            .block_on(client.flush(caller, alpha.node_id, handle, 0))
+            .expect_err("a flush that may already have been applied must not be re-sent");
+        assert_eq!(refused, Errno::IO);
+        sprung
+            .recv()
+            .expect("the relay discarded the server's answer");
+    });
 
-    ground.server.kill();
-    ground.server.start_again();
-    settle(&client);
+    reconnected_after(&client, || {
+        ground.server.kill();
+        ground.server.start_again();
+    });
     assert_eq!(
         relay.forwarded(Opcode::Flush),
         1,
@@ -526,9 +531,10 @@ fn a_forget_of_an_ended_generation_never_reaches_the_newer_connection() {
         "a forget of the installed connection's generation is sent"
     );
 
-    ground.server.kill();
-    ground.server.start_again();
-    settle(&client);
+    reconnected_after(&client, || {
+        ground.server.kill();
+        ground.server.start_again();
+    });
     assert!(relay.connections() >= 2, "a newer connection is installed");
 
     runtime.block_on(client.forget_on(caller, FIRST_GENERATION, tree.node_id, 1));

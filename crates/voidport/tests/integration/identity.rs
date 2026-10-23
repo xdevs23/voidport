@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use rustix::fs::OFlags;
 use rustix::io::Errno;
-use support::daemon::{Ground, runtime, settle};
+use support::daemon::{Ground, reconnected_after, runtime};
 use voidport::client::{Caller, Interrupt, Lock, LockKind, MountState};
 
 const STALL: Duration = Duration::from_secs(30);
@@ -34,8 +34,7 @@ fn a_stale_node_id_never_aliases_another_file() {
         .block_on(client.lookup(caller, tree.node_id, b"alpha"))
         .expect("alpha resolves");
 
-    ground.server.restart();
-    settle(&client);
+    reconnected_after(&client, || ground.server.restart());
 
     let fresh_tree = runtime
         .block_on(client.lookup(caller, root, b"tree"))
@@ -95,8 +94,7 @@ fn no_id_from_the_old_session_is_accepted_by_the_new_one() {
     }
     old_nodes.insert(tree.node_id);
 
-    ground.server.restart();
-    settle(&client);
+    reconnected_after(&client, || ground.server.restart());
 
     let fresh_tree = runtime
         .block_on(client.lookup(caller, root, b"tree"))
@@ -186,8 +184,7 @@ fn a_lock_lost_with_its_server_surfaces_as_ebadf_and_is_reacquirable() {
         ))
         .expect("the range is free");
 
-    ground.server.restart();
-    settle(&client);
+    reconnected_after(&client, || ground.server.restart());
 
     assert_eq!(
         runtime
