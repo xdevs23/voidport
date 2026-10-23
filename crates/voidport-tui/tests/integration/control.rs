@@ -1,7 +1,3 @@
-#![forbid(unsafe_code)]
-
-mod support;
-
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::net::UnixListener;
 use std::time::{Duration, Instant};
@@ -13,7 +9,10 @@ use voidport_tui::client::{Backoff, Session};
 use voidport_tui::event::Event;
 use voidport_tui::model::{Connection, Dialog, Screen, Tone};
 
-use support::{Harness, STATE, fixture, patience};
+use voidport_test_support::tui::{Harness, PATIENCE};
+use voidport_test_support::{RunningServer, daemon_config};
+
+use crate::support::{STATE, TempDir, fixture, fixture_with};
 
 fn press(harness: &mut Harness, code: KeyCode) {
     harness.feed(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
@@ -33,7 +32,7 @@ fn attaching_reads_every_screen_and_quitting_leaves_the_server_serving() {
     // The fixture configures port 0, so the bound endpoint can only come from
     // the server.
     assert!(
-        harness.until(patience(), |model| model.server.ready().is_some()),
+        harness.until(PATIENCE, |model| model.server.ready().is_some()),
         "the overview never arrived: {:?}",
         harness.model.status
     );
@@ -55,7 +54,7 @@ fn attaching_reads_every_screen_and_quitting_leaves_the_server_serving() {
     );
 
     press(&mut harness, KeyCode::Char('2'));
-    assert!(harness.until(patience(), |model| model.namespaces.ready().is_some()));
+    assert!(harness.until(PATIENCE, |model| model.namespaces.ready().is_some()));
     assert_eq!(harness.model.namespace_keys(), vec!["project"]);
 
     for (key, screen) in [
@@ -66,12 +65,12 @@ fn attaching_reads_every_screen_and_quitting_leaves_the_server_serving() {
         press(&mut harness, key);
         assert_eq!(harness.model.screen, screen);
         assert!(
-            harness.until(patience(), |model| model.namespace_spec().is_some()),
+            harness.until(PATIENCE, |model| model.namespace_spec().is_some()),
             "{screen:?} never read its namespace"
         );
     }
     press(&mut harness, KeyCode::Char('6'));
-    assert!(harness.until(patience(), |model| model.sessions.ready().is_some()));
+    assert!(harness.until(PATIENCE, |model| model.sessions.ready().is_some()));
     press(&mut harness, KeyCode::Char('1'));
     assert_eq!(harness.model.screen, Screen::Overview);
 
@@ -89,7 +88,7 @@ fn the_overview_follows_a_listener_added_and_removed_while_it_watches() {
     let (directory, server) = fixture("listeners");
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
     assert!(
-        harness.until(patience(), |model| model.server.ready().is_some()),
+        harness.until(PATIENCE, |model| model.server.ready().is_some()),
         "the overview never arrived: {:?}",
         harness.model.status
     );
@@ -110,7 +109,7 @@ fn the_overview_follows_a_listener_added_and_removed_while_it_watches() {
         })
     };
     assert!(
-        harness.until(patience(), |model| shows(model, &endpoint)),
+        harness.until(PATIENCE, |model| shows(model, &endpoint)),
         "the added listener never appeared: {:?}",
         harness
             .model
@@ -123,7 +122,7 @@ fn the_overview_follows_a_listener_added_and_removed_while_it_watches() {
         endpoint: endpoint.clone(),
     });
     assert!(
-        harness.until(patience(), |model| !shows(model, &endpoint)),
+        harness.until(PATIENCE, |model| !shows(model, &endpoint)),
         "the removed listener never went away: {:?}",
         harness
             .model
@@ -141,13 +140,13 @@ fn namespace_create_and_delete_round_trip_behind_a_confirmation() {
     let (_directory, server) = fixture("namespaces");
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
     press(&mut harness, KeyCode::Char('2'));
-    assert!(harness.until(patience(), |model| model.namespaces.ready().is_some()));
+    assert!(harness.until(PATIENCE, |model| model.namespaces.ready().is_some()));
 
     press(&mut harness, KeyCode::Char('n'));
     type_text(&mut harness, "fresh");
     press(&mut harness, KeyCode::Enter);
     assert!(
-        harness.until(patience(), |model| model
+        harness.until(PATIENCE, |model| model
             .namespace_keys()
             .iter()
             .any(|key| key == "fresh")),
@@ -168,7 +167,7 @@ fn namespace_create_and_delete_round_trip_behind_a_confirmation() {
     );
     press(&mut harness, KeyCode::Char('y'));
     assert!(
-        harness.until(patience(), |model| !model
+        harness.until(PATIENCE, |model| !model
             .namespace_keys()
             .iter()
             .any(|key| key == "fresh")),
@@ -181,14 +180,14 @@ fn a_rejected_creation_renders_the_servers_error_and_changes_nothing() {
     let (_directory, server) = fixture("rejected");
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
     press(&mut harness, KeyCode::Char('2'));
-    assert!(harness.until(patience(), |model| model.namespaces.ready().is_some()));
+    assert!(harness.until(PATIENCE, |model| model.namespaces.ready().is_some()));
     let before = harness.model.namespace_keys();
 
     press(&mut harness, KeyCode::Char('n'));
     type_text(&mut harness, "project");
     press(&mut harness, KeyCode::Enter);
     assert!(
-        harness.until(patience(), |model| model.status.tone == Tone::Failure),
+        harness.until(PATIENCE, |model| model.status.tone == Tone::Failure),
         "the duplicate was not refused"
     );
     assert!(
@@ -204,7 +203,7 @@ fn rule_add_and_remove_round_trip() {
     let (_directory, server) = fixture("rules");
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
     press(&mut harness, KeyCode::Char('3'));
-    assert!(harness.until(patience(), |model| model.namespace_spec().is_some()));
+    assert!(harness.until(PATIENCE, |model| model.namespace_spec().is_some()));
     assert_eq!(harness.model.rule_keys(), vec!["/project"]);
 
     press(&mut harness, KeyCode::Char('a'));
@@ -214,7 +213,7 @@ fn rule_add_and_remove_round_trip() {
     type_text(&mut harness, "data");
     press(&mut harness, KeyCode::Enter);
     assert!(
-        harness.until(patience(), |model| model
+        harness.until(PATIENCE, |model| model
             .rule_keys()
             .iter()
             .any(|key| key == "/added")),
@@ -226,7 +225,7 @@ fn rule_add_and_remove_round_trip() {
     press(&mut harness, KeyCode::Char('d'));
     press(&mut harness, KeyCode::Char('y'));
     assert!(
-        harness.until(patience(), |model| !model
+        harness.until(PATIENCE, |model| !model
             .rule_keys()
             .iter()
             .any(|key| key == "/added")),
@@ -239,7 +238,7 @@ fn the_ownership_editor_round_trips_the_whole_policy_including_sentinels() {
     let (_directory, server) = fixture("ownership");
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
     press(&mut harness, KeyCode::Char('4'));
-    assert!(harness.until(patience(), |model| model.namespace_spec().is_some()));
+    assert!(harness.until(PATIENCE, |model| model.namespace_spec().is_some()));
 
     press(&mut harness, KeyCode::Char('e'));
     let Some(Dialog::Form(form)) = &mut harness.model.dialog else {
@@ -252,7 +251,7 @@ fn the_ownership_editor_round_trips_the_whole_policy_including_sentinels() {
     press(&mut harness, KeyCode::Enter);
 
     assert!(
-        harness.until(patience(), |model| matches!(
+        harness.until(PATIENCE, |model| matches!(
             model.namespace_spec().map(|spec| &spec.ownership),
             Some(OwnershipSpec::Map { .. })
         )),
@@ -285,7 +284,7 @@ fn the_ownership_editor_round_trips_the_whole_policy_including_sentinels() {
     form.fields[4].value = "1001->1000, 1002->1000".to_owned();
     press(&mut harness, KeyCode::Enter);
     assert!(
-        harness.until(patience(), |model| model.status.tone == Tone::Failure),
+        harness.until(PATIENCE, |model| model.status.tone == Tone::Failure),
         "a non-injective map was accepted"
     );
     assert!(
@@ -309,11 +308,11 @@ fn the_permission_and_auth_setters_round_trip() {
     let (_directory, server) = fixture("modes");
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
     press(&mut harness, KeyCode::Char('5'));
-    assert!(harness.until(patience(), |model| model.namespace_spec().is_some()));
+    assert!(harness.until(PATIENCE, |model| model.namespace_spec().is_some()));
 
     press(&mut harness, KeyCode::Enter);
     assert!(
-        harness.until(patience(), |model| model.status.tone == Tone::Success
+        harness.until(PATIENCE, |model| model.status.tone == Tone::Success
             && model.status.message.contains("permission")),
         "the permission setter was not answered: {:?}",
         harness.model.status
@@ -322,7 +321,7 @@ fn the_permission_and_auth_setters_round_trip() {
     press(&mut harness, KeyCode::Char('j'));
     press(&mut harness, KeyCode::Enter);
     assert!(
-        harness.until(patience(), |model| model.status.tone == Tone::Success
+        harness.until(PATIENCE, |model| model.status.tone == Tone::Success
             && model.status.message.contains("auth")),
         "the auth setter was not answered: {:?}",
         harness.model.status
@@ -343,12 +342,12 @@ fn a_restarted_server_is_reconnected_to_and_every_view_is_re_read() {
     let state_file = directory.join("state.toml");
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
     press(&mut harness, KeyCode::Char('2'));
-    assert!(harness.until(patience(), |model| model.namespaces.ready().is_some()));
+    assert!(harness.until(PATIENCE, |model| model.namespaces.ready().is_some()));
 
     server.stop();
     drop(server);
     assert!(
-        harness.until(patience(), |model| !model.connection.is_connected()),
+        harness.until(PATIENCE, |model| !model.connection.is_connected()),
         "the loss was never noticed"
     );
     assert!(
@@ -357,7 +356,7 @@ fn a_restarted_server_is_reconnected_to_and_every_view_is_re_read() {
         harness.model.status
     );
 
-    let restarted = support::start(&state_file);
+    let restarted = RunningServer::start(&daemon_config(&state_file)).expect("the server starts");
     {
         let mut client = restarted.connect();
         client.expect_ok(&Request::NamespaceCreate {
@@ -384,10 +383,10 @@ fn a_restarted_server_is_reconnected_to_and_every_view_is_re_read() {
 fn quitting_stays_instant_while_a_reconnection_is_pending() {
     let (directory, mut server) = fixture("quit-while-retrying");
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
-    assert!(harness.until(patience(), |model| model.server.ready().is_some()));
+    assert!(harness.until(PATIENCE, |model| model.server.ready().is_some()));
     server.stop();
     drop(server);
-    assert!(harness.until(patience(), |model| !model.connection.is_connected()));
+    assert!(harness.until(PATIENCE, |model| !model.connection.is_connected()));
 
     // The worker sleeps between attempts; quitting must not wait for that.
     press(&mut harness, KeyCode::Char('q'));
@@ -404,7 +403,7 @@ fn quitting_stays_instant_while_a_reconnection_is_pending() {
 
 #[test]
 fn a_wedged_server_is_detected_by_the_clients_timeouts() {
-    let directory = support::TempDir::new("wedged");
+    let directory = TempDir::new("wedged");
     let socket = directory.join("control.sock");
     let listener = UnixListener::bind(&socket).expect("a bindable socket path");
     // Accept and never answer: the wedged server the timeouts exist for.
@@ -427,7 +426,7 @@ fn a_wedged_server_is_detected_by_the_clients_timeouts() {
     )
     .expect("the control socket accepts");
     assert!(
-        harness.until(patience(), |model| matches!(
+        harness.until(PATIENCE, |model| matches!(
             model.connection,
             Connection::Lost { .. }
         )),
@@ -446,7 +445,7 @@ fn a_wedged_server_is_detected_by_the_clients_timeouts() {
 /// the socket: the view reports it and the connection stays up.
 #[test]
 fn a_reply_the_client_cannot_read_is_reported_without_dropping_the_connection() {
-    let directory = support::TempDir::new("skewed");
+    let directory = TempDir::new("skewed");
     let socket = directory.join("control.sock");
     let listener = UnixListener::bind(&socket).expect("a bindable socket path");
     let skewed = std::thread::spawn(move || {
@@ -464,7 +463,7 @@ fn a_reply_the_client_cannot_read_is_reported_without_dropping_the_connection() 
 
     let mut harness = Harness::attach(&socket).expect("the control socket accepts");
     assert!(
-        harness.until(patience(), |model| model.server.failure().is_some()),
+        harness.until(PATIENCE, |model| model.server.failure().is_some()),
         "the unreadable answer was never reported: {:?}",
         harness.model.status
     );
@@ -479,7 +478,7 @@ fn a_reply_the_client_cannot_read_is_reported_without_dropping_the_connection() 
 
 #[test]
 fn a_missing_socket_fails_before_anything_is_taken_over() {
-    let directory = support::TempDir::new("missing");
+    let directory = TempDir::new("missing");
     let error =
         Session::connect(&directory.join("nothing.sock")).expect_err("nothing is listening there");
     assert!(error.to_string().contains("cannot connect"), "{error}");
@@ -487,20 +486,21 @@ fn a_missing_socket_fails_before_anything_is_taken_over() {
 
 #[test]
 fn attaching_tails_the_log_file_the_server_names() {
-    let scratch = support::TempDir::new("log-path");
+    let scratch = TempDir::new("log-path");
     let log = scratch.join("voidportd.log");
     std::fs::write(
         &log,
         "2026-08-16T10:11:12.345678Z  INFO voidportd: started\n",
     )
     .expect("a writable log file");
-    let (_directory, server) = support::logging_fixture("logs", &log);
+    // The path is only reported to the server, never opened by it.
+    let (_directory, server) = fixture_with("logs", |config| config.with_log_file(&log));
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
 
     press(&mut harness, KeyCode::Char('7'));
     assert_eq!(harness.model.screen, Screen::Logs);
     assert!(
-        harness.until(patience(), |model| model
+        harness.until(PATIENCE, |model| model
             .logs
             .lines()
             .any(|line| line.text.contains("started"))),
@@ -522,7 +522,7 @@ fn attaching_tails_the_log_file_the_server_names() {
         .expect("the log file writes");
     drop(file);
     assert!(
-        harness.until(patience(), |model| model
+        harness.until(PATIENCE, |model| model
             .logs
             .lines()
             .any(|line| line.text.contains("something to say"))),
@@ -535,14 +535,14 @@ fn attaching_tails_the_log_file_the_server_names() {
 
 #[test]
 fn an_unreadable_log_file_is_named_and_the_interface_keeps_working() {
-    let scratch = support::TempDir::new("log-elsewhere");
+    let scratch = TempDir::new("log-elsewhere");
     let log = scratch.join("not-on-this-machine/voidportd.log");
-    let (_directory, server) = support::logging_fixture("logs-elsewhere", &log);
+    let (_directory, server) = fixture_with("logs-elsewhere", |config| config.with_log_file(&log));
     let mut harness = Harness::attach(server.socket()).expect("the control socket accepts");
 
     press(&mut harness, KeyCode::Char('7'));
     assert!(
-        harness.until(patience(), |model| model.logs.trouble.is_some()),
+        harness.until(PATIENCE, |model| model.logs.trouble.is_some()),
         "an unreadable log file said nothing"
     );
     assert_eq!(
@@ -554,7 +554,7 @@ fn an_unreadable_log_file_is_named_and_the_interface_keeps_working() {
 
     press(&mut harness, KeyCode::Char('2'));
     assert!(
-        harness.until(patience(), |model| model.namespaces.ready().is_some()),
+        harness.until(PATIENCE, |model| model.namespaces.ready().is_some()),
         "an unreadable log file took the interface down with it"
     );
     assert_eq!(harness.model.namespace_keys(), vec!["project"]);

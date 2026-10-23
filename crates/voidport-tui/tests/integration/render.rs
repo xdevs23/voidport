@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
 use voidport_control::{
