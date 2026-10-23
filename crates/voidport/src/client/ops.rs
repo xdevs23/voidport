@@ -36,10 +36,9 @@ use voidport_proto::opcode::Opcode;
 use voidport_session::Window;
 use voidport_session::replay::OpenFlags;
 
-use super::connection::{Answer, Connection, Forget, Nothing};
+use super::connection::{Answer, Connection, Entries, Forget, Nothing};
 use super::{
-    Caller, Client, Data, Entries, Entry, EntrySink, Interrupt, Outgoing, Pages, errno_of,
-    interpret,
+    Caller, Client, Data, Entry, EntrySink, Interrupt, Outgoing, Pages, errno_of, interpret,
 };
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -99,27 +98,38 @@ pub(crate) struct Settled {
     pub outcome: Result<bool, Errno>,
 }
 
-pub(crate) fn settle(entries: &Entries, streamed: Result<Streamed, Errno>) -> Settled {
+/// A reply that ends in an errno answers the kernel that errno, so no entry is
+/// offered then. Otherwise the entries are offered to the sink until it is
+/// full, and every entry after the first one it refuses is refused too.
+pub(crate) fn settle(
+    sink: &mut dyn EntrySink,
+    entries: &Entries,
+    streamed: Result<Streamed, Errno>,
+) -> Settled {
+    let lookups = entries.lookups();
     match streamed {
         Ok(Streamed {
             exhausted,
             failed: None,
-        }) => Settled {
-            give_back: entries.refused().to_vec(),
-            accepted: entries.accepted().to_vec(),
-            outcome: Ok(exhausted),
-        },
+        }) => {
+            let taken = entries
+                .listed()
+                .iter()
+                .take_while(|listed| !sink.offer(listed))
+                .count();
+            let (accepted, refused) = lookups.split_at(taken);
+            Settled {
+                give_back: refused.to_vec(),
+                accepted: accepted.to_vec(),
+                outcome: Ok(exhausted),
+            }
+        }
         Ok(Streamed {
             failed: Some(errno),
             ..
         })
         | Err(errno) => Settled {
-            give_back: entries
-                .accepted()
-                .iter()
-                .chain(entries.refused())
-                .copied()
-                .collect(),
+            give_back: lookups,
             accepted: Vec::new(),
             outcome: Err(errno),
         },
@@ -840,7 +850,7 @@ impl Client {
         handle: u64,
         cookie: u64,
         size: u32,
-        sink: Box<dyn EntrySink>,
+        mut sink: Box<dyn EntrySink>,
     ) -> Listing {
         let body = ReaddirplusRequest {
             handle: U64::new(handle),
@@ -862,7 +872,7 @@ impl Client {
                 &Interrupt::none(),
                 Opcode::Readdirplus,
                 &request,
-                Entries::new(piece, sink),
+                Entries::new(piece),
                 listing_reply_bound(size),
             )
             .await;
@@ -870,6 +880,7 @@ impl Client {
             Ok(Some((connection, answer))) => (
                 Some(connection.generation()),
                 settle(
+                    sink.as_mut(),
                     &entries,
                     streamed::<ReaddirplusResponse>(&connection, &answer),
                 ),
@@ -897,7 +908,7 @@ impl Client {
             }
         }
         Listing {
-            sink: entries.into_sink(),
+            sink,
             accepted: settled.accepted,
             generation,
             outcome: settled.outcome,

@@ -36,7 +36,7 @@ use zerocopy::byteorder::little_endian::U64;
 
 use super::storage::grow_vacant;
 use super::transport::{ReadHalf, Stream as Transport, WriteHalf};
-use super::{Caller, ConnectError, Death, Entry, Target};
+use super::{Caller, ConnectError, Death, DirEntry, Entry, Target};
 
 /// A request whose connection was lost while its session lives on may be
 /// answered from the reply the server kept for it ([`Self::resume`]), streamed
@@ -50,8 +50,8 @@ pub(crate) trait Destination: Send {
 
     fn took(&mut self, len: usize) -> Result<(), FramingError>;
 
-    /// Entries already handed to the reply of the kernel are lookups that
-    /// session counted, and are not taken back while it lives.
+    /// Entries already received are lookups that session counted, so they are
+    /// not dropped while it lives.
     fn restartable(&self) -> bool;
 
     /// Drops what the destination took. Called on a destination that is
@@ -162,29 +162,17 @@ impl Destination for Data {
     }
 }
 
-#[derive(Clone, Copy, Debug)]
-pub struct Listed<'a> {
-    pub name: &'a [u8],
-    pub entry: Entry,
-    pub next_cookie: u64,
-    pub entry_type: u32,
-}
-
 pub trait EntrySink: std::any::Any + Send {
-    fn offer(&mut self, entry: &Listed<'_>) -> bool;
-
-    fn take_back(&mut self, count: usize);
+    /// Returns `true` when the sink is full and refuses the entry.
+    fn offer(&mut self, entry: &DirEntry) -> bool;
 }
 
-/// Every entry counts a lookup on the server, so the destination records which
-/// entries the sink took and which it refused, for the request to give back what
-/// the kernel will not account for.
-pub struct Entries {
+/// Every entry counts a lookup on the server, so the destination collects every
+/// entry of the reply, and the caller gives back the lookups of the entries the
+/// kernel does not take.
+pub(crate) struct Entries {
     piece: Buffer,
-    sink: Box<dyn EntrySink>,
-    accepted: Vec<u64>,
-    refused: Vec<u64>,
-    full: bool,
+    listed: Vec<DirEntry>,
     /// Entries of a kept reply already received before the connection was lost.
     skip: usize,
 }
@@ -192,46 +180,36 @@ pub struct Entries {
 impl fmt::Debug for Entries {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("Entries")
-            .field("accepted", &self.accepted.len())
-            .field("refused", &self.refused.len())
-            .field("full", &self.full)
+            .field("listed", &self.listed.len())
             .finish_non_exhaustive()
     }
 }
 
 impl Entries {
-    #[must_use]
-    pub fn piece_len() -> usize {
+    pub(crate) fn piece_len() -> usize {
         Stream::DirEntries
             .piece_bound(&LIMITS)
             .map_or(0, |bound| bound as usize)
     }
 
-    #[must_use]
-    pub fn new(piece: Buffer, sink: Box<dyn EntrySink>) -> Self {
+    pub(crate) fn new(piece: Buffer) -> Self {
         Self {
             piece,
-            sink,
-            accepted: Vec::new(),
-            refused: Vec::new(),
-            full: false,
+            listed: Vec::new(),
             skip: 0,
         }
     }
 
-    #[must_use]
-    pub fn accepted(&self) -> &[u64] {
-        &self.accepted
+    pub(crate) fn listed(&self) -> &[DirEntry] {
+        &self.listed
     }
 
-    #[must_use]
-    pub fn refused(&self) -> &[u64] {
-        &self.refused
-    }
-
-    #[must_use]
-    pub fn into_sink(self) -> Box<dyn EntrySink> {
-        self.sink
+    /// The nodes of every entry received, one lookup each.
+    pub(crate) fn lookups(&self) -> Vec<u64> {
+        self.listed
+            .iter()
+            .map(|listed| listed.entry.node_id)
+            .collect()
     }
 }
 
@@ -251,37 +229,25 @@ impl Destination for Entries {
             self.skip -= 1;
             return Ok(());
         }
-        let entry = Entry::of(&item.header.entry);
-        let listed = Listed {
-            name: item.tail,
-            entry,
+        self.listed.push(DirEntry {
+            name: item.tail.to_vec(),
+            entry: Entry::of(&item.header.entry),
             next_cookie: item.header.next_cookie.get(),
             entry_type: item.header.entry_type()? as u32,
-        };
-        if !self.full && self.sink.offer(&listed) {
-            self.full = true;
-        }
-        if self.full {
-            self.refused.push(entry.node_id);
-        } else {
-            self.accepted.push(entry.node_id);
-        }
+        });
         Ok(())
     }
 
     fn restartable(&self) -> bool {
-        self.accepted.is_empty() && self.refused.is_empty()
+        self.listed.is_empty()
     }
 
     fn restart(&mut self) {
-        self.sink.take_back(self.accepted.len());
-        self.accepted.clear();
-        self.refused.clear();
-        self.full = false;
+        self.listed.clear();
     }
 
     fn resume(&mut self) {
-        self.skip = self.accepted.len() + self.refused.len();
+        self.skip = self.listed.len();
     }
 
     fn owed(lent: Lent<Self>) -> Owed {
@@ -1398,42 +1364,36 @@ pub(crate) mod tests {
         taken: Vec<u64>,
     }
 
+    impl Recording {
+        fn with_room(room: usize) -> Self {
+            Self {
+                room,
+                taken: Vec::new(),
+            }
+        }
+    }
+
     impl EntrySink for Recording {
-        fn offer(&mut self, entry: &Listed<'_>) -> bool {
+        fn offer(&mut self, entry: &DirEntry) -> bool {
             if self.taken.len() == self.room {
                 return true;
             }
             self.taken.push(entry.entry.node_id);
             false
         }
-
-        fn take_back(&mut self, count: usize) {
-            self.taken.truncate(self.taken.len().saturating_sub(count));
-        }
-    }
-
-    async fn listing(room: usize) -> Entries {
-        let piece = Memory::host().buffer(Entries::piece_len(), 1).await;
-        Entries::new(
-            piece,
-            Box::new(Recording {
-                room,
-                taken: Vec::new(),
-            }),
-        )
     }
 
     async fn listed(
-        room: usize,
         pieces: &[Vec<u8>],
         close: Vec<u8>,
     ) -> (Entries, Result<Streamed, rustix::io::Errno>) {
         let (connection, mut reader, mut server) = pair();
+        let piece_buffer = Memory::host().buffer(Entries::piece_len(), 1).await;
         let (id, call) = request(
             &connection,
             &mut server,
             Opcode::Readdirplus,
-            listing(room).await,
+            Entries::new(piece_buffer),
         )
         .await;
         let mut stream = head(id, &ReaddirplusResponse);
@@ -1463,9 +1423,11 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn a_listing_that_fails_partway_gives_every_entry_back() {
         let pieces = [entry(7, b"seven"), entry(8, b"eight")];
-        let (entries, streamed) = listed(8, &pieces, closing(-5, false)).await;
-        assert_eq!(entries.accepted(), &[7, 8]);
-        let settled = settle(&entries, streamed);
+        let (entries, streamed) = listed(&pieces, closing(-5, false)).await;
+        assert_eq!(entries.lookups(), vec![7, 8]);
+        let mut sink = Recording::with_room(8);
+        let settled = settle(&mut sink, &entries, streamed);
+        assert!(sink.taken.is_empty(), "no entry reaches the kernel");
         assert_eq!(settled.give_back, vec![7, 8]);
         assert!(settled.accepted.is_empty());
         assert_eq!(settled.outcome, Err(rustix::io::Errno::IO));
@@ -1474,8 +1436,10 @@ pub(crate) mod tests {
     #[tokio::test]
     async fn the_exhausted_bit_and_not_a_short_batch_ends_a_listing() {
         let pieces = [entry(1, b"one"), entry(2, b"two"), entry(3, b"three")];
-        let (entries, streamed) = listed(2, &pieces, closing(0, true)).await;
-        let settled = settle(&entries, streamed);
+        let (entries, streamed) = listed(&pieces, closing(0, true)).await;
+        let mut sink = Recording::with_room(2);
+        let settled = settle(&mut sink, &entries, streamed);
+        assert_eq!(sink.taken, vec![1, 2]);
         assert_eq!(settled.accepted, vec![1, 2]);
         assert_eq!(
             settled.give_back,
@@ -1484,8 +1448,8 @@ pub(crate) mod tests {
         );
         assert_eq!(settled.outcome, Ok(true));
 
-        let (entries, streamed) = listed(8, &pieces[..1], closing(0, false)).await;
-        let settled = settle(&entries, streamed);
+        let (entries, streamed) = listed(&pieces[..1], closing(0, false)).await;
+        let settled = settle(&mut Recording::with_room(8), &entries, streamed);
         assert_eq!(settled.outcome, Ok(false), "a short batch is not the end");
         assert!(settled.give_back.is_empty());
     }

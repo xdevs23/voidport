@@ -431,10 +431,6 @@ impl DirectorySink for Tripwire {
         false
     }
 
-    fn take_back(&mut self, count: usize) {
-        self.taken = self.taken.saturating_sub(count);
-    }
-
     fn counts_lookups(&self) -> bool {
         true
     }

@@ -15,7 +15,7 @@ use std::any::Any;
 use rustix::io::Errno;
 use voidport_fuse::{Attributes, FileType};
 
-use crate::client::{Caller, Client, EntrySink, Listed};
+use crate::client::{Caller, Client, DirEntry, EntrySink};
 use crate::fuse::attr::{Privileged, dirent_kind, entry_attr};
 
 #[derive(Clone, Copy, Debug)]
@@ -32,8 +32,6 @@ pub trait DirectorySink: Send + 'static {
     /// Returns `true` when the buffer refused the entry because it is full.
     fn offer(&mut self, entry: &DirectoryEntry<'_>) -> bool;
 
-    fn take_back(&mut self, count: usize);
-
     /// False for plain `readdir`, whose entries the kernel does not account for.
     fn counts_lookups(&self) -> bool;
 }
@@ -48,23 +46,17 @@ pub struct DirectoryRead {
 struct Offer<S> {
     sink: S,
     privileged: Privileged,
-    start: u64,
-    cookies: Vec<u64>,
+    /// The cookie after the last entry the sink took.
+    cookie: u64,
     full: bool,
 }
 
-impl<S> Offer<S> {
-    fn cookie(&self) -> u64 {
-        self.cookies.last().copied().unwrap_or(self.start)
-    }
-}
-
 impl<S: DirectorySink> EntrySink for Offer<S> {
-    fn offer(&mut self, entry: &Listed<'_>) -> bool {
+    fn offer(&mut self, entry: &DirEntry) -> bool {
         let attributes = entry_attr(&entry.entry, self.privileged);
         let refused = self.sink.offer(&DirectoryEntry {
             node_id: entry.entry.node_id,
-            name: entry.name,
+            name: &entry.name,
             offset: entry.next_cookie,
             kind: dirent_kind(entry.entry_type, entry.entry.attr.mode.get()),
             attributes: &attributes,
@@ -73,16 +65,9 @@ impl<S: DirectorySink> EntrySink for Offer<S> {
         if refused {
             self.full = true;
         } else {
-            self.cookies.push(entry.next_cookie);
+            self.cookie = entry.next_cookie;
         }
         refused
-    }
-
-    fn take_back(&mut self, count: usize) {
-        self.sink.take_back(count);
-        self.cookies
-            .truncate(self.cookies.len().saturating_sub(count));
-        self.full = false;
     }
 }
 
@@ -99,8 +84,7 @@ pub async fn read_directory<S: DirectorySink>(
     let mut offer = Box::new(Offer {
         sink,
         privileged,
-        start: read.cookie,
-        cookies: Vec::new(),
+        cookie: read.cookie,
         full: false,
     });
     // A later request that ends in an errno answers the kernel that errno, so
@@ -110,14 +94,7 @@ pub async fn read_directory<S: DirectorySink>(
     let page = u32::try_from(rustix::param::page_size()).unwrap_or(u32::MAX);
     let outcome = loop {
         let listing = client
-            .readdirplus(
-                caller,
-                read.node_id,
-                read.handle,
-                offer.cookie(),
-                page,
-                offer,
-            )
+            .readdirplus(caller, read.node_id, read.handle, offer.cookie, page, offer)
             .await;
         let any: Box<dyn Any> = listing.sink;
         offer = match any.downcast::<Offer<S>>() {

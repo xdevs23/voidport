@@ -9,7 +9,7 @@ use rustix::io::Errno;
 use support::daemon::{Ground, reconnected_after, runtime};
 use support::relay::{Cut, Latch, Relay};
 use voidport::client::{
-    Caller, Client, Connections, Data, EntrySink, Interrupt, Listed, Lock, LockKind, MountState,
+    Caller, Client, Connections, Data, DirEntry, EntrySink, Interrupt, Lock, LockKind, MountState,
     Placement,
 };
 use voidport::subscribe::{ShareEvent, Subscription};
@@ -688,15 +688,9 @@ fn a_queued_forget_of_an_ended_session_never_reaches_the_newer_one() {
 struct Recording(Arc<Mutex<Vec<Vec<u8>>>>);
 
 impl EntrySink for Recording {
-    fn offer(&mut self, entry: &Listed<'_>) -> bool {
-        self.0.lock().expect("unpoisoned").push(entry.name.to_vec());
+    fn offer(&mut self, entry: &DirEntry) -> bool {
+        self.0.lock().expect("unpoisoned").push(entry.name.clone());
         false
-    }
-
-    fn take_back(&mut self, count: usize) {
-        let mut names = self.0.lock().expect("unpoisoned");
-        let kept = names.len().saturating_sub(count);
-        names.truncate(kept);
     }
 }
 
@@ -780,7 +774,7 @@ fn a_listing_cut_off_with_its_session_is_answered_by_the_next_session() {
     assert_eq!(listing.outcome, Err(Errno::STALE));
     assert!(
         names.lock().expect("unpoisoned").is_empty(),
-        "the entries of the ended session were taken back"
+        "no entry of the ended session reached the sink"
     );
     assert!(listing.accepted.is_empty());
     assert_eq!(

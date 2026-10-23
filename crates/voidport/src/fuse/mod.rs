@@ -1046,11 +1046,6 @@ impl DirectorySink for PlusSink {
         full
     }
 
-    fn take_back(&mut self, count: usize) {
-        self.reply.take_back(count);
-        self.taken.truncate(self.taken.len().saturating_sub(count));
-    }
-
     fn counts_lookups(&self) -> bool {
         true
     }
@@ -1068,10 +1063,6 @@ impl DirectorySink for PlainSink {
             entry.kind,
             OsStr::from_bytes(entry.name),
         )
-    }
-
-    fn take_back(&mut self, count: usize) {
-        self.reply.take_back(count);
     }
 
     fn counts_lookups(&self) -> bool {

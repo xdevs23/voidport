@@ -257,8 +257,6 @@ pub enum Plus {}
 pub struct ReplyListing<Kind> {
     reply: Reply,
     buffer: Vec<u8>,
-    /// Where each record added starts in the buffer, in order.
-    records: Vec<usize>,
     limit: usize,
     kind: PhantomData<Kind>,
 }
@@ -272,7 +270,6 @@ impl<Kind> ReplyListing<Kind> {
         Self {
             reply,
             buffer: Vec::new(),
-            records: Vec::new(),
             limit: size as usize,
             kind: PhantomData,
         }
@@ -285,21 +282,10 @@ impl<Kind> ReplyListing<Kind> {
         if end > self.limit {
             return true;
         }
-        self.records.push(self.buffer.len());
         self.buffer.extend_from_slice(head);
         self.buffer.extend_from_slice(name);
         self.buffer.resize(end, 0);
         false
-    }
-
-    /// Removes the last `count` entries added, or every entry when fewer were
-    /// added, so that the entries added next follow the ones that remain.
-    pub fn take_back(&mut self, count: usize) {
-        let kept = self.records.len().saturating_sub(count);
-        if let Some(&start) = self.records.get(kept) {
-            self.buffer.truncate(start);
-        }
-        self.records.truncate(kept);
     }
 
     /// Answers with the entries added, where none means the end of the
@@ -464,37 +450,6 @@ mod tests {
         let (second, name) = abi::Dirent::read_from_prefix(&rest[8..]).expect("a record");
         assert_eq!(second.ino.get(), 4);
         assert_eq!(&name[..10], b"abcdefghij");
-    }
-
-    #[test]
-    fn entries_taken_back_leave_the_reply_as_it_was_before_them() {
-        let (reply, kernel) = reply();
-        let mut listing = ReplyDirectory::new(reply, 4096);
-        assert!(!listing.add(3, 1, FileType::Directory, OsStr::new("a")));
-        assert!(!listing.add(4, 2, FileType::RegularFile, OsStr::new("abcdefghij")));
-        assert!(!listing.add(5, 3, FileType::RegularFile, OsStr::new("b")));
-        listing.take_back(2);
-        assert!(!listing.add(6, 2, FileType::RegularFile, OsStr::new("c")));
-        listing.ok();
-
-        let (_, payload) = answer(&kernel);
-        assert_eq!(payload.len(), 32 + 32, "two records of a 1-byte name");
-        let (first, rest) = abi::Dirent::read_from_prefix(&payload).expect("a record");
-        assert_eq!(first.ino.get(), 3);
-        let (second, name) = abi::Dirent::read_from_prefix(&rest[8..]).expect("a record");
-        assert_eq!((second.ino.get(), second.off.get()), (6, 2));
-        assert_eq!(&name[..1], b"c");
-    }
-
-    #[test]
-    fn taking_back_more_entries_than_were_added_empties_the_reply() {
-        let (reply, kernel) = reply();
-        let mut listing = ReplyDirectory::new(reply, 4096);
-        assert!(!listing.add(3, 1, FileType::Directory, OsStr::new("a")));
-        listing.take_back(2);
-        listing.ok();
-        let (_, payload) = answer(&kernel);
-        assert!(payload.is_empty(), "nothing is left");
     }
 
     #[test]

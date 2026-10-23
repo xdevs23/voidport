@@ -17,7 +17,7 @@ mod pool;
 mod storage;
 mod transport;
 
-pub use connection::{Data, Entries, EntrySink, Listed, Notice};
+pub use connection::{Data, EntrySink, Notice};
 pub use interrupt::{Interrupt, Raise};
 pub use ops::{
     AttrChange, Granted, Listing, Lock, LockKind, NewFile, Placement, Streamed, TimeChange,
@@ -463,8 +463,8 @@ impl Client {
     ///
     /// `destination` comes back with every outcome, an error before any attempt
     /// included. A destination that cannot be restarted while its session lives,
-    /// one whose entries already reached the reply of the kernel, fails the
-    /// request instead of being sent again in that session.
+    /// one that already received entries, fails the request instead of being
+    /// sent again in that session.
     ///
     /// `kept` is the most bytes the kept reply of the server to this request can
     /// take.

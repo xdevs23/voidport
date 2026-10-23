@@ -65,13 +65,6 @@ impl DirectorySink for Collector {
         false
     }
 
-    fn take_back(&mut self, count: usize) {
-        let kept = self.names.len().saturating_sub(count);
-        self.names.truncate(kept);
-        self.accepted.truncate(kept);
-        self.offsets.truncate(kept);
-    }
-
     fn counts_lookups(&self) -> bool {
         self.counts
     }
