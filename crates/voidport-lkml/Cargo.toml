@@ -32,6 +32,7 @@ voidport-spawn.workspace = true
 
 [dev-dependencies]
 voidport-fuse.workspace = true
+voidport-test-host.workspace = true
 
 [build-dependencies]
 clap.workspace = true

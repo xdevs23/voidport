@@ -1,6 +1,6 @@
 [package]
 name = "voidport-test-host"
-description = "voidport test scaffolding: scratch space and the vsock capability probe, with no dependency on another crate of the workspace. Unpublished, dev-only."
+description = "voidport test scaffolding: scratch space, the vsock capability probe and the name of a test for a rerun of it, with no dependency on another crate of the workspace. Unpublished, dev-only."
 version.workspace = true
 edition.workspace = true
 license.workspace = true

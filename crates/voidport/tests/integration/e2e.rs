@@ -17,6 +17,7 @@ use support::{
 };
 use voidport::mount::{MountOptions, TeardownError};
 use voidport_spawn::{Program, Stream};
+use voidport_test_support::test_name;
 
 const PATIENCE: Duration = Duration::from_secs(10);
 
@@ -1058,7 +1059,7 @@ fn lock_waiter(path: &std::path::Path) -> std::process::Child {
     Program::new(std::env::current_exe().expect("the test binary"))
         .args([
             "--exact",
-            "e2e::a_blocking_lock_waiter_in_its_own_process",
+            &test_name!(a_blocking_lock_waiter_in_its_own_process),
             "--test-threads=1",
         ])
         .env(LOCK_WAITER, path)

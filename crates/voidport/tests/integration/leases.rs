@@ -22,6 +22,7 @@ use support::{Fixture, Guest};
 use voidport::mount::MountOptions;
 use voidport_proto::opcode::Opcode;
 use voidport_spawn::{Program, Stream};
+use voidport_test_support::test_name;
 use voidportd::host::lease;
 
 const PAGE: usize = 4096;
@@ -158,7 +159,7 @@ impl Mapper {
         let mut process = Program::new(std::env::current_exe().expect("the test binary"))
             .args([
                 "--exact",
-                "leases::a_mapping_in_its_own_process",
+                &test_name!(a_mapping_in_its_own_process),
                 "--test-threads=1",
                 "--nocapture",
             ])

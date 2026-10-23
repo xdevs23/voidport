@@ -13,6 +13,6 @@ pub use reported::{bound_vsock_port, vsock_port};
 pub use server::{
     RunningServer, daemon_config, descriptor_flags, invoking_environment, open_descriptors,
 };
-pub use voidport_test_host::{Scratch, create_directory, scratch_root, vsock};
+pub use voidport_test_host::{Scratch, create_directory, scratch_root, test_name, vsock};
 pub use voidportd::daemon::DaemonConfig;
 pub use wait::{readable, until};

@@ -19,6 +19,7 @@ use voidport_lkml::{
     storage::{Corpus, DataDirectory, FORMAT_VERSION_3, Writer, digest},
 };
 use voidport_spawn::{Program, Stream};
+use voidport_test_host::test_name;
 
 #[test]
 fn query_receipts_exact_bytes_counts_and_offline_readers() {
@@ -341,7 +342,7 @@ fn large_tmp_is_not_read_or_ingested() {
         let status = Program::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
-                "acquisition::large_tmp_is_not_read_or_ingested",
+                &test_name!(large_tmp_is_not_read_or_ingested),
                 "--nocapture",
             ])
             .env("LKML_LIMIT_TMP_READ", "1")

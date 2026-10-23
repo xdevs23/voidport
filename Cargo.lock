@@ -3009,6 +3009,7 @@ dependencies = [
  "voidport-fuse",
  "voidport-lkml-cli",
  "voidport-spawn",
+ "voidport-test-host",
 ]
 
 [[package]]

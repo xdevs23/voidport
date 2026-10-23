@@ -19,14 +19,13 @@ use sha2::{Digest as _, Sha256};
 use support::Fixture;
 use support::namespace::{NamespaceCopy, in_copy};
 use voidport_spawn::{Program, Stream};
+use voidport_test_support::test_name;
 
 const IMAGE_BYTES: u64 = 256 * 1024 * 1024;
 
 const FILES: usize = 48;
 
 const FILE_BYTES: usize = 64 * 1024;
-
-const TEST: &str = "loopimage::a_btrfs_image_on_the_mount_formats_mounts_and_checks_clean";
 
 const IMAGE_DEVICE: &str = "VOIDPORT_TEST_IMAGE_DEVICE";
 
@@ -110,7 +109,11 @@ struct Filler {
 impl Filler {
     fn start(device: &str, mountpoint: &Path) -> Self {
         let mut process = in_copy(std::env::current_exe().expect("the test binary"))
-            .args(["--exact", TEST, "--nocapture"])
+            .args([
+                "--exact",
+                &test_name!(a_btrfs_image_on_the_mount_formats_mounts_and_checks_clean),
+                "--nocapture",
+            ])
             .env(IMAGE_DEVICE, device)
             .env(IMAGE_MOUNTPOINT, mountpoint)
             .stdin(Stream::Piped)
