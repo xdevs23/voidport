@@ -1,11 +1,13 @@
 #![forbid(unsafe_code)]
 
+#[path = "support/pty.rs"]
+mod pty;
 mod support;
 
 use std::os::unix::net::UnixListener;
 use std::path::PathBuf;
 
-use support::pty::{
+use pty::{
     ACKNOWLEDGEMENT, SCENARIO, SOCKET, STATE_FILE, acknowledge, await_observation, spawn, unique,
 };
 use voidport_pty::{CTRL_Z, ENTER_ALTERNATE, LEAVE_ALTERNATE, Pty};

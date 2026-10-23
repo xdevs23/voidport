@@ -1,24 +1,10 @@
-#![allow(dead_code, reason = "each test file uses part of this")]
-
-pub mod pty;
-
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
-use voidport_test_support::{RunningServer, create_directory, daemon_config, scratch_root};
-
-#[allow(
-    unused_imports,
-    reason = "each integration test file uses part of this"
-)]
-pub use voidport_test_support::tui::{Harness, PATIENCE};
-
-#[must_use]
-pub fn patience() -> Duration {
-    PATIENCE
-}
+use voidport_test_support::{
+    DaemonConfig, RunningServer, create_directory, daemon_config, scratch_root,
+};
 
 /// The path of the unix listener is filled in per fixture, because two
 /// suites running side by side must not use the same socket.
@@ -70,11 +56,6 @@ impl TempDir {
     }
 
     #[must_use]
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    #[must_use]
     pub fn join(&self, name: &str) -> PathBuf {
         self.path.join(name)
     }
@@ -96,30 +77,20 @@ impl Drop for TempDir {
 
 #[must_use]
 pub fn fixture(label: &str) -> (TempDir, RunningServer) {
+    fixture_with(label, |config| config)
+}
+
+#[must_use]
+pub fn fixture_with(
+    label: &str,
+    configure: impl FnOnce(DaemonConfig) -> DaemonConfig,
+) -> (TempDir, RunningServer) {
     let directory = TempDir::new(label);
     directory.directory("project");
     directory.directory("data");
     let state_file = directory.join("state.toml");
     fs::write(&state_file, state(&directory)).expect("a writable state file");
-    let server = start(&state_file);
-    (directory, server)
-}
-
-#[must_use]
-pub fn start(state_file: &Path) -> RunningServer {
-    let config = daemon_config(state_file);
-    RunningServer::start(&config).expect("the server starts")
-}
-
-/// The path is only reported to the server, never opened by it.
-#[must_use]
-pub fn logging_fixture(label: &str, log_file: &Path) -> (TempDir, RunningServer) {
-    let directory = TempDir::new(label);
-    directory.directory("project");
-    directory.directory("data");
-    let state_file = directory.join("state.toml");
-    fs::write(&state_file, state(&directory)).expect("a writable state file");
-    let config = daemon_config(&state_file).with_log_file(log_file);
+    let config = configure(daemon_config(&state_file));
     let server = RunningServer::start(&config).expect("the server starts");
     (directory, server)
 }
