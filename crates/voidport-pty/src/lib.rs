@@ -260,8 +260,10 @@ impl Drop for Pty {
     /// the test run.
     fn drop(&mut self) {
         if matches!(self.child.try_wait(), Ok(None)) {
-            let _ = self.child.kill();
-            let _ = self.child.wait();
+            let ended = self.child.kill().and_then(|()| self.child.wait());
+            if let Err(error) = ended {
+                eprintln!("the pty child {} is not ended: {error}", self.child.id());
+            }
         }
     }
 }
