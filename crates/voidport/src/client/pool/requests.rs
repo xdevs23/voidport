@@ -18,7 +18,9 @@ use zerocopy::byteorder::little_endian::U64;
 
 use super::{Checkout, Pool};
 use crate::client::Caller;
-use crate::client::connection::{Answer, Data, Destination, Forgotten, Nothing, Unsent, encode};
+use crate::client::connection::{
+    Answer, Data, Destination, Forget, Forgotten, Nothing, Unsent, encode,
+};
 
 /// A forget has no reply.
 const NO_REPLY: usize = 0;
@@ -123,58 +125,53 @@ impl Pool {
             };
             match forget_settled(self.ask(question, NO_REPLY).await) {
                 ForgetSettled::Done | ForgetSettled::Unknown(_) => {}
-                ForgetSettled::SendAgain => {
-                    self.forget(forgotten.caller, forgotten.node_id, forgotten.nlookup)
-                        .await;
-                }
+                ForgetSettled::SendAgain => self.forget(&[forgotten.forget]).await,
                 ForgetSettled::SessionEnded => return,
             }
         }
     }
 
-    /// The forget is recorded on its connection before it is written, so the
-    /// loss of that connection settles it.
-    pub async fn forget(self: &Arc<Self>, caller: Caller, node_id: u64, nlookup: u64) {
-        loop {
+    /// Sends `forgets` in order, back to back on one connection, and moves the
+    /// rest to another connection only when that one is lost.
+    pub async fn forget(self: &Arc<Self>, forgets: &[Forget]) {
+        let mut unsent = forgets;
+        while !unsent.is_empty() {
             let Ok(connection) = self.take().await else {
                 // The session ended: its nodes went with it.
                 return;
             };
-            let Ok(request_id) = connection.take_request_id() else {
-                connection.give_back();
-                return;
-            };
-            let body = ForgetRequest {
-                nlookup: U64::new(nlookup),
-            };
-            let Ok(frame) = encode(request_id, caller, node_id, &body, &[]) else {
-                tracing::error!("a forget could not be encoded");
-                connection.give_back();
-                return;
-            };
-            connection.wrote_forget(Forgotten {
-                request_id,
-                caller,
-                node_id,
-                nlookup,
-            });
-            let sent = connection.send(&frame).await;
-            match forget_sent(sent) {
-                ForgetSent::Written => {
-                    connection.give_back();
-                    return;
-                }
-                ForgetSent::Lost => {
-                    let send_again = connection.withdraw_forget(request_id);
-                    connection.lost();
-                    connection.give_back();
-                    if !send_again {
-                        return;
-                    }
-                }
-            }
+            unsent = write_forgets(&connection, unsent).await;
+            connection.give_back();
         }
     }
+}
+
+/// Each forget is recorded on `connection` before it is written, so the loss of
+/// that connection settles it. Returns the forgets that follow a loss.
+async fn write_forgets<'f>(connection: &Checkout, forgets: &'f [Forget]) -> &'f [Forget] {
+    for (at, &forget) in forgets.iter().enumerate() {
+        let Ok(request_id) = connection.take_request_id() else {
+            return &forgets[at + 1..];
+        };
+        let body = ForgetRequest {
+            nlookup: U64::new(forget.nlookup),
+        };
+        let Ok(frame) = encode(request_id, forget.caller, forget.node_id, &body, &[]) else {
+            tracing::error!("a forget could not be encoded");
+            continue;
+        };
+        connection.wrote_forget(Forgotten { request_id, forget });
+        if let ForgetSent::Lost = forget_sent(connection.send(&frame).await) {
+            let send_again = connection.withdraw_forget(request_id);
+            connection.lost();
+            return if send_again {
+                &forgets[at..]
+            } else {
+                &forgets[at + 1..]
+            };
+        }
+    }
+    &[]
 }
 
 fn outcome_answer(frame: &[u8], closing: Option<Closing>) -> Result<OutcomeAnswer, FramingError> {

@@ -4,6 +4,7 @@ mod accounting;
 mod cli;
 mod connections;
 mod direct_io;
+mod dispatch;
 mod e2e;
 mod faults;
 mod identity;

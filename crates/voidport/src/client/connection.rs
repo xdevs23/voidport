@@ -408,11 +408,16 @@ pub struct Connection {
 }
 
 #[derive(Clone, Copy, Debug)]
-pub struct Forgotten {
-    pub request_id: u64,
+pub struct Forget {
     pub caller: Caller,
     pub node_id: u64,
     pub nlookup: u64,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct Forgotten {
+    pub request_id: u64,
+    pub forget: Forget,
 }
 
 #[derive(Debug)]

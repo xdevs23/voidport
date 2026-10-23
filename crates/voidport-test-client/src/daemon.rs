@@ -567,9 +567,13 @@ impl Ground {
 
     #[must_use]
     pub fn mount_with(&self, label: &str, options: &MountOptions) -> Guest {
+        self.mount_with_url(label, &self.server.url("work", ""), options)
+    }
+
+    #[must_use]
+    pub fn mount_with_url(&self, label: &str, url: &str, options: &MountOptions) -> Guest {
         let mountpoint = self.directory.directory(&format!("mnt-{label}"));
-        let url = self.server.url("work", "");
-        let parsed = MountUrl::parse(&url).unwrap_or_else(|error| panic!("{url}: {error}"));
+        let parsed = MountUrl::parse(url).unwrap_or_else(|error| panic!("{url}: {error}"));
         let mount = Mount::new(&parsed, &mountpoint, options, &crate::guardian())
             .unwrap_or_else(|error| panic!("mounting {url} failed: {error:?}"));
         Guest::adopt(mount, mountpoint)
