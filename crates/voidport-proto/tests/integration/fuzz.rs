@@ -1,5 +1,3 @@
-#![forbid(unsafe_code)]
-
 use voidport_proto::error::FramingError;
 use voidport_proto::frame::{FLAG_RESPONSE, Frame, FrameHeader, FrameKind, FrameWriter, Parsed};
 use voidport_proto::limits::Limits;

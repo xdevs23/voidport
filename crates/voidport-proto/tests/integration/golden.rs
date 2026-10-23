@@ -3,8 +3,6 @@
 //! field of a struct therefore has its own byte signature, so a swapped pair
 //! of fields shows up immediately.
 
-#![forbid(unsafe_code)]
-
 use core::fmt::Debug;
 use voidport_proto::ops::dir::EntryType;
 
