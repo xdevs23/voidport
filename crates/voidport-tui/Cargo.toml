@@ -25,15 +25,5 @@ voidport-test-support = { workspace = true }
 name = "integration"
 path = "tests/integration/main.rs"
 
-# The terminal suite starts a child process on a pty for every case. A child
-# has a copy of every descriptor of the test process until it starts the
-# program it was created for. The control suite starts a server on the state
-# file of a server it stopped, and a copy of the descriptor of the state lock
-# in such a child makes that start fail. So the terminal suite is a test binary
-# of its own.
-[[test]]
-name = "terminal"
-path = "tests/terminal.rs"
-
 [lints]
 workspace = true

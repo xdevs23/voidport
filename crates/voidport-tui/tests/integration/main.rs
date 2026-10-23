@@ -2,5 +2,5 @@
 
 mod control;
 mod render;
-#[path = "../support/mod.rs"]
 mod support;
+mod terminal;
