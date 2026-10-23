@@ -58,7 +58,9 @@ fn serving_failure_child() {
     let (report, stopped) = std::sync::mpsc::channel();
     std::thread::spawn(move || {
         await_observation();
-        let _ = report.send(Err(INJECTED.to_owned()));
+        report
+            .send(Err(INJECTED.to_owned()))
+            .expect("the report channel is still open");
     });
     let serving = Presentation::Serving(voidport_tui::Serving {
         notes: None,
@@ -84,7 +86,9 @@ fn real_serving_failure_child() {
     std::thread::spawn(move || {
         await_observation();
         server.stop();
-        let _ = report.send(Ok(()));
+        report
+            .send(Ok(()))
+            .expect("the report channel is still open");
     });
 
     let serving = Presentation::Serving(voidport_tui::Serving {

@@ -52,15 +52,17 @@ fn spawn(
 fn stderr_of(child: &mut Child) -> String {
     let mut stderr = String::new();
     if let Some(mut pipe) = child.stderr.take() {
-        let _ = pipe.read_to_string(&mut stderr);
+        let _length = pipe
+            .read_to_string(&mut stderr)
+            .expect("the error output of the daemon is text");
     }
     stderr
 }
 
 fn refused(mut child: Child, readiness: &ReadinessSocket) -> String {
     if ready(&child, readiness) {
-        let _ = child.kill();
-        let _ = child.wait();
+        child.kill().expect("the serving daemon is killed");
+        let _status = child.wait().expect("the killed daemon exits");
         panic!("the daemon must refuse to start, but it is serving");
     }
     let status = child.wait().expect("the daemon exits");
