@@ -1,0 +1,61 @@
+[package]
+name = "voidportd"
+description = "voidport server: serves policy-composed namespaces of the host filesystem"
+version.workspace = true
+edition.workspace = true
+license = "AGPL-3.0-only"
+
+[dependencies]
+voidport-control = { workspace = true, features = ["client"] }
+voidport-memory = { workspace = true }
+voidport-proto = { workspace = true, features = ["userspace"] }
+voidport-session = { workspace = true }
+voidport-tui = { workspace = true }
+voidport-vhost = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+ed25519-dalek = { workspace = true }
+jsonwebtoken = { workspace = true }
+libc = { workspace = true }
+linux-raw-sys = { workspace = true }
+memchr = { workspace = true }
+percent-encoding = { workspace = true }
+rustix = { workspace = true }
+sd-notify = { workspace = true }
+signal-hook-registry = { workspace = true }
+serde = { workspace = true }
+sha2 = { workspace = true }
+hex = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+tokio-vsock = { workspace = true }
+toml = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+uuid = { workspace = true }
+vhost = { workspace = true }
+virtio-queue = { workspace = true }
+vm-memory = { workspace = true }
+vsock = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+ed25519-dalek = { workspace = true, features = ["pem"] }
+voidport-pty = { workspace = true }
+voidport-test-host = { workspace = true }
+voidport-test-support = { workspace = true }
+voidport-test-server = { workspace = true }
+voidport-keeper = { workspace = true }
+vhost = { workspace = true, features = ["vhost-user-frontend"] }
+virtio-bindings = { workspace = true }
+virtio-queue = { workspace = true, features = ["test-utils"] }
+vmm-sys-util = { workspace = true }
+
+[build-dependencies]
+clap = { workspace = true }
+clap_mangen = { workspace = true }
+
+[lints]
+workspace = true

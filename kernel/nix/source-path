@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+set -euo pipefail
+export VOIDPORT_SOURCE_ROOT
+VOIDPORT_SOURCE_ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+nix-instantiate --eval --strict --read-write-mode --json --expr '
+  builtins.path {
+    path = builtins.toPath (builtins.getEnv "VOIDPORT_SOURCE_ROOT");
+    name = "voidport-source";
+    filter = path: type:
+      !(builtins.elem (builtins.baseNameOf path) [ ".cache" ".git" "TODO.md" ]);
+  }
+' | python3 -c 'import json, sys; print(json.load(sys.stdin))'

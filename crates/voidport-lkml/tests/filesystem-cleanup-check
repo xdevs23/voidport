@@ -1,0 +1,70 @@
+#!/usr/bin/env python3
+"""Offline regression for loop cleanup, including simultaneous failures."""
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import unittest
+
+HARNESS = os.environ.get("LKML_FILESYSTEM_HARNESS")
+if HARNESS is None:
+    # A program passed with python3 -c has no file next to it to locate the
+    # harness from.
+    if "__file__" not in globals():
+        sys.exit("set LKML_FILESYSTEM_HARNESS to the source of filesystem-check")
+    HARNESS = Path(__file__).with_name("filesystem-check").read_text()
+
+
+class Cleanup(unittest.TestCase):
+    def test_cleanup_errors_preserve_primary_failure_and_attempt_detach(self):
+        for failed_commands in [["umount"], ["losetup"], ["umount", "losetup"], []]:
+            with self.subTest(failed_commands=failed_commands):
+                # Execute the real cleanup function in a child so its exception
+                # chain and terminal exit are checked, not just mock call counts.
+                program = '''
+import json
+import os
+import subprocess
+namespace = {"__name__": "filesystem_check"}
+exec(compile(os.environ["LKML_FILESYSTEM_HARNESS"], "filesystem-check", "exec"), namespace)
+failed = json.loads(os.environ["LKML_FAILED_CLEANUP"])
+def controlled_run(arguments):
+    print(json.dumps(arguments), flush=True)
+    if arguments[0] in failed:
+        raise subprocess.CalledProcessError(31 if arguments[0] == "umount" else 32, arguments)
+namespace["run"] = controlled_run
+try:
+    raise RuntimeError("original filesystem assertion failed")
+finally:
+    namespace["cleanup"]("private-mount", "owned-loop", True)
+'''
+                result = subprocess.run(
+                    [sys.executable, "-c", program], capture_output=True, text=True,
+                    env=dict(os.environ, LKML_FILESYSTEM_HARNESS=HARNESS,
+                             LKML_FAILED_CLEANUP=json.dumps(failed_commands)),
+                )
+                self.assertNotEqual(result.returncode, 0)
+                self.assertEqual([json.loads(line) for line in result.stdout.splitlines()],
+                                 [["umount", "private-mount"], ["losetup", "--detach", "owned-loop"]])
+                self.assertIn("original filesystem assertion failed", result.stderr)
+                for command in failed_commands:
+                    self.assertIn(f"'{command}'", result.stderr)
+                    self.assertIn("31" if command == "umount" else "32", result.stderr)
+                print(result.stdout, end="")
+                print(result.stderr, end="", file=sys.stderr)
+
+    def test_successful_cleanup_order(self):
+        namespace = {"__name__": "filesystem_check"}
+        exec(compile(HARNESS, "filesystem-check", "exec"), namespace)
+        calls = []
+        namespace["run"] = calls.append
+        namespace["cleanup"]("private-mount", "owned-loop", True)
+        self.assertEqual(calls, [["umount", "private-mount"], ["losetup", "--detach", "owned-loop"]])
+        calls.clear()
+        namespace["cleanup"]("private-mount", "owned-loop", False)
+        self.assertEqual(calls, [["losetup", "--detach", "owned-loop"]])
+
+
+if __name__ == "__main__":
+    unittest.main(argv=[sys.argv[0]])

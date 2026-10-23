@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+inputs=${1:?usage: check-crate-inputs manifest workspace}
+root=${2:?usage: check-crate-inputs manifest workspace}
+
+die() {
+  printf 'crate inputs: %s\n' "$*" >&2
+  exit 1
+}
+
+same_content() {
+  local name=$1 own=$2 stored theirs mine
+  stored=$(jq -er --arg name "$name" \
+    '.[$name] | select(type == "string" and length > 0)' "$inputs") ||
+    die "$name is missing from the source manifest"
+  theirs=$(nix-store --query --hash "$stored") || die "$name is not in the store"
+  mine=$(nix-hash --type sha256 --base32 "$root/$own") ||
+    die "$own cannot be hashed"
+  [ "$theirs" = "sha256:$mine" ] ||
+    die "the module's $name is not the workspace's $own"
+  printf 'crate inputs: %s matches the workspace\n' "$name"
+}
+
+same_content voidport-proto crates/voidport-proto
+same_content voidport-session crates/voidport-session
+same_content lockfile Cargo.lock
+same_content kernel-options kernel/options

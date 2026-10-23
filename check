@@ -1,0 +1,19 @@
+#!/usr/bin/env bash
+# Usage: ./check [extra cargo-test args]
+set -euo pipefail
+cd "$(dirname "$0")"
+./.githooks/pre-commit --all
+if [ "$#" -eq 1 ] && [ "$1" = --hygiene ]; then
+  exit 0
+fi
+python3 slots/test_slots.py
+exec slots/slots.py nix develop path:. -c bash -c '
+  set -euo pipefail
+  cargo fmt --all --check
+  cargo clippy --workspace --all-targets -- -D warnings
+  # The sysroot of the target without a standard library is set through the
+  # flag, so the host build above is unaffected.
+  RUSTFLAGS="--sysroot=$VOIDPORT_NO_STD_SYSROOT" \
+    cargo check -p voidport-session --target "$VOIDPORT_NO_STD_TARGET"
+  cargo test --workspace "$@"
+' bash "$@"

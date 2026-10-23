@@ -1,0 +1,16 @@
+[package]
+name = "voidport-spawn"
+description = "voidport child processes: started from a thread whose descriptor table contains no file of the process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# `close_range` with `CLOSE_RANGE_UNSHARE` and `PIDFD_THREAD`, which rustix 1.1
+# does not offer.
+libc = { workspace = true }
+rustix = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

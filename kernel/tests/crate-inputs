@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+inputs=${1:?usage: crate-inputs manifest}
+checker="$root/kernel/check-crate-inputs"
+base="$root/.cache/voidport-crate-inputs"
+mkdir -p -- "$base"
+scratch=$(mktemp -d "$base/run.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+
+"$checker" "$inputs" "$root"
+printf 'PASS: unchanged shared crates and lockfile\n'
+
+expect_failure() {
+  local label=$1
+  if "$checker" "$scratch/inputs.json" "$root"; then
+    printf 'FAIL: %s was accepted\n' "$label" >&2
+    exit 1
+  fi
+  printf 'PASS: rejected %s\n' "$label"
+}
+
+for name in voidport-proto voidport-session lockfile kernel-options; do
+  jq --arg name "$name" --arg replacement "$inputs" \
+    '.[$name] = $replacement' "$inputs" >"$scratch/inputs.json"
+  expect_failure "changed $name"
+
+  jq --arg name "$name" 'del(.[$name])' "$inputs" >"$scratch/inputs.json"
+  expect_failure "missing $name"
+
+  jq --arg name "$name" '.[$name] = null' "$inputs" >"$scratch/inputs.json"
+  expect_failure "null $name"
+done
+
+printf '{' >"$scratch/inputs.json"
+expect_failure 'malformed manifest'
+printf 'PASS: all source-manifest cases\n'

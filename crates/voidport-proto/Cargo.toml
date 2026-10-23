@@ -1,0 +1,21 @@
+[package]
+name = "voidport-proto"
+description = "voidport wire protocol: opcodes, frame layout, and fixed-layout message types"
+version.workspace = true
+edition.workspace = true
+license = "MIT"
+
+[features]
+# The kernel module leaves this off and supplies the bounds from its own
+# bindings, so the crate stays without the standard library there.
+userspace = ["dep:linux-raw-sys"]
+
+[dependencies]
+linux-raw-sys = { workspace = true, optional = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+linux-raw-sys = { workspace = true }
+
+[lints]
+workspace = true

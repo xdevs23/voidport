@@ -1,0 +1,10 @@
+[package]
+name = "voidport-kernel-options"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+[workspace]
+
+[dependencies]
+fixed = { version = "=1.29.0", default-features = false }

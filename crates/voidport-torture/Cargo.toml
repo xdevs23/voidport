@@ -1,0 +1,43 @@
+[package]
+name = "voidport-torture"
+description = "voidport torture harness: every operation class at once, for hours, with the invariants asserted throughout"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The mount itself: the harness drives real FUSE mounts of a real server, and
+# mounting is what this crate does.
+voidport = { path = "../voidport" }
+# The node and handle counts a leak would show up in are the control plane's
+# session view, and the control classes speak to it: this crate dials the
+# control socket itself, so it asks for the client and does not wait for another
+# crate's dependency to enable it.
+voidport-control = { workspace = true, features = ["client"] }
+# The lock-storm class speaks the data plane directly; see `wire`.
+voidport-proto = { workspace = true, features = ["userspace"] }
+# The shell that starts the servers comes from a thread whose descriptor table
+# contains no file of a mount of the run; see `server`.
+voidport-spawn = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+# The restart class parses the state file after a crash, independently of the
+# server that is about to be started on it again.
+toml = { workspace = true }
+# The lock-storm class dials every transport a mount URL can name, vsock
+# included, and it speaks the wire synchronously; see `wire`.
+vsock = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+# The smoke variant runs a real server, started exactly as its binary starts
+# it, from the runner the other suites share.
+voidport-test-support = { workspace = true }
+
+[lints]
+workspace = true

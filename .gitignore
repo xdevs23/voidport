@@ -1,0 +1,8 @@
+/target
+/.cache/
+# `nix build` leaves this symlink into the store at the root of whatever
+# directory it was run in.
+/result
+# The test helpers are loaded by path, so running the harness leaves compiled
+# bytecode beside them. It is regenerated on every run and never an input.
+__pycache__/

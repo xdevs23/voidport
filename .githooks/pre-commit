@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+# Fails on files that do not belong to the project: foreign source trees and
+# build artifacts, and top-level entries off the allowlist.
+set -euo pipefail
+
+allowed_top='^(Cargo\.lock|Cargo\.toml|check|crates|examples|flake\.lock|flake\.nix|kernel|\.gitignore|LICENSES|nix|README\.md|slots|\.githooks)(/|$)'
+foreign_ext='\.(c|h|cpp|hpp|cc|hh|cxx|hxx|ko|o|a|so|orig|rej)$'
+
+# The C files that are allowed: the logic-free forwarders for static-inline
+# kernel helpers with their header, the header for the generated bindings of
+# the transport, and the compatibility header.
+allowed_c='^kernel/(transport/voidport_helpers\.[ch]|transport/transport_bindings\.h|compat\.h)$'
+
+if [ "${1:-}" = "--all" ]; then
+  files=$(git ls-files)
+else
+  files=$(git diff --cached --name-only --diff-filter=ACR)
+fi
+
+bad=0
+while IFS= read -r file; do
+  [ -z "$file" ] && continue
+  if ! printf '%s\n' "$file" | grep -Eq "$allowed_top"; then
+    echo "hygiene: '$file' is outside the allowed top-level layout" >&2
+    bad=1
+  fi
+  if printf '%s\n' "$file" | grep -Eq "$foreign_ext" &&
+    ! printf '%s\n' "$file" | grep -Eq "$allowed_c"; then
+    echo "hygiene: '$file' looks like a foreign source or build artifact" >&2
+    bad=1
+  fi
+done <<< "$files"
+
+if [ "$bad" -ne 0 ]; then
+  echo "hygiene: refusing. External files never enter this history." >&2
+  echo "Move investigation copies to the project cache directory," >&2
+  echo "or extend the allowlist in .githooks/pre-commit deliberately." >&2
+  exit 1
+fi
+
+exec "$(dirname "$0")/check-vocab" "$@"

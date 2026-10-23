@@ -1,0 +1,20 @@
+[package]
+name = "voidport-session"
+description = "voidport session core: handshake validation, request tracking, replay discipline and reconnect, shared by both clients"
+version.workspace = true
+edition.workspace = true
+# MIT, because the in-kernel client is GPL-2.0-only and the two copyleft
+# versions do not combine.
+license = "MIT"
+
+[dependencies]
+voidport-proto = { workspace = true }
+
+# Not a dependency of the crate, which keeps the rule set of the kernel build
+# small.
+[dev-dependencies]
+zerocopy = { workspace = true }
+voidport-proto = { workspace = true, features = ["userspace"] }
+
+[lints]
+workspace = true

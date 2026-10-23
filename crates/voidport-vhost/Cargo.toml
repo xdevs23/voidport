@@ -1,0 +1,17 @@
+[package]
+name = "voidport-vhost"
+description = "voidport vhost-user device: the offer, the messages it handles, the guest memory a frontend hands over, the queues in it, their eventfds and the record of their chains in flight, shared by the server and the keeper"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+rustix = { workspace = true }
+thiserror = { workspace = true }
+vhost = { workspace = true }
+virtio-bindings = { workspace = true }
+virtio-queue = { workspace = true }
+vm-memory = { workspace = true }
+
+[lints]
+workspace = true

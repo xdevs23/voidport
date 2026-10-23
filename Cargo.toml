@@ -1,0 +1,136 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/voidport-proto",
+    "crates/voidport-memory",
+    "crates/voidport-session",
+    "crates/voidport-control",
+    "crates/voidportd",
+    "crates/voidport-spawn",
+    "crates/voidport-fuse",
+    "crates/voidport",
+    "crates/voidport-ctl",
+    "crates/voidport-tui",
+    "crates/voidport-bench",
+    "crates/voidport-torture",
+    "crates/voidport-wire-census",
+    "crates/voidport-pty",
+    "crates/voidport-test-host",
+    "crates/voidport-test-support",
+    "crates/voidport-test-client",
+    "crates/voidport-test-server",
+    "crates/voidport-lkml",
+    "crates/voidport-lkml-cli",
+    "crates/voidport-vhost",
+    "crates/voidport-keeper",
+]
+
+[workspace.package]
+version = "2.0.0"
+edition = "2024"
+license = "GPL-3.0-only"
+repository = "https://github.com/xdevs23/voidport"
+
+[workspace.dependencies]
+voidport-control = { path = "crates/voidport-control" }
+voidport-spawn = { path = "crates/voidport-spawn" }
+voidport-fuse = { path = "crates/voidport-fuse" }
+voidport-lkml-cli = { path = "crates/voidport-lkml-cli" }
+voidport-keeper = { path = "crates/voidport-keeper" }
+voidport-memory = { path = "crates/voidport-memory" }
+voidport-proto = { path = "crates/voidport-proto" }
+# no_std and MIT, so the GPL-2.0-only kernel client may link it.
+voidport-session = { path = "crates/voidport-session" }
+voidport-pty = { path = "crates/voidport-pty" }
+voidport-test-host = { path = "crates/voidport-test-host" }
+voidport-test-support = { path = "crates/voidport-test-support" }
+voidport-test-client = { path = "crates/voidport-test-client" }
+voidport-test-server = { path = "crates/voidport-test-server" }
+voidport-tui = { path = "crates/voidport-tui" }
+voidport-vhost = { path = "crates/voidport-vhost" }
+
+mail-parser = { version = "=0.10.0", features = ["serde_support"] }
+email_address = "0.2"
+email-format = "=0.8.1"
+tempfile = "3"
+time = { version = "0.3", features = ["formatting", "parsing", "serde", "serde-well-known"] }
+anyhow = "1.0"
+bitflags = "=2.13.1"
+clap = { version = "4.6", features = ["derive"] }
+clap_mangen = "0.3"
+# The version selected by the `crossterm_0_29` feature of `ratatui`.
+crossterm = "0.29"
+# The major version signed with by `jsonwebtoken`.
+ed25519-dalek = { version = "2.2.0", default-features = false, features = [
+    "pkcs8",
+    "std",
+    "zeroize",
+] }
+jsonwebtoken = { version = "=11.1.0", default-features = false, features = [
+    "rust_crypto",
+    "use_pem",
+] }
+libc = "0.2"
+linux-raw-sys = { version = "0.12.1", default-features = false, features = [
+    "general",
+    "no_std",
+] }
+memchr = "2.8"
+percent-encoding = "2.3"
+portable-pty = "0.9"
+procfs = { version = "=0.18.0", default-features = false }
+ratatui = { version = "0.30", features = ["crossterm_0_29"] }
+rustix = { version = "1.1", features = [
+    "event",
+    "fs",
+    "mm",
+    "mount",
+    "net",
+    "param",
+    "process",
+    "rand",
+    "stdio",
+    "thread",
+] }
+sd-notify = "0.5"
+signal-hook-registry = "1.4"
+serde = { version = "1.0", features = ["derive"] }
+sha2 = "0.10"
+signal-hook = "0.3"
+hex = "0.4"
+serde_json = "1.0"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["full"] }
+# Its listener needs a runtime to bind, and binding happens before any runtime
+# exists. `vsock` binds the listener, and this crate then accepts its
+# connections.
+tokio-vsock = "0.7"
+toml = "1.1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+url = "2.5"
+uuid = { version = "1.24", default-features = false, features = ["std"] }
+vhost = { version = "=0.17.0", features = ["vhost-user-backend"] }
+virtio-bindings = "=0.2.7"
+virtio-queue = "=0.18.0"
+vm-memory = { version = "=0.18.0", features = ["backend-mmap"] }
+vmm-sys-util = "=0.15.0"
+vsock = "0.5"
+vt100 = "0.16"
+zerocopy = { version = "0.8", features = ["derive"] }
+
+# A crate root without unsafe code forbids it, so the crates that need unsafe
+# code are the ones without that line. No module allows unsafe code by itself.
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+undocumented_unsafe_blocks = "deny"
+
+# Line tables give a failing test file and line numbers in its backtrace.
+# Full debug information is most of every test binary.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

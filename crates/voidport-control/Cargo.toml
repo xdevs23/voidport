@@ -1,0 +1,18 @@
+[package]
+name = "voidport-control"
+description = "voidport control-plane protocol: request, response and policy types shared by the server and the operator CLI"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+client = ["dep:rustix"]
+
+[dependencies]
+rustix = { workspace = true, optional = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[lints]
+workspace = true

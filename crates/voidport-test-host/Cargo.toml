@@ -1,0 +1,17 @@
+[package]
+name = "voidport-test-host"
+description = "voidport test scaffolding: scratch space and the vsock capability probe, with no dependency on another crate of the workspace. Unpublished, dev-only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+libc = { workspace = true }
+vsock = { workspace = true }
+
+[dev-dependencies]
+rustix = { workspace = true }
+
+[lints]
+workspace = true

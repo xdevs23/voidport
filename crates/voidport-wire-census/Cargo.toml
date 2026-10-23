@@ -1,0 +1,25 @@
+[package]
+name = "voidport-wire-census"
+description = "voidport wire census: forwards the connections of a mount to the server and counts the requests and the bytes. Unpublished, a tool of the kernel guests."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+# The census reads the stream toward the server with the parser and the bounds
+# that the server reads it with.
+voidport-proto = { workspace = true, features = ["userspace"] }
+
+clap = { workspace = true }
+rustix = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+
+[dev-dependencies]
+# The tests build the frames they send with the message types of the wire crate.
+zerocopy = { workspace = true }
+
+[lints]
+workspace = true

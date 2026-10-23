@@ -1,0 +1,32 @@
+[package]
+name = "voidport-keeper"
+description = "voidport keeper: connects the voidport device of a virtual machine to voidportd across restarts of voidportd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+voidport-session = { workspace = true }
+voidport-vhost = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+rustix = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+vhost = { workspace = true, features = ["vhost-user-frontend"] }
+virtio-queue = { workspace = true }
+vm-memory = { workspace = true }
+vmm-sys-util = { workspace = true }
+
+[dev-dependencies]
+virtio-bindings = { workspace = true }
+virtio-queue = { workspace = true, features = ["test-utils"] }
+
+[build-dependencies]
+clap = { workspace = true }
+clap_mangen = { workspace = true }
+
+[lints]
+workspace = true

@@ -1,0 +1,100 @@
+#!/usr/bin/env python3
+"""Explicit, single-query interoperability proof for the packaged collector."""
+import argparse
+import hashlib
+import json
+from pathlib import Path
+import subprocess
+import sys
+
+QUERY = "m:CAHk-=wgscVQOpma5sANWVLEu_VWBbVDz3dxbBcc_JM0CcR7QJw@mail.gmail.com"
+RESPONSE = "CAHk-=wgscVQOpma5sANWVLEu_VWBbVDz3dxbBcc_JM0CcR7QJw@mail.gmail.com"
+PARENT = "fb210ac8-b00b-42ff-8fc1-6f9243302b61@kernel.dk"
+# Exact links of the two required messages. Other thread mail needs a link only
+# wherever it has a Message-ID, because the URL library used by the collector
+# encodes those links.
+LINKS = {
+    RESPONSE: "https://lore.kernel.org/lkml/CAHk-=wgscVQOpma5sANWVLEu_VWBbVDz3dxbBcc_JM0CcR7QJw@mail.gmail.com/",
+    PARENT: "https://lore.kernel.org/lkml/fb210ac8-b00b-42ff-8fc1-6f9243302b61@kernel.dk/",
+}
+
+
+def printed(binary, *arguments):
+    """Returns the JSON document that the collector prints for `arguments`."""
+    result = subprocess.run([str(binary), *arguments], check=True, capture_output=True)
+    return json.loads(result.stdout)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--run-live", action="store_true")
+    parser.add_argument("--output", type=Path)
+    parser.add_argument("--package", type=Path, default=Path("result"))
+    args = parser.parse_args()
+    if not args.run_live:
+        print("NOT-PROVEN: live LKML interoperability was not requested")
+        return 1
+    if args.output is None:
+        parser.error("--output DIR is required with --run-live")
+    if args.output.is_symlink() or (args.output.exists() and any(args.output.iterdir())):
+        parser.error("live proof requires a new or empty corpus directory")
+    binary = args.package.resolve() / "bin/voidport-lkml"
+    command = [str(binary), "collect", "--output", str(args.output), "--query", QUERY,
+               "--timeout-seconds", "90", "--delay-seconds", "5"]
+    print(json.dumps({"arguments": command}), flush=True)
+    result = subprocess.run(command, check=False)
+    if result.returncode:
+        print(f"NOT-PROVEN: packaged collection exited {result.returncode}; retained diagnostics describe the external or local failure")
+        return 1
+    subprocess.run([str(binary), "verify", "--output", str(args.output)], check=True)
+    status = printed(binary, "status", "--json", "--output", str(args.output))
+    assert [unit["query"] for unit in status["units"]] == [QUERY]
+    assert all(unit["complete"] for unit in status["units"])
+    records = printed(binary, "export", "--output", str(args.output))
+    assert len(records["attempts"]) == 1
+    attempt = records["attempts"][0]
+    assert attempt["timeout_seconds"] == 90 and attempt["exit_code"] == 0
+    assert attempt["state"] == "complete"
+    assert attempt["tool"]["version"] == "2.1.0"
+    assert attempt["tool"]["version_provenance"] == "supplied_package_metadata"
+    executable = Path(attempt["tool"]["executable"])
+    assert executable.is_file() and str(executable).startswith("/nix/store/")
+    assert "public-inbox" in str(executable) and executable.name == "lei"
+    index = records["links"]["message_ids"]
+    children, parents = index.get(RESPONSE, []), index.get(PARENT, [])
+    assert children and parents, "expected response or parent was not returned"
+    receipts = []
+    for key, artifact in records["artifacts"].items():
+        raw = (args.output / artifact["path"]).read_bytes()
+        assert hashlib.sha256(raw).hexdigest() == key
+        assert len(raw) == artifact["length"]
+        identifier = artifact["metadata"]["primary_id"]
+        observations = [item for item in records["observations"] if item["delivery"]["digest"] == key]
+        assert observations, "artifact has no delivery observation"
+        archive_links = sorted({item["archive_link"] for item in observations}, key=str)
+        for archive_link in archive_links:
+            assert (archive_link is None) == (identifier is None), "archive link without Message-ID"
+            if identifier in LINKS:
+                assert archive_link == LINKS[identifier]
+        receipts.append({"digest": key, "length": len(raw), "message_id": identifier,
+                         "archive_links": archive_links})
+    relationships = []
+    for child in children:
+        relation = records["links"]["relationships"][child]
+        assert relation["candidate"] == {"id": PARENT, "basis": "direct"}
+        assert relation["targets"] == parents
+        assert records["artifacts"][child]["metadata"]["class"] == "response"
+        relationships.append({"response_digest": child, "relationship": relation})
+    receipt = {"result": "PROVEN", "arguments": command, "attempt": attempt,
+               "artifacts": receipts, "relationships": relationships}
+    (args.output / attempt["directory"] / "live-receipts.json").write_text(json.dumps(receipt, indent=2) + "\n")
+    print(json.dumps(receipt, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, ValueError, AssertionError, KeyError, subprocess.SubprocessError) as error:
+        print(f"NOT-PROVEN: live interoperability: {error}", file=sys.stderr)
+        sys.exit(1)

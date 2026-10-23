@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=nix/run-harness.sh
+source "$root/kernel/nix/run-harness.sh"
+# /dev/console leads to hvc0 once it exists, so systemd writes its console
+# messages there.
+voidport_boot_parameters=(console=hvc0 systemd.getty_auto=0)
+run_harness closure "${1:-1}" closure

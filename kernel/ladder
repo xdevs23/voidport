@@ -1,0 +1,134 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=nix/cache-args.sh
+source "$root/kernel/nix/cache-args.sh"
+# shellcheck source=nix/processors.sh
+source "$root/kernel/nix/processors.sh"
+runs=${1:-2}
+
+say() { printf '\n== %s\n' "$*"; }
+die() {
+  printf '%s\n' "ladder: $*" >&2
+  exit 1
+}
+
+heavy() {
+  "$root/slots/slots.py" taskset -c "$voidport_cpus" "$@"
+}
+
+# Continue after a failure so that one member does not hide the others.
+if [ -z "${VOIDPORT_KERNEL_MEMBER:-}" ]; then
+  evidence_root="$root/.cache/kernel-ladder"
+  mkdir -p "$evidence_root"
+  evidence=$(mktemp -d "$evidence_root/run.XXXXXXXX")
+  printf 'kernel matrix evidence: %s\n' "$evidence"
+  result=0
+  for member in stable longterm mainline debug.stable debug.longterm debug.mainline; do
+    if VOIDPORT_KERNEL_MEMBER="$member" "$0" "$runs" >"$evidence/$member.log" 2>&1; then
+      printf '%s exit=0\n' "$member" | tee "$evidence/$member.exit"
+    else
+      status=$?
+      printf '%s exit=%s\n' "$member" "$status" | tee "$evidence/$member.exit"
+      if [ "$status" = 130 ] || [ "$status" = 143 ]; then
+        exit "$status"
+      fi
+      result=1
+    fi
+  done
+  exit "$result"
+fi
+member=$VOIDPORT_KERNEL_MEMBER
+printf 'kernel member: %s; build architecture: %s\n' "$member" "$(uname -m)"
+
+source_path=$(heavy bash "$root/kernel/nix/source-path")
+printf 'kernel source snapshot: %s\n' "$source_path"
+
+build() {
+  local attribute=$1
+  case "$attribute" in tools | closureChecks) ;; *) attribute="$member.$attribute" ;; esac
+  heavy nix-build --max-jobs 1 --cores "$voidport_cores" --no-out-link "$source_path/kernel/nix" \
+    "${voidport_cache_args[@]}" -A "$attribute"
+}
+
+say "rung 1: the module's crate inputs are the workspace's"
+inputs=$(build crateInputs) || die "the module's crate inputs are unavailable"
+tools=$(build tools) || die "the ladder's tools are unavailable"
+PATH="$tools/bin:$PATH" "$root/kernel/check-crate-inputs" "$inputs" "$root"
+PATH="$tools/bin:$PATH" "$root/kernel/tests/crate-inputs" "$inputs"
+printf 'crate inputs: the module builds the workspace files, not a copy\n'
+
+host_tests=$(build module.hostTests) ||
+  die "the host tests of the mount option parser and the host-tested module files failed"
+printf 'kernel host tests: %s\n' "$host_tests"
+"$root/kernel/tests/hygiene"
+harness_checks=$(build closureChecks) ||
+  die "the checks of the guest harness failed"
+printf 'guest harness checks: %s\n' "$harness_checks"
+
+say "rung 2: the shared crates under kbuild"
+crate=$(build wireCrate) || die "the wire crate does not ride kbuild"
+printf 'wire crate object: %s\n' "$crate"
+session_crate=$(build sessionCrate) || die "the session core does not ride kbuild"
+printf 'session crate object: %s\n' "$session_crate"
+
+say "rung 3: the filesystem module"
+module=$(build module) || die "the module does not build"
+printf 'module: %s\n' "$module"
+
+say "rung 4: style, against the kernel tree's own configuration"
+style=$(build style) || die "the kernel's style configuration is unavailable"
+
+# rustfmt follows the module tree from each crate root.
+"$tools/bin/rustfmt" --check \
+  --config-path "$style/.rustfmt.toml" \
+  "$root/kernel/voidport/voidport_main.rs" \
+  "$root/kernel/transport/voidport_transport.rs" \
+  "$root/kernel/options/src/lib.rs" ||
+  die "the Rust does not match the kernel tree's rustfmt configuration"
+printf 'rustfmt: the module Rust matches the kernel tree configuration\n'
+
+mapfile -t c_files < <("$tools/bin/find" "$root/kernel" \
+  \( -name '*.c' -o -name '*.h' \) | sort)
+if [ "${#c_files[@]}" -eq 0 ]; then
+  printf 'checkpatch: the module has no C surface, so there is nothing to check\n'
+else
+  "$tools/bin/perl" "$style/scripts/checkpatch.pl" \
+    --no-tree --strict --terse --file "${c_files[@]}" ||
+    die "the C does not pass the kernel tree's checkpatch"
+  printf 'checkpatch: %s C file(s) pass\n' "${#c_files[@]}"
+fi
+
+# clippy runs by building the module with clippy-driver in place of the
+# compiler, a build of its own.
+linted=$(build linted) || die "the Rust does not pass the kernel tree's clippy"
+printf 'clippy: the module Rust passes the kernel tree configuration (%s)\n' "$linted"
+
+say "rung 5: built equals loaded"
+mount_guest=$(build mountGuest) || die "the mount guest image does not build"
+release=$(cat "$mount_guest/kernel-release")
+ko="$module/voidport/voidport.ko"
+vermagic=$("$tools/bin/modinfo" -F vermagic "$ko" | cut -d' ' -f1)
+[ -n "$vermagic" ] || die "$ko carries no vermagic"
+[ "$vermagic" = "$release" ] ||
+  die "$ko was built for $vermagic and the guest boots $release"
+printf 'built equals loaded: %s\n' "$release"
+
+running=$(uname -r)
+if [ "$vermagic" = "$running" ]; then
+  printf 'this machine boots %s, so it may load the module too\n' "$running"
+else
+  printf 'this machine boots %s, so the guest is the only place it loads\n' "$running"
+fi
+
+say "rung 6: the read-only mount in a guest, $runs run(s)"
+"$root/kernel/mount-harness" "$runs"
+# Disabling IPv6 takes effect only at boot.
+VOIDPORT_FOCUS=ipv6-disabled "$root/kernel/mount-harness" "$runs"
+VOIDPORT_FOCUS=virtio "$root/kernel/mount-harness" "$runs"
+
+say "rung 7: the complete NixOS store over voidport, $runs run(s)"
+"$root/kernel/closure-harness" "$runs"
+
+say "the ladder holds"

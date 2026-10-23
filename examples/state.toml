@@ -1,0 +1,149 @@
+# A voidport state file. Start the server with `voidportd --state state.toml`.
+# The server writes every change made through `voidport-ctl` back into this
+# file and overwrites edits made while it runs.
+
+[server]
+# The control socket of `voidport-ctl`, created with mode 0600. The command
+# line option `--control-socket` overrides it.
+control_socket = "/run/voidport/control.sock"
+
+# Where guests connect. `transport` is "tcp" (`addr`), "unix" (`path`),
+# "vsock" (`port`, and optionally `cid`) or "vhost-user" (`path`). Port 0
+# picks a free port at every start. The server does not start if one of the
+# listeners cannot be bound.
+[[server.listeners]]
+transport = "tcp"
+addr = "0.0.0.0:9000"
+
+[[server.listeners]]
+transport = "unix"
+path = "/run/voidport/data.sock"
+
+[[server.listeners]]
+transport = "vsock"
+port = 1024
+
+[[server.listeners]]
+transport = "vhost-user"
+path = "/run/voidport/vhost-user.sock"
+
+[[namespaces]]
+# What guests mount, as in voidport://10.0.2.2:9000/@project. At most 255
+# bytes, without `/`, NUL or control characters, unique in this file.
+name = "project"
+
+# "passthrough": host permission bits as they are, without the write bits on a
+# read-only rule.
+permission = "passthrough"
+
+# "cached" (default): backing I/O uses the host page cache.
+# "passthrough": a guest handle opened with O_DIRECT opens the backing file
+# with O_DIRECT.
+# "always": every backing file is opened with O_DIRECT.
+direct_io = "cached"
+
+# "none" is the only mode.
+auth = "none"
+
+# Whether setuid and setgid set by guests are recorded and shown (default
+# true). When false, they are hidden and a chmod that sets one fails.
+privileged_bits = true
+
+# "passthrough": host ids as they are.
+# "static" with `uid` and `gid`: every file shows those ids.
+# "map" with `uid_map` and `gid_map`: ids translated in both directions.
+[namespaces.ownership]
+mode = "map"
+
+# A host id that no table entry covers is shown as `squash_uid`/`squash_gid`
+# ("squash"), hides the file ("hide"), or is shown as it is ("passthrough").
+unmapped = "squash"
+squash_uid = 65534
+squash_gid = 65534
+
+# Each host id and each guest id appears at most once. `host` is a number or
+# "uid"/"gid" for the id of the user who runs the server.
+[[namespaces.ownership.uid_map]]
+host = "uid"
+guest = 0
+
+[[namespaces.ownership.gid_map]]
+host = "gid"
+guest = 0
+
+# A rule shares one path of the namespace.
+#   path    a namespace path, or `/dir/*` for the default of every child of
+#           `/dir`
+#   mode    "rw", "ro" or "hidden"
+#   target  the host path, absolute or relative to the directory of this file.
+#           Required on the topmost rule of a host tree, and must exist.
+#   match   a glob over the names of the children of `path` (`*` matches any
+#           run of bytes, and a leading `*` skips names starting with `.`).
+#           Two matches on one directory may not cover the same name. A rule
+#           with `match` has no `target`.
+# The most specific rule wins: a literal path, then a match, then `*`, then
+# the rule of the enclosing directory.
+
+[[namespaces.rules]]
+path = "/project"
+mode = "rw"
+target = "project"
+
+[[namespaces.rules]]
+path = "/project/*"
+mode = "hidden"
+
+[[namespaces.rules]]
+path = "/project/foo"
+mode = "rw"
+
+[[namespaces.rules]]
+path = "/project/bar"
+mode = "ro"
+
+[[namespaces.rules]]
+path = "/project/file.txt"
+mode = "rw"
+
+[[namespaces.rules]]
+path = "/project/vendor"
+mode = "ro"
+target = "vendor-snapshot"
+
+[[namespaces.rules]]
+path = "/project"
+mode = "rw"
+match = "family-*"
+
+# Which extended attributes guests may read and write. Without rules, every
+# attribute reads and only `user.*` writes.
+#   match   a glob over attribute names
+#   read    "allow" or "deny"; a denied attribute is missing from listings
+#   write   "allow" or "deny"; a denied write fails with EPERM
+# A rule sets at least one verdict, and each `match` appears once. The
+# longest literal prefix wins, deny wins a tie, and a verdict left unset comes
+# from the next matching rule or the default.
+
+[[namespaces.xattr]]
+match = "user.*"
+write = "deny"
+
+[[namespaces.xattr]]
+match = "user.build.id"
+write = "allow"
+
+[[namespaces]]
+name = "logs"
+permission = "passthrough"
+direct_io = "always"
+auth = "none"
+
+[namespaces.ownership]
+mode = "static"
+uid = 0
+gid = 0
+
+[[namespaces.rules]]
+path = "/var/log/app.log"
+mode = "ro"
+target = "logs/app.log"

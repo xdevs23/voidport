@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0
+
+include $(src)/../crates.mk
+include $(src)/../options.mk
+include $(src)/../bindings.mk
+
+obj-m += voidport.o
+voidport-y := voidport_main.o ../transport/voidport_helpers.o $(voidport-crate-objs) $(options-objs)
+
+RUSTFLAGS_voidport_main.o += $(voidport-crate-externs) \
+	--extern voidport_kernel_options=$(obj)/libvoidport_kernel_options.rlib
+$(obj)/voidport_main.o: $(obj)/voidport_transport.o $(obj)/voidport_session.o $(obj)/voidport_proto.o $(obj)/voidport_kernel_options.o

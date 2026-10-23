@@ -1,0 +1,12 @@
+# SPDX-License-Identifier: GPL-2.0
+# The virtiofs driver binds every virtio filesystem device first. The virtio
+# bus has no driver override, so for a tag starting with voidport- the rule
+# unbinds the device from virtiofs and binds it to voidport. A failing step
+# writes to the kernel log and ends the hand-over.
+ACTION=="add", SUBSYSTEM=="virtiofs", ENV{TAG}=="voidport-*", \
+  RUN{builtin}+="kmod load voidport", \
+  RUN+="/bin/sh -c 'fail() { echo voidport: $$* for %p failed > /dev/kmsg; \
+    exit 1; }; cd -P /sys%p/device || fail finding the virtio device; \
+    d=$${PWD##*/}; drivers=/sys/bus/virtio/drivers; \
+    echo $$d > $$drivers/virtiofs/unbind || fail unbinding $$d from virtiofs; \
+    echo $$d > $$drivers/voidport/bind || fail binding $$d to voidport'"

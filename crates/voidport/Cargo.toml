@@ -1,0 +1,49 @@
+[package]
+name = "voidport"
+description = "voidport guest client: mounts a voidport namespace through the kernel module or FUSE"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+voidport-control = { workspace = true }
+voidport-fuse = { workspace = true }
+voidport-memory = { workspace = true }
+voidport-proto = { workspace = true, features = ["userspace"] }
+voidport-session = { workspace = true }
+voidport-spawn = { workspace = true }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+# Provides `PIDFD_THREAD`, which rustix 1.1 does not name.
+libc = { workspace = true }
+percent-encoding = { workspace = true }
+rustix = { workspace = true }
+sd-notify = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+# The owned split of `tokio-vsock` shares one lock between its halves, so
+# `vsock` duplicates the socket into two halves instead.
+tokio-vsock = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+url = { workspace = true }
+vsock = { workspace = true }
+zerocopy = { workspace = true }
+
+[dev-dependencies]
+voidport-tui = { workspace = true }
+voidportd = { path = "../voidportd" }
+voidport-test-client = { workspace = true }
+voidport-test-support = { workspace = true }
+procfs = { workspace = true }
+sha2 = { workspace = true }
+tokio = { workspace = true, features = ["test-util"] }
+
+[build-dependencies]
+clap = { workspace = true }
+clap_mangen = { workspace = true }
+
+[lints]
+workspace = true

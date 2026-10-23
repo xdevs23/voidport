@@ -1,0 +1,20 @@
+[package]
+name = "voidport-test-server"
+description = "voidport test scaffolding for the suites of the server: a data-plane client on a real socket, the host tree and state file of the data tests, and temporary directories. Unpublished, dev-only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+voidport-control = { workspace = true }
+voidport-proto = { workspace = true, features = ["userspace"] }
+voidport-test-support = { workspace = true }
+voidportd = { path = "../voidportd" }
+
+rustix = { workspace = true }
+vsock = { workspace = true }
+zerocopy = { workspace = true }
+
+[lints]
+workspace = true

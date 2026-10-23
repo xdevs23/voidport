@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Fails on the words listed below, as whole words in any casing; an underscore
+# separates words. Only added lines count: the staged diff, or every tracked
+# line under `--all`. A line containing `vocab-ok` is exempt.
+set -euo pipefail
+
+words='rather[ _]than|worth|leg|lane|doctrine|caveat|twist|ruling|ruled|seat|belt-and-suspenders|wrinkle|guessing' # vocab-ok: the list itself
+
+# `grep -w` treats an underscore as a word character, so the boundary is
+# spelled out.
+bounded="(^|[^[:alnum:]])($words)([^[:alnum:]]|\$)"
+
+refuse() {
+  echo "vocab: refusing. These words are banned in tracked content." >&2
+  echo "Rewrite the line, or mark a legitimate identifier with a" >&2
+  echo "'vocab-ok' comment on the same line." >&2
+  exit 1
+}
+
+judge() {
+  local entry rest file line text hits bad=0
+  while IFS= read -r entry || [ -n "$entry" ]; do
+    [ -z "$entry" ] && continue
+    file=${entry%%:*}
+    rest=${entry#*:}
+    line=${rest%%:*}
+    text=${rest#*:}
+    case $text in *vocab-ok*) continue ;; esac
+    hits=$(printf '%s\n' "$text" | grep -oiE "$bounded" \
+      | sed -E 's/^[^[:alnum:]]+//; s/[^[:alnum:]]+$//' \
+      | sort -fu | paste -sd' ' -) || true
+    [ -z "$hits" ] && continue
+    echo "vocab: $file:$line: $hits" >&2
+    bad=1
+  done
+  return "$bad"
+}
+
+# Every added line of the staged change, as `file:line:text`. The pass counts
+# the lines given by the hunk header, so added content that starts with `+++`
+# or `@@` is not taken for a header.
+staged() {
+  git diff --cached -U0 --diff-filter=ACMR | awk '
+    left + right == 0 {
+      if (/^\+\+\+ /) { f = substr($0, 5); sub(/^b\//, "", f) }
+      else if (/^@@ /) {
+        old = $2; sub(/^-/, "", old)
+        new = $3; sub(/^\+/, "", new)
+        left  = (index(old, ",") ? substr(old, index(old, ",") + 1) : 1) + 0
+        n     = (index(new, ",") ? substr(new, 1, index(new, ",") - 1) : new) + 0
+        right = (index(new, ",") ? substr(new, index(new, ",") + 1) : 1) + 0
+      }
+      next
+    }
+    /^\+/ { printf "%s:%d:%s\n", f, n, substr($0, 2); n++; right-- }
+    /^-/  { left-- }
+  '
+}
+
+if [ "${1:-}" = "--all" ]; then
+  candidates=$(git grep -IniE "$bounded" -- . || true)
+  printf '%s\n' "$candidates" | judge || refuse
+else
+  # The prefix `file:line:` can widen the candidate set. `judge` looks at the
+  # text alone and drops what the path pulled in.
+  candidates=$(staged | grep -iE "$bounded" || true)
+  printf '%s\n' "$candidates" | judge || refuse
+fi

@@ -1,0 +1,57 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+# shellcheck source=nix/run-harness.sh
+source "$root/kernel/nix/run-harness.sh"
+expected_tests=(
+  transport-transitions vfs-options mount-diagnostics active-io-lifecycle benign-child-exit
+  invalid-port duplicate-addr unknown-option relative-path url-helper url-type url-client
+  mount remount
+  read-file read-empty readdir name-max read-nested getattr readlink read-large special-inode
+  write-refused mapping-modes exec-from-mount credentials xattr-acl read-concurrency
+  revalidate-retry unix-mount unix-chroot-mount netns-mount netns-reference peer-failure
+  decoy-failure unmount-wait frame-in-parts close-frame stall-expiry connection-flaps
+  sessions-share-node
+  connection-threads connections-parallel settle-not-started settle-applied-forget
+  settle-departed-lookup settle-signalled-outcome settle-signalled-mkdir
+  join-silent join-teardown join-refused
+  write-through namespace-orphan setattr writable-mapping direct-io lock-wait
+  revalidate-size revalidate-mtime
+  negative-zero negative-lifetime negative-fixture
+  revalidate-replace connection-fault busy-unmount unmount namespace-operations lazy-detach
+  record-locks
+  node-balance module-unload signal-queued signal-partial kill-partial signal-transmitted
+  signal-answered
+  ownership-reclaim ownership-signal-node ownership-signal-open ownership-signal-dir
+  ownership-cleanup-forget ownership-cleanup-release
+)
+case "${VOIDPORT_FOCUS:-full}" in
+  full) ;;
+  lifetime)
+    expected_tests=(transport-transitions read-concurrency active-io-lifecycle
+      benign-child-exit ownership-signal-node ownership-signal-open ownership-signal-dir
+      signal-queued signal-partial kill-partial signal-transmitted signal-answered)
+    ;;
+  ipv6-disabled)
+    expected_tests=(address-family-unavailable)
+    # The guest kernel has IPv6 built in, and only this parameter removes it,
+    # at boot.
+    voidport_boot_parameters=(ipv6.disable=1)
+    ;;
+  virtio)
+    expected_tests=(virtio-handover virtio-absent-tag
+      virtio-mount virtio-read-write virtio-mapping
+      virtio-restart module-unload)
+    ;;
+  *) printf 'unknown focused suite\n' >&2; exit 1 ;;
+esac
+case "${VOIDPORT_KERNEL_MEMBER:-stable}" in
+  debug.*)
+    expected_tests+=(debug-configuration debug-lifetime)
+    # Only the debug kernels have fault injection.
+    if [ "${VOIDPORT_FOCUS:-full}" = full ]; then
+      expected_tests+=(allocation-faults)
+    fi
+    ;;
+esac
+run_harness mount "${1:-1}" share "${expected_tests[@]}"

@@ -1,0 +1,27 @@
+[package]
+name = "voidport-test-client"
+description = "voidport test scaffolding for the suites of the guest client: a server with its host tree, mounts of it, a server process that can be killed, a relay and a shared mapping. Unpublished, dev-only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+voidport = { path = "../voidport" }
+voidport-control = { workspace = true }
+voidport-proto = { workspace = true }
+voidport-spawn = { workspace = true }
+voidport-test-support = { workspace = true }
+
+# `pthread_kill`, which neither std nor rustix offers.
+libc = { workspace = true }
+percent-encoding = { workspace = true }
+rustix = { workspace = true }
+serde_json = { workspace = true }
+signal-hook = { workspace = true }
+tokio = { workspace = true }
+vsock = { workspace = true }
+zerocopy = { workspace = true }
+
+[lints]
+workspace = true

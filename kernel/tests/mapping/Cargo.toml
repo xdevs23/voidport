@@ -1,0 +1,14 @@
+[package]
+name = "mapping-test"
+version = "0.0.0"
+edition = "2021"
+license = "GPL-2.0-only"
+
+[workspace]
+
+[[bin]]
+name = "mapping-test"
+path = "../mapping.rs"
+
+[dependencies]
+libc = "=0.2.189"

@@ -1,0 +1,86 @@
+#!/usr/bin/env python3
+"""Run compiled collector assertions on private ext4 and btrfs loop mounts."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+import tempfile
+
+
+def run(arguments, **kwargs):
+    print(json.dumps({"command": [str(arg) for arg in arguments]}), flush=True)
+    return subprocess.run(arguments, check=True, **kwargs)
+
+
+def cleanup(mount, device, mounted):
+    failures = []
+    try:
+        if mounted:
+            try:
+                run(["umount", str(mount)])
+            except (OSError, subprocess.SubprocessError) as error:
+                failures.append(error)
+    finally:
+        try:
+            run(["losetup", "--detach", device])
+        except (OSError, subprocess.SubprocessError) as error:
+            failures.append(error)
+    if failures:
+        raise ExceptionGroup("collector filesystem cleanup failed", failures)
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--persistence-test", type=Path, required=True)
+    parser.add_argument("--acquisition-test", type=Path, required=True)
+    parser.add_argument("--inside-private-namespace", action="store_true", help=argparse.SUPPRESS)
+    args = parser.parse_args()
+    try:
+        descriptor = os.open("/dev/loop-control", os.O_RDWR)
+        os.close(descriptor)
+    except OSError as error:
+        print(f"NOT-PROVEN: collector filesystem persistence requires loop mounts: {error}")
+        return 1
+    binaries = [args.persistence_test.resolve(), args.acquisition_test.resolve()]
+    for binary in binaries:
+        if not binary.is_file():
+            parser.error(f"missing compiled integration test: {binary}")
+    if not args.inside_private_namespace:
+        return run(["unshare", "--mount", "--propagation", "private", sys.executable,
+                    str(Path(__file__).resolve()), "--inside-private-namespace",
+                    "--persistence-test", str(binaries[0]), "--acquisition-test", str(binaries[1])]).returncode
+    cache = Path.home() / ".cache/voidport-lkml-filesystems"
+    cache.mkdir(parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix="proof-", dir=cache) as scratch:
+        scratch = Path(scratch)
+        for filesystem in ["ext4", "btrfs"]:
+            image = scratch / f"{filesystem}.img"
+            with image.open("xb") as stream:
+                stream.truncate(256 * 1024 * 1024)
+            mount = scratch / filesystem
+            mount.mkdir()
+            device = run(["losetup", "--find", "--show", str(image)], capture_output=True, text=True).stdout.strip()
+            mounted = False
+            try:
+                run([f"mkfs.{filesystem}", "-F" if filesystem == "ext4" else "-f", device])
+                run(["mount", "-t", filesystem, device, str(mount)])
+                mounted = True
+                environment = dict(os.environ, VOIDPORT_LKML_TEST_ROOT=str(mount))
+                for binary in binaries:
+                    run([str(binary), "--nocapture", "--include-ignored"], env=environment)
+                print(f"PROVEN: collector assertions on {filesystem}", flush=True)
+            finally:
+                cleanup(mount, device, mounted)
+    return 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except (OSError, subprocess.SubprocessError, ExceptionGroup) as error:
+        import traceback
+        traceback.print_exception(error)
+        print(f"FAILED: collector filesystem proof: {error}", file=sys.stderr)
+        sys.exit(1)

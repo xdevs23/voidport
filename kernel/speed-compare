@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
+[ "$#" -eq 1 ] || { printf 'usage: kernel/speed-compare DIRECTORY\n' >&2; exit 1; }
+# shellcheck source=nix/run-harness.sh
+source "$root/kernel/nix/run-harness.sh"
+VOIDPORT_HARNESS_DIR=$1 run_harness speed 1 share

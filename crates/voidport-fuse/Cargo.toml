@@ -1,0 +1,21 @@
+[package]
+name = "voidport-fuse"
+description = "voidport FUSE layer: mounting, and the kernel protocol on /dev/fuse"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+# The fusermount3 helper is started from a thread whose descriptor table
+# contains no file of a FUSE mount.
+voidport-spawn = { workspace = true }
+
+bitflags = { workspace = true }
+linux-raw-sys = { workspace = true }
+rustix = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+zerocopy = { workspace = true }
+
+[lints]
+workspace = true

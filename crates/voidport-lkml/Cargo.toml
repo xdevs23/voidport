@@ -1,0 +1,38 @@
+[package]
+name = "voidport-lkml"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+clap.workspace = true
+email_address.workspace = true
+email-format.workspace = true
+hex.workspace = true
+mail-parser.workspace = true
+rustix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+signal-hook.workspace = true
+tempfile.workspace = true
+thiserror.workspace = true
+time.workspace = true
+tokio.workspace = true
+url.workspace = true
+voidport-lkml-cli.workspace = true
+# Every lei process comes from a thread whose descriptor table contains no file
+# of the corpus, which can be on a FUSE mount.
+voidport-spawn.workspace = true
+
+[dev-dependencies]
+voidport-fuse.workspace = true
+
+[build-dependencies]
+clap.workspace = true
+clap_mangen.workspace = true
+voidport-lkml-cli.workspace = true

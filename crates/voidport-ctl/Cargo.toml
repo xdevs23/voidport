@@ -1,0 +1,32 @@
+[package]
+name = "voidport-ctl"
+description = "voidport operator CLI: manages namespaces and rules on a running voidportd"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+voidport-control = { workspace = true, features = ["client"] }
+
+anyhow = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+voidport-proto = { workspace = true, features = ["userspace"] }
+voidport-tui = { workspace = true }
+voidport-test-support = { workspace = true }
+tokio = { workspace = true }
+zerocopy = { workspace = true }
+
+[build-dependencies]
+anyhow = { workspace = true }
+clap = { workspace = true }
+clap_mangen = { workspace = true }
+voidport-control = { workspace = true }
+
+[lints]
+workspace = true

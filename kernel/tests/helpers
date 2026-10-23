@@ -1,0 +1,25 @@
+#!/usr/bin/env python3
+"""Compare the compiled C object's public symbols with its documented manifest."""
+import argparse
+import json
+import os
+from pathlib import Path
+import subprocess
+
+parser = argparse.ArgumentParser(description=__doc__)
+parser.add_argument("object", type=Path)
+args = parser.parse_args()
+manifest = Path(__file__).resolve().parents[1] / "voidport/helpers.json"
+expected = json.loads(manifest.read_text())
+assert all(isinstance(reason, str) and reason.strip() for reason in expected.values())
+output = subprocess.check_output(
+    [os.environ.get("NM", "nm"), "--defined-only", "--extern-only",
+     "--format=just-symbols", str(args.object)], text=True
+)
+# The kernel compiler may emit public CFI and function-prefix metadata.
+actual = {name for name in output.splitlines()
+          if not name.startswith(("__pfx_", "__cfi_"))}
+if actual != set(expected):
+    raise SystemExit(f"C helper manifest mismatch: extra={sorted(actual - set(expected))}, "
+                     f"missing={sorted(set(expected) - actual)}")
+print(f"C helper manifest: {len(expected)} exports match their documented interfaces")

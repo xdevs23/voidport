@@ -1,0 +1,15 @@
+[package]
+name = "voidport-pty"
+description = "voidport test scaffolding: one process under one pty, for the terminal-lifecycle tests. Unpublished, dev-only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+libc = { workspace = true }
+portable-pty = { workspace = true }
+vt100 = { workspace = true }
+
+[lints]
+workspace = true

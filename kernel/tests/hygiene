@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+set -euo pipefail
+root=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/../.." && pwd -P)
+base=${XDG_CACHE_HOME:-$HOME/.cache}/voidport-hygiene
+mkdir -p "$base"
+scratch=$(mktemp -d "$base/run.XXXXXX")
+trap 'rm -rf -- "$scratch"' EXIT
+cat > "$scratch/git" <<'EOF'
+#!/usr/bin/env bash
+if [ "$*" != 'ls-files' ]; then
+  exit 2
+fi
+printf '%s\n' kernel/voidport/unlisted.c
+EOF
+chmod +x "$scratch/git"
+if PATH="$scratch:$PATH" "$root/.githooks/pre-commit" --all; then
+  printf 'FAIL: an unlisted C source was accepted\n' >&2
+  exit 1
+else
+  status=$?
+  [ "$status" = 1 ] || exit "$status"
+fi
+printf 'PASS: the hook refused an unlisted C source\n'

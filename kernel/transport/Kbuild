@@ -1,0 +1,2 @@
+# SPDX-License-Identifier: GPL-2.0
+# The standalone C-object check uses the same flags as the module link.

@@ -1,0 +1,21 @@
+[package]
+name = "voidport-test-support"
+description = "voidport test scaffolding: a real server on a thread, a control client and the operator interface without a terminal, for the workspace suites. Unpublished, dev-only."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+publish = false
+
+[dependencies]
+voidport-control = { workspace = true, features = ["client"] }
+voidport-test-host = { workspace = true }
+voidport-tui = { workspace = true }
+voidportd = { path = "../voidportd" }
+
+rustix = { workspace = true }
+sd-notify = { workspace = true }
+serde_json = { workspace = true }
+tokio = { workspace = true }
+
+[lints]
+workspace = true

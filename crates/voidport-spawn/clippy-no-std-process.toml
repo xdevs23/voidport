@@ -1,0 +1,20 @@
+# SPDX-License-Identifier: GPL-3.0-only
+
+# A child started from the descriptor table of a process that has files of a
+# FUSE mount inherits a copy of each file until its `execve` ends, so the
+# mounts are busy meanwhile. Each crate of such a process links its
+# `clippy.toml` to this file. voidport-spawn has none.
+
+disallowed-types = [
+    { path = "std::process::Command", reason = "start the child with voidport_spawn::Program, which runs it from a descriptor table that contains no file of the process" },
+    { path = "tokio::process::Command", reason = "start the child with voidport_spawn::Program, which runs it from a descriptor table that contains no file of the process" },
+]
+
+disallowed-methods = [
+    { path = "std::process::Command::spawn", reason = "start the child with voidport_spawn::Program::spawn" },
+    { path = "std::process::Command::output", reason = "start the child with voidport_spawn::Program::output" },
+    { path = "std::process::Command::status", reason = "start the child with voidport_spawn::Program::status" },
+    { path = "tokio::process::Command::spawn", reason = "start the child with voidport_spawn::Program::spawn" },
+    { path = "tokio::process::Command::output", reason = "start the child with voidport_spawn::Program::output" },
+    { path = "tokio::process::Command::status", reason = "start the child with voidport_spawn::Program::status" },
+]
