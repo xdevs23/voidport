@@ -4,6 +4,7 @@ description = "voidport operator CLI: manages namespaces and rules on a running 
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+autotests = false
 
 [dependencies]
 voidport-control = { workspace = true, features = ["client"] }
@@ -27,6 +28,10 @@ anyhow = { workspace = true }
 clap = { workspace = true }
 clap_mangen = { workspace = true }
 voidport-control = { workspace = true }
+
+[[test]]
+name = "integration"
+path = "tests/integration/main.rs"
 
 [lints]
 workspace = true

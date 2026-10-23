@@ -1,14 +1,10 @@
 //! The real CLI against a real server.
 
-#![forbid(unsafe_code)]
-
-mod support;
-
 use std::fs;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
-use support::{Ctl as _, RunningServer, TempDir, server};
+use crate::support::{Ctl as _, RunningServer, TempDir, server};
 use voidport_control::{OwnershipSpec, Reply, Response};
 use voidport_test_support::{create_directory, daemon_config};
 

@@ -2,11 +2,7 @@
 //! interface runs headless through `voidport_test_support::tui`, so this test
 //! cannot pass without having read the server.
 
-#![forbid(unsafe_code)]
-
-mod support;
-
-use support::{Ctl as _, TempDir, server};
+use crate::support::{Ctl as _, TempDir, server};
 use voidport_test_support::tui::Harness;
 use voidport_tui::model::Screen;
 
