@@ -1,14 +1,12 @@
 #![forbid(unsafe_code)]
 
-mod frontend;
-
 use voidport_test_server as support;
 
 use std::fs;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 
-use frontend::{
+use crate::frontend::{
     Device, EVENT_INDEX, FEATURES, INDIRECT, QUEUE_SIZE, REPLY_LEN, Wait, body, frame, frame_chain,
     guest_memory, hello, lock, open, state_with_vhost_user,
 };

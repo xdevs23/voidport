@@ -2,6 +2,8 @@
 //! sets up queues in it, lays descriptor chains out, kicks, and reads the used
 //! ring. No virtual machine is involved.
 
+#![forbid(unsafe_code)]
+
 use std::fs::File;
 use std::os::fd::AsRawFd as _;
 use std::os::unix::net::UnixStream;
