@@ -21,6 +21,7 @@ use voidport_lkml::{
     storage::{Corpus, DataDirectory, StorageError, Writer, digest},
 };
 use voidport_spawn::{Program, Stream};
+use voidport_test_host::test_name;
 
 fn rerun(test: &str) -> Program<'static> {
     let mut program = Program::new(std::env::current_exe().unwrap());
@@ -130,7 +131,7 @@ fn failed_publication_keeps_the_previous_generation() {
         } else {
             drop(corpus);
             run_with_write_limit(
-                "persistence::failed_publication_keeps_the_previous_generation",
+                &test_name!(failed_publication_keeps_the_previous_generation),
                 &path,
                 failure == "write termination",
             );
@@ -240,7 +241,7 @@ fn stop_after_the_rename_keeps_the_new_generation() {
     let previous = corpus.state().generation;
     drop(corpus);
     let arrived = filesystem.hold_next_sync();
-    let mut copy = rerun("persistence::stop_after_the_rename_keeps_the_new_generation")
+    let mut copy = rerun(&test_name!(stop_after_the_rename_keeps_the_new_generation))
         .env("LKML_STOPPED_CORPUS", &filesystem.mountpoint)
         .spawn()
         .unwrap();
@@ -288,7 +289,7 @@ fn failed_raw_store_is_uncommitted_and_retryable() {
         match failure {
             "write error" | "write termination" => {
                 run_with_write_limit(
-                    "persistence::failed_raw_store_is_uncommitted_and_retryable",
+                    &test_name!(failed_raw_store_is_uncommitted_and_retryable),
                     &path,
                     failure == "write termination",
                 );
