@@ -15,7 +15,7 @@ expected_tests=(
   connection-threads connections-parallel settle-not-started settle-applied-forget
   settle-departed-lookup settle-signalled-outcome settle-signalled-mkdir
   join-silent join-teardown join-refused
-  write-through namespace-orphan setattr writable-mapping direct-io lock-wait
+  write-through namespace-orphan setattr writable-mapping direct-io direct-io-mount lock-wait
   revalidate-size revalidate-mtime
   negative-zero negative-lifetime negative-fixture
   revalidate-replace connection-fault busy-unmount unmount namespace-operations lazy-detach

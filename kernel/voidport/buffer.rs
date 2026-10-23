@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use core::convert::Infallible;
+use core::mem::MaybeUninit;
 use core::ops::ControlFlow;
 
 use kernel::bindings;
@@ -18,6 +19,9 @@ use crate::wire::Source;
 pub(crate) struct Buffer {
     runs: KVec<Run>,
     len: usize,
+    /// The memory in which the runs lie for a buffer made by [`Buffer::bounce`],
+    /// and empty otherwise. It is dropped after the runs.
+    memory: KVVec<u8>,
 }
 
 // SAFETY: the pages of every run remain valid until the buffer is dropped, and
@@ -78,6 +82,7 @@ impl Buffer {
         let mut buffer = Self {
             runs: KVec::new(),
             len: 0,
+            memory: KVVec::new(),
         };
         while buffer.len < length {
             let mut pages = core::ptr::null_mut();
@@ -117,6 +122,26 @@ impl Buffer {
                 Err(_) => return Err(Error::from_errno(taken as c_int)),
             }
         }
+        Ok(buffer)
+    }
+
+    /// `length` bytes of memory allocated for the buffer, which the reply to a
+    /// read can fill after a fatal signal ended the caller of the read, as it
+    /// can fill the pages of a program.
+    pub(crate) fn bounce(length: usize) -> Result<Self> {
+        let mut memory = KVVec::from_elem(0u8, length, GFP_KERNEL)?;
+        let segment = bindings::kvec {
+            iov_base: memory.as_mut_ptr().cast(),
+            iov_len: length,
+        };
+        let mut iter = MaybeUninit::<bindings::iov_iter>::uninit();
+        // SAFETY: the segment lies in the memory, and the iterator is set up
+        // before it is read.
+        let mut buffer = unsafe {
+            bindings::iov_iter_kvec(iter.as_mut_ptr(), bindings::ITER_DEST, &segment, 1, length);
+            Self::take(iter.as_mut_ptr(), length)?
+        };
+        buffer.memory = memory;
         Ok(buffer)
     }
 
@@ -173,6 +198,30 @@ impl Buffer {
                 source.receive_exact(bytes)
             }))
         }))
+    }
+
+    /// Copies the bytes `0..len` into `to`, and returns how many it copied.
+    ///
+    /// # Safety
+    ///
+    /// `to` is a live iterator, and no reply streams into the bytes.
+    pub(crate) unsafe fn copy_to_iter(&self, len: usize, to: *mut bindings::iov_iter) -> usize {
+        let mut copied = 0;
+        let visited = self.parts(0, len, &mut |part| {
+            let (page, offset) = part.page_of();
+            // SAFETY: the page remains valid until the buffer is dropped, the
+            // part lies inside it, and the caller promises a live iterator.
+            let done = unsafe { bindings::copy_page_to_iter(page, offset, part.len(), to) };
+            copied += done;
+            if done == part.len() {
+                ControlFlow::Continue(())
+            } else {
+                ControlFlow::Break(())
+            }
+        });
+        match visited {
+            ControlFlow::Continue(()) | ControlFlow::Break(()) => copied,
+        }
     }
 
     /// `destination` may lie in a page of the buffer itself.

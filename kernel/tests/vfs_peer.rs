@@ -76,7 +76,7 @@ pub(super) use signals::{Case as SignalCase, Operation as SignalOperation, run a
 pub(super) use sockets::{netns, peer_failure, unix, unix_chroot, unmount_wait};
 pub(super) use stopped_peer::{Case as StoppedPeerCase, run as stopped_peer};
 pub(super) use transitions::{run as transitions, stall_expiry};
-pub(super) use writes::{direct, run as writes};
+pub(super) use writes::{direct, direct_mount, run as writes};
 
 #[derive(Clone, Copy, Debug)]
 enum Answer {

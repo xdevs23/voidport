@@ -347,6 +347,7 @@ fn exercise(port: u16, state: &State, replies: &Replies) -> Result {
         "entry_timeout=0",
         "reconnect_stall=0",
         "no_privileged_bits",
+        "direct_io",
     ] {
         assert_eq!(mount(change, true), -1, "{change}");
         assert_eq!(errno(), libc::EINVAL, "{change}");

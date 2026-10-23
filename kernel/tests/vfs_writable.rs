@@ -9,6 +9,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::{CStr, CString};
 use std::io::ErrorKind;
 use std::net::{Ipv4Addr, TcpListener};
+use std::os::fd::AsRawFd;
 use std::ops::Range;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -46,6 +47,59 @@ pub(super) fn pattern(seed: u8, range: Range<u64>) -> Vec<u8> {
     range
         .map(|offset| ((offset % 251) as u8).wrapping_add(seed))
         .collect()
+}
+
+pub(super) struct Mapping {
+    address: *mut u8,
+    len: usize,
+}
+
+impl Mapping {
+    pub(super) fn new(file: &std::fs::File, len: usize) -> Result<Self> {
+        let address = unsafe {
+            libc::mmap(
+                std::ptr::null_mut(),
+                len,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_SHARED,
+                file.as_raw_fd(),
+                0,
+            )
+        };
+        if address == libc::MAP_FAILED {
+            return Err(std::io::Error::last_os_error().into());
+        }
+        Ok(Self {
+            address: address.cast(),
+            len,
+        })
+    }
+
+    pub(super) fn store(&self, seed: u8, range: Range<u64>) {
+        let bytes = pattern(seed, range.clone());
+        assert!(range.end as usize <= self.len);
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                bytes.as_ptr(),
+                self.address.add(range.start as usize),
+                bytes.len(),
+            )
+        };
+    }
+
+    pub(super) fn sync(&self) -> std::io::Result<()> {
+        if unsafe { libc::msync(self.address.cast(), self.len, libc::MS_SYNC) } == 0 {
+            Ok(())
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    }
+}
+
+impl Drop for Mapping {
+    fn drop(&mut self) {
+        unsafe { libc::munmap(self.address.cast(), self.len) };
+    }
 }
 
 pub(super) fn path(name: &str) -> String {

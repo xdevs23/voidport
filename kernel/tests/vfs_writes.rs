@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: GPL-2.0
 
 use super::writable::{
-    Answer, FIRST_FILE, Held, Peer, Received, mount, path, pattern, remount, unmount,
+    Answer, FIRST_FILE, Held, Mapping, Peer, Received, mount, path, pattern, remount, unmount,
 };
 use crate::{Result, load_module, unload_module};
 use std::fs::{File, OpenOptions};
 use std::io::{Seek, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
-use std::sync::Arc;
+use std::sync::{Arc, mpsc};
 use voidport_proto::opcode::Opcode;
 
 const FILE: u64 = FIRST_FILE;
@@ -40,6 +40,23 @@ fn read_at(file: &File, offset: u64, len: usize) -> Result<Vec<u8>> {
     let read = file.read_at(&mut bytes, offset)?;
     bytes.truncate(read);
     Ok(bytes)
+}
+
+/// The bytes `0..size` of `file`, copied by `sendfile(2)`, which splices them.
+fn sent(file: &File, size: u64) -> Result<Vec<u8>> {
+    let copy_path = "/vfs-writable-copy";
+    let copy = File::create(copy_path)?;
+    let end = libc::off_t::try_from(size)?;
+    let mut offset: libc::off_t = 0;
+    while offset < end {
+        let left = usize::try_from(end - offset)?;
+        let sent = unsafe { libc::sendfile(copy.as_raw_fd(), file.as_raw_fd(), &mut offset, left) };
+        assert!(sent > 0, "{}", std::io::Error::last_os_error());
+    }
+    drop(copy);
+    let copied = std::fs::read(copy_path)?;
+    std::fs::remove_file(copy_path)?;
+    Ok(copied)
 }
 
 pub(crate) fn run() -> Result {
@@ -171,37 +188,137 @@ pub(crate) fn direct() -> Result {
 
     // The writes ended the lifetime of the attributes of the file, and their
     // refresh drops the cached pages, since the modification time changed. The
-    // refresh happens here, so that it does not drop the pages the splice
-    // reads.
+    // refresh happens here, so that the read after the splice finds the pages
+    // that a splice through the page cache would leave.
     file.metadata()?;
-    let copy_path = "/vfs-writable-copy";
-    let copy = File::create(copy_path)?;
-    let mut offset: libc::off_t = 0;
-    while offset < size as libc::off_t {
-        let left = (size as libc::off_t - offset) as usize;
-        let sent = unsafe { libc::sendfile(copy.as_raw_fd(), file.as_raw_fd(), &mut offset, left) };
-        assert!(sent > 0, "{}", std::io::Error::last_os_error());
-    }
-    drop(copy);
-    assert!(
-        std::fs::read(copy_path)? == expected,
-        "the splice copied other bytes"
-    );
-    std::fs::remove_file(copy_path)?;
+    assert!(sent(&file, size)? == expected, "the splice copied other bytes");
     peer.take();
     let cached = File::open(path("file"))?;
-    assert!(read_at(&cached, 0, size as usize)? == expected);
-    assert_eq!(
-        reads(&peer.take()),
-        [],
-        "the splice left the page cache empty"
+    assert!(read_at(&cached, 0, usize::try_from(size)?)? == expected);
+    assert!(
+        !reads(&peer.take()).is_empty(),
+        "the splice left the file in the page cache"
     );
     drop(cached);
     drop(file);
 
     unmount(session)?;
     println!(
-        "direct I/O: a direct write is sent while another waits for its reply, each direct read is one request, and a splice reads through the page cache"
+        "direct I/O: a direct write is sent while another waits for its reply, each direct read is one request, and a splice reads past the page cache"
+    );
+    unload_module()
+}
+
+/// A mount with `direct_io` reads, splices and writes a file opened without
+/// `O_DIRECT` as `direct` does, with the inode lock taken exclusively for a
+/// write, and maps it through the page cache as a mount without the option
+/// does.
+pub(crate) fn direct_mount() -> Result {
+    load_module()?;
+    let page = u32::try_from(unsafe { libc::sysconf(libc::_SC_PAGESIZE) })?;
+    let (page_end, page_len) = (u64::from(page), usize::try_from(page)?);
+    let size = u64::from(DIRECT);
+    let peer = Peer::new(vec![Held::new(
+        "file",
+        libc::S_IFREG | 0o644,
+        pattern(0, 0..size),
+    )]);
+    let session = mount(&peer, "direct_io")?;
+    let file = Arc::new(
+        OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path("file"))?,
+    );
+    peer.take();
+
+    // A read or a splice through the page cache would find the pages cached
+    // the second time.
+    for _ in 0..2 {
+        assert!(
+            read_at(&file, 0, usize::try_from(DIRECT)?)? == pattern(0, 0..size),
+            "the read returned other bytes"
+        );
+    }
+    assert_eq!(reads(&peer.take()), [(0, DIRECT); 2]);
+    for _ in 0..2 {
+        assert!(
+            sent(&file, size)? == pattern(0, 0..size),
+            "the splice copied other bytes"
+        );
+        assert!(
+            !reads(&peer.take()).is_empty(),
+            "the splice read from the page cache"
+        );
+    }
+
+    // A write through the page cache would leave the whole page cached.
+    let written = pattern(6, 0..page_end);
+    assert_eq!(file.write_at(&written, 0)?, page_len);
+    assert_eq!(writes(&peer.take()), [(0, page)]);
+    assert!(read_at(&file, 0, page_len)? == written);
+    assert_eq!(reads(&peer.take()), [(0, page)]);
+
+    // Without `O_DIRECT`, a write waits for the inode lock while another
+    // write waits for the reply to it.
+    peer.withhold(&[Opcode::Write]);
+    let first = {
+        let file = file.clone();
+        std::thread::spawn(move || file.write_at(&pattern(7, 0..page_end), 0))
+    };
+    peer.wait_for(&Received::Write {
+        node: FILE,
+        offset: 0,
+        len: page,
+    })?;
+    let (task, started) = mpsc::channel();
+    let second = {
+        let file = file.clone();
+        std::thread::spawn(move || {
+            task.send(unsafe { libc::gettid() })
+                .expect("the case receives the task of the writer");
+            file.write_at(&pattern(8, page_end..2 * page_end), page_end)
+        })
+    };
+    let status = format!("/proc/self/task/{}/status", started.recv()?);
+    while !std::fs::read_to_string(&status)?
+        .lines()
+        .any(|line| line.starts_with("State:\tD"))
+    {
+        assert!(!second.is_finished(), "the second write did not wait");
+        std::thread::yield_now();
+    }
+    assert!(
+        !peer.received().contains(&Received::Write {
+            node: FILE,
+            offset: page_end,
+            len: page,
+        }),
+        "the second write was sent while the first one held the inode lock"
+    );
+    peer.send_withheld();
+    for writer in [first, second] {
+        let written = writer.join().map_err(|_| "a writer panicked")?;
+        assert_eq!(written?, page_len);
+    }
+    assert_eq!(writes(&peer.take()), [(0, page), (page_end, page)]);
+
+    let mapping = Mapping::new(&file, page_len)?;
+    mapping.store(9, 0..page_end);
+    mapping.sync()?;
+    assert!(
+        peer.content(FILE)[..page_len] == pattern(9, 0..page_end),
+        "the content of the peer does not show the stores through the mapping"
+    );
+    peer.take();
+    assert!(read_at(&file, 0, page_len)? == pattern(9, 0..page_end));
+    assert_eq!(reads(&peer.take()), [(0, page)]);
+    drop(mapping);
+    drop(file);
+
+    unmount(session)?;
+    println!(
+        "direct I/O mount: a file opened without O_DIRECT is read, spliced and written past the page cache, a write waits for the inode lock held by another, and a shared mapping stores through the page cache"
     );
     unload_module()
 }
