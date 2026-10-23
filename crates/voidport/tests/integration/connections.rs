@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use rustix::io::Errno;
-use support::daemon::{Ground, runtime, settle};
+use support::daemon::{Ground, reconnected_after, runtime};
 use support::relay::{Cut, Latch, Relay};
 use voidport::client::{
     Caller, Client, Connections, Data, EntrySink, Interrupt, Listed, Lock, LockKind, MountState,
@@ -470,9 +470,10 @@ fn losing_the_last_connection_during_a_write_takes_the_reconnect_path() {
             subscribed: false
         })
     );
-    rig.relay.arm(Opcode::Write, Cut::DiscardReply);
-    assert_eq!(rig.write(file, 0, b"LAST"), Err(Errno::IO));
-    settle(&rig.client);
+    reconnected_after(&rig.client, || {
+        rig.relay.arm(Opcode::Write, Cut::DiscardReply);
+        assert_eq!(rig.write(file, 0, b"LAST"), Err(Errno::IO));
+    });
     assert_eq!(rig.relay.carried(Opcode::Outcome), 0, "nothing was asked");
     assert_eq!(
         fs::read(rig.ground.tree.join("beta")).expect("host"),
@@ -1123,28 +1124,29 @@ fn a_refused_join_ends_the_session_and_the_mount_reconnects() {
     let other = Ground::start("connections-refused-join-other");
     rig.relay.redirect(other.server.data_socket());
     let hellos = rig.relay.carried(Opcode::Hello);
-
-    // One request holds the session's one connection, so the next one joins
-    // another, and is refused.
-    let latch = Latch::default();
-    let held = rig
-        .relay
-        .arm(Opcode::Getattr, Cut::HoldReply(latch.clone()));
-    let client = Arc::clone(&rig.client);
     let root = rig.client.root_node_id();
-    let first = rig
-        .runtime
-        .spawn(async move { client.getattr(Caller::default(), root, None).await });
-    held.recv().expect("the first reply is held");
-    rig.runtime
-        .block_on(rig.client.getattr(Caller::default(), root, None))
-        .expect("served in the new session");
-    latch.release();
-    rig.runtime
-        .block_on(first)
-        .expect("joined")
-        .expect("sent again in the new session");
-    settle(&rig.client);
+
+    reconnected_after(&rig.client, || {
+        // One request holds the session's one connection, so the next one joins
+        // another, and is refused.
+        let latch = Latch::default();
+        let held = rig
+            .relay
+            .arm(Opcode::Getattr, Cut::HoldReply(latch.clone()));
+        let client = Arc::clone(&rig.client);
+        let first = rig
+            .runtime
+            .spawn(async move { client.getattr(Caller::default(), root, None).await });
+        held.recv().expect("the first reply is held");
+        rig.runtime
+            .block_on(rig.client.getattr(Caller::default(), root, None))
+            .expect("served in the new session");
+        latch.release();
+        rig.runtime
+            .block_on(first)
+            .expect("joined")
+            .expect("sent again in the new session");
+    });
     assert!(
         rig.relay.carried(Opcode::Hello) >= hellos + 2,
         "a refused join and the hello of a new session"

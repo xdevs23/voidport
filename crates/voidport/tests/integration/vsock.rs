@@ -18,7 +18,7 @@ use std::time::Duration;
 
 use rustix::io::Errno;
 use serde_json::Value;
-use support::daemon::{LOOPBACK_CID, PATIENCE, Restartable, eventually, settle};
+use support::daemon::{LOOPBACK_CID, PATIENCE, Restartable, eventually, state_is};
 use support::{Guest, TempDir, errno, preflight, vsock_preflight};
 use voidport::client::MountState;
 use voidport::mount::{Mount, MountOptions};
@@ -202,7 +202,7 @@ fn a_vsock_mount_heals_paths_and_stales_descriptors_across_a_restart() {
         "the mount never noticed its server had gone"
     );
     ground.server.start_again();
-    settle(&client);
+    state_is(&client, |state| state == MountState::Connected);
     assert_eq!(client.state(), MountState::Connected);
 
     // The walk from the mount root is what the kernel's own `ESTALE` retry

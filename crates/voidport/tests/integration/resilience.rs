@@ -14,9 +14,9 @@ use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
 use support::daemon::{
-    CONTENTS, Ground, PATIENCE, accepts, eventually, runtime, settle, state_file,
+    CONTENTS, Ground, PATIENCE, accepts, eventually, reconnected_after, runtime, state_file,
     state_file_hiding_children, state_file_read_only, state_file_retargeted,
-    state_file_without_the_namespace, state_file_without_the_tree,
+    state_file_without_the_namespace, state_file_without_the_tree, state_is,
 };
 use support::relay::{Cut, Latch, Relay};
 use support::{errno, preflight};
@@ -276,21 +276,21 @@ fn a_handshake_completing_past_the_deadline_does_not_serve_the_window_it_missed(
 
     let latch = Latch::default();
     let held = relay.arm(Opcode::Hello, Cut::HoldRequest(latch.clone()));
-    let lost = Instant::now();
-    relay.end_carriers(Opcode::Hello);
-    held.recv().expect("the reconnect sends a hello");
-    let stalled = runtime
-        .block_on(client.getattr(caller, root, None))
-        .expect_err("the window closed before the held hello went through");
-    let waited = lost.elapsed();
-    assert_eq!(stalled, Errno::IO);
-    assert!(
-        waited >= STALL,
-        "the request gave up after {waited:?}, before the {STALL:?} window closed"
-    );
-
-    latch.release();
-    settle(&client);
+    reconnected_after(&client, || {
+        let lost = Instant::now();
+        relay.end_carriers(Opcode::Hello);
+        held.recv().expect("the reconnect sends a hello");
+        let stalled = runtime
+            .block_on(client.getattr(caller, root, None))
+            .expect_err("the window closed before the held hello went through");
+        let waited = lost.elapsed();
+        assert_eq!(stalled, Errno::IO);
+        assert!(
+            waited >= STALL,
+            "the request gave up after {waited:?}, before the {STALL:?} window closed"
+        );
+        latch.release();
+    });
     runtime
         .block_on(client.lookup(caller, root, b"tree"))
         .expect("the mount serves again");
@@ -399,12 +399,13 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
         .block_on(client.lookup(caller, root, b"tree"))
         .expect("the mount serves");
 
-    ground.server.kill();
-    ground
-        .server
-        .rewrite_state(&state_file_without_the_tree(&socket));
-    ground.server.start_again();
-    settle(&client);
+    reconnected_after(&client, || {
+        ground.server.kill();
+        ground
+            .server
+            .rewrite_state(&state_file_without_the_tree(&socket));
+        ground.server.start_again();
+    });
     assert_eq!(
         runtime
             .block_on(client.lookup(caller, root, b"tree"))
@@ -412,12 +413,13 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
         Errno::NOENT
     );
 
-    ground.server.kill();
-    ground
-        .server
-        .rewrite_state(&state_file_read_only(&ground.tree, &socket));
-    ground.server.start_again();
-    settle(&client);
+    reconnected_after(&client, || {
+        ground.server.kill();
+        ground
+            .server
+            .rewrite_state(&state_file_read_only(&ground.tree, &socket));
+        ground.server.start_again();
+    });
     let tree = runtime
         .block_on(client.lookup(caller, root, b"tree"))
         .expect("the graft is back");
@@ -435,12 +437,13 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
     // not. A name that only existed in the old target is gone.
     let elsewhere = ground.directory.directory("elsewhere");
     fs::write(elsewhere.join("moved"), b"moved").expect("a writable tree");
-    ground.server.kill();
-    ground
-        .server
-        .rewrite_state(&state_file_retargeted(&elsewhere, &socket));
-    ground.server.start_again();
-    settle(&client);
+    reconnected_after(&client, || {
+        ground.server.kill();
+        ground
+            .server
+            .rewrite_state(&state_file_retargeted(&elsewhere, &socket));
+        ground.server.start_again();
+    });
     let tree = runtime
         .block_on(client.lookup(caller, root, b"tree"))
         .expect("the graft still resolves");
@@ -465,12 +468,13 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
 
     // A name the namespace hides cannot be created, because the guest would not
     // see what it made.
-    ground.server.kill();
-    ground
-        .server
-        .rewrite_state(&state_file_hiding_children(&ground.tree, &socket));
-    ground.server.start_again();
-    settle(&client);
+    reconnected_after(&client, || {
+        ground.server.kill();
+        ground
+            .server
+            .rewrite_state(&state_file_hiding_children(&ground.tree, &socket));
+        ground.server.start_again();
+    });
     let tree = runtime
         .block_on(client.lookup(caller, root, b"tree"))
         .expect("the graft is still there");
@@ -505,7 +509,7 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
         .server
         .rewrite_state(&state_file(&ground.tree, &socket));
     ground.server.start_again();
-    settle(&client);
+    state_is(&client, |state| state == MountState::Connected);
     runtime
         .block_on(client.lookup(caller, root, b"tree"))
         .expect("the namespace is served again");
@@ -656,7 +660,7 @@ fn a_mount_comes_up_while_another_mount_of_the_process_stalls_with_a_file_open()
     );
 
     stalled.server.start_again();
-    settle(&client);
+    state_is(&client, |state| state == MountState::Connected);
     drop(held);
 }
 
@@ -712,7 +716,7 @@ fn a_child_started_while_the_fusermount_helper_starts_gets_no_copy_of_its_socket
     );
 
     stalled.server.start_again();
-    settle(&client);
+    state_is(&client, |state| state == MountState::Connected);
     let sockets = sockets_of(bystander.id());
     drop(bystander.stdin.take());
     let _ended = bystander.wait().expect("cat ends");
@@ -769,7 +773,7 @@ fn an_unmount_the_kernel_refuses_hands_the_recovery_back() {
     );
 
     ground.server.start_again();
-    settle(&client);
+    state_is(&client, |state| state == MountState::Connected);
     assert_eq!(
         fs::read(guest.path("tree/data.bin")).expect("the mount serves again"),
         CONTENTS

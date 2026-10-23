@@ -281,7 +281,8 @@ impl Client {
     /// came back": a watch receiver coalesces, so a session replaced inside one
     /// scheduling gap of an observer wakes it once, reading `Connected`. The
     /// generation is monotonic, so it makes that flap visible.
-    pub(crate) fn connected_generation(&self) -> Option<u64> {
+    #[must_use]
+    pub fn connected_generation(&self) -> Option<u64> {
         self.lock().machine.connected_generation()
     }
 
