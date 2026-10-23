@@ -1,6 +1,7 @@
 use voidport_test_client as support;
 
 use std::fs;
+use std::future::Future;
 use std::os::unix::fs::MetadataExt as _;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -9,8 +10,8 @@ use rustix::io::Errno;
 use support::daemon::{Ground, reconnected_after, runtime};
 use support::relay::{Cut, Latch, Relay};
 use voidport::client::{
-    Caller, Client, Connections, Data, DirEntry, EntrySink, Interrupt, Lock, LockKind, MountState,
-    Origin, Placement,
+    Caller, Client, Connections, Data, DirEntry, EntrySink, Interrupt, Interrupted, Lock, LockKind,
+    MountState, Origin, Placement,
 };
 use voidport::subscribe::{ShareEvent, Subscription};
 use voidport_control::{
@@ -117,6 +118,13 @@ impl Rig {
     /// applied ends the test only when the server ends.
     fn nodes_become(&self, nodes: usize) {
         self.ground.server.until(|| self.session().nodes == nodes);
+    }
+
+    /// As [`Self::nodes_become`], for a release.
+    fn handles_become(&self, handles: usize) {
+        self.ground
+            .server
+            .until(|| self.session().handles == handles);
     }
 
     /// Waits until every connection of the pool is idle, and makes the server
@@ -854,11 +862,9 @@ fn an_interrupted_lock_wait_ends_with_eintr_and_takes_nothing() {
     let client = Arc::clone(&rig.client);
     let waiting = rig.runtime.spawn(async move {
         let lock = whole_file(2, LockKind::Write);
-        let origin = Origin {
-            caller: Caller::default(),
-            interrupt: &interrupt,
-        };
-        client.setlk(origin, node, handle, lock, true).await
+        client
+            .setlk(raised_by(&interrupt), node, handle, lock, true)
+            .await
     });
     reaching
         .recv()
@@ -884,10 +890,7 @@ fn a_raised_interrupt_ends_a_lock_request_and_never_an_unlock() {
     let (raise, raised) = Interrupt::new();
     raise.raise();
     let setlk = |interrupt: &Interrupt, owner, kind| {
-        let origin = Origin {
-            caller: Caller::default(),
-            interrupt,
-        };
+        let origin = raised_by(interrupt);
         rig.runtime.block_on(
             rig.client
                 .setlk(origin, node, handle, whole_file(owner, kind), false),
@@ -898,6 +901,198 @@ fn a_raised_interrupt_ends_a_lock_request_and_never_an_unlock() {
     assert_eq!(setlk(&raised, 2, LockKind::Write), Err(Errno::INTR));
     setlk(&raised, 1, LockKind::Unlock).expect("the unlock is applied");
     setlk(&never, 2, LockKind::Write).expect("the lock is free");
+}
+
+fn raised_by(interrupt: &Interrupt) -> Origin<'_> {
+    Origin {
+        caller: Caller::default(),
+        interrupt,
+    }
+}
+
+/// The relay holds the reply to the request until the returned latch is
+/// released, so the server has applied the request and the client receives
+/// nothing. The interrupt is raised once the reply is held.
+fn interrupted_while_held<R, F>(
+    rig: &Rig,
+    opcode: Opcode,
+    send: impl FnOnce(Arc<Client>, Interrupt) -> F,
+) -> (R, Latch)
+where
+    F: Future<Output = R> + Send + 'static,
+    R: Send + 'static,
+{
+    let latch = Latch::default();
+    let held = rig.relay.arm(opcode, Cut::HoldReply(latch.clone()));
+    let (raise, interrupt) = Interrupt::new();
+    let sent = rig.runtime.spawn(send(Arc::clone(&rig.client), interrupt));
+    held.recv().expect("the reply is held");
+    raise.raise();
+    (rig.runtime.block_on(sent).expect("joined"), latch)
+}
+
+#[test]
+fn an_interrupted_lookup_ends_with_eintr_and_its_late_lookup_is_forgotten() {
+    let rig = rig("connections-interrupted-lookup");
+    let before = rig.session();
+    let tree = rig.tree;
+    let (looked_up, latch) =
+        interrupted_while_held(&rig, Opcode::Lookup, move |client, interrupt| async move {
+            client.lookup(raised_by(&interrupt), tree, b"alpha").await
+        });
+    assert_eq!(looked_up, Err(Errno::INTR));
+    assert_eq!(
+        rig.session().nodes,
+        before.nodes + 1,
+        "the server counted the lookup"
+    );
+    latch.release();
+    rig.nodes_become(before.nodes);
+}
+
+/// The reply comes to the client only through the outcome that the client asks
+/// for on another connection, after the connection of the lookup ended.
+#[test]
+fn an_interrupted_lookup_whose_reply_is_lost_is_forgotten_after_its_outcome() {
+    let rig = rig("connections-interrupted-lost-lookup");
+    rig.widen();
+    let before = rig.session();
+    let latch = Latch::default();
+    let reaching = rig
+        .relay
+        .arm(Opcode::Lookup, Cut::HoldRequest(latch.clone()));
+    let discarded = rig.relay.arm(Opcode::Lookup, Cut::DiscardReply);
+    let (raise, interrupt) = Interrupt::new();
+    let client = Arc::clone(&rig.client);
+    let tree = rig.tree;
+    let looking = rig
+        .runtime
+        .spawn(async move { client.lookup(raised_by(&interrupt), tree, b"alpha").await });
+    reaching
+        .recv()
+        .expect("the lookup is held before the server");
+    raise.raise();
+    assert_eq!(
+        rig.runtime.block_on(looking).expect("joined"),
+        Err(Errno::INTR)
+    );
+    latch.release();
+    discarded
+        .recv()
+        .expect("the reply of the server is discarded");
+    rig.nodes_become(before.nodes);
+}
+
+#[test]
+fn an_interrupted_opendir_ends_with_eintr_and_its_late_handle_is_released() {
+    let rig = rig("connections-interrupted-opendir");
+    let before = rig.session();
+    let tree = rig.tree;
+    let directory = rustix::fs::OFlags::DIRECTORY.bits() | rustix::fs::OFlags::RDONLY.bits();
+    let (opened, latch) =
+        interrupted_while_held(&rig, Opcode::Open, move |client, interrupt| async move {
+            client.open(raised_by(&interrupt), tree, directory).await
+        });
+    assert_eq!(opened, Err(Errno::INTR));
+    assert_eq!(
+        rig.session().handles,
+        before.handles + 1,
+        "the server opened the directory"
+    );
+    latch.release();
+    rig.handles_become(before.handles);
+}
+
+#[test]
+fn an_interrupted_listing_ends_with_eintr_and_its_late_entries_are_forgotten() {
+    let rig = rig("connections-interrupted-listing");
+    let directory = rustix::fs::OFlags::DIRECTORY.bits() | rustix::fs::OFlags::RDONLY.bits();
+    let handle = rig
+        .runtime
+        .block_on(rig.client.open(Origin::default(), rig.tree, directory))
+        .expect("the directory opens");
+    let before = rig.session();
+    let tree = rig.tree;
+    let names = Arc::new(Mutex::new(Vec::new()));
+    let sink = Box::new(Recording(Arc::clone(&names)));
+    let (listing, latch) = interrupted_while_held(
+        &rig,
+        Opcode::Readdirplus,
+        move |client, interrupt| async move {
+            let origin = raised_by(&interrupt);
+            client
+                .readdirplus(origin, tree, handle, 0, 65536, sink)
+                .await
+        },
+    );
+    assert_eq!(listing.outcome, Err(Errno::INTR));
+    assert!(names.lock().expect("unpoisoned").is_empty());
+    assert!(
+        rig.session().nodes > before.nodes,
+        "the server counted the entries"
+    );
+    latch.release();
+    rig.nodes_become(before.nodes);
+}
+
+/// A mkdir may have taken effect by the time the interrupt comes, so the
+/// caller waits for the answer after the cancel and learns the outcome.
+#[test]
+fn an_interrupted_mkdir_waits_for_its_answer() {
+    let rig = rig("connections-interrupted-mkdir");
+    let latch = Latch::default();
+    let held = rig.relay.arm(Opcode::Mkdir, Cut::HoldReply(latch.clone()));
+    let (raise, interrupt) = Interrupt::new();
+    let client = Arc::clone(&rig.client);
+    let tree = rig.tree;
+    let making = rig.runtime.spawn(async move {
+        client
+            .mkdir(raised_by(&interrupt), tree, b"made", 0o755, 0)
+            .await
+    });
+    held.recv().expect("the reply is held");
+    raise.raise();
+    rig.ground
+        .server
+        .until(|| rig.relay.carried(Opcode::Cancel) == 1);
+    latch.release();
+    let made = rig.runtime.block_on(making).expect("joined");
+    assert!(
+        made.is_ok(),
+        "the caller learns that it took effect: {made:?}"
+    );
+    assert!(rig.ground.tree.join("made").is_dir());
+}
+
+#[test]
+fn an_interrupted_read_ends_with_eintr_and_leaves_every_count() {
+    let rig = rig("connections-interrupted-read");
+    let (node, handle) = rig.open(b"alpha", O_RDWR);
+    let before = rig.session();
+    let buffer = rig.runtime.block_on(rig.client.buffer(64));
+    let (read, latch) =
+        interrupted_while_held(&rig, Opcode::Read, move |client, interrupt| async move {
+            let data = Data::new(buffer);
+            client
+                .read(raised_by(&interrupt), node, handle, 0, data)
+                .await
+                .map(|(_, outcome)| outcome)
+        });
+    assert_eq!(read, Err(Interrupted));
+    latch.release();
+    rig.fence();
+    let after = rig.session();
+    assert_eq!((after.nodes, after.handles), (before.nodes, before.handles));
+    rig.runtime
+        .block_on(support::read(
+            &rig.client,
+            Caller::default(),
+            node,
+            handle,
+            0,
+            64,
+        ))
+        .expect("the handle reads after the interrupted read");
 }
 
 #[test]
