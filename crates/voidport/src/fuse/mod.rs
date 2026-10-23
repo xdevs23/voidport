@@ -44,7 +44,7 @@ use voidport_session::metadata::{self, MaskedChmod};
 use voidport_session::write::{self, Next};
 
 use crate::client::{
-    AttrChange, Caller, Client, Data, Interrupt, Lock, LockKind, NewFile, Pages, Placement,
+    AttrChange, Caller, Client, Data, Interrupt, Lock, LockKind, NewFile, Origin, Pages, Placement,
     Streamed,
 };
 use crate::fuse::attr::{Privileged, entry_attr, node_attr, time_change, timespec};
@@ -195,15 +195,10 @@ impl VoidportFs {
         }
     }
 
-    /// No interrupt of the request ends the work.
-    fn spawn(&self, request: Request, work: impl Future<Output = ()> + Send + 'static) {
-        self.spawn_interruptible(request, |_| work);
-    }
-
     /// The callback is counted as owed from here, before the dispatch loop is
     /// let go, so there is no instant where the kernel has handed over a request
     /// that nothing accounts for, until the work is finished or dropped.
-    fn spawn_interruptible<F>(&self, request: Request, work: impl FnOnce(Interrupt) -> F)
+    fn spawn<F>(&self, request: Request, work: impl FnOnce(Interrupt) -> F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
@@ -263,8 +258,12 @@ impl VoidportFs {
     fn lookup(&self, request: Request, lookup: Child<'_>, reply: ReplyEntry) {
         let (client, caller, entry) = (self.client(), caller_of(request), self.entry());
         let name = lookup.name.as_bytes().to_vec();
-        self.spawn(request, async move {
-            entry.reply(reply, client.lookup(caller, lookup.parent, &name).await);
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            entry.reply(reply, client.lookup(origin, lookup.parent, &name).await);
         });
     }
 
@@ -288,8 +287,12 @@ impl VoidportFs {
 
     fn getattr(&self, request: Request, getattr: Getattr, reply: ReplyAttr) {
         let (client, caller, present) = (self.client(), caller_of(request), self.present);
-        self.spawn(request, async move {
-            match client.getattr(caller, getattr.node, getattr.handle).await {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            match client.getattr(origin, getattr.node, getattr.handle).await {
                 Ok(attr) => reply.attr(&present.attributes(getattr.node, &attr), present.attr_ttl),
                 Err(error) => reply.error(error),
             }
@@ -316,12 +319,16 @@ impl VoidportFs {
             _ => None,
         };
         let node = setattr.node;
-        self.spawn_interruptible(request, |interrupt| async move {
-            let change = match preserve_privileged(&client, caller, node, change, chmod).await {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            let change = match preserve_privileged(&client, origin, node, change, chmod).await {
                 Ok(change) => change,
                 Err(error) => return reply.error(error),
             };
-            match client.setattr(caller, &interrupt, node, change).await {
+            match client.setattr(origin, node, change).await {
                 Ok(attr) => reply.attr(&present.attributes(node, &attr), present.attr_ttl),
                 Err(error) => reply.error(error),
             }
@@ -330,8 +337,12 @@ impl VoidportFs {
 
     fn readlink(&self, request: Request, readlink: Readlink, reply: ReplyData) {
         let (client, caller) = (self.client(), caller_of(request));
-        self.spawn(request, async move {
-            match client.readlink(caller, readlink.node).await {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            match client.readlink(origin, readlink.node).await {
                 Ok(target) => reply.data(&target),
                 Err(error) => reply.error(error),
             }
@@ -351,10 +362,14 @@ impl VoidportFs {
         }
         let (client, caller, entry) = (self.client(), caller_of(request), self.entry());
         let name = mknod.name.as_bytes().to_vec();
-        self.spawn(request, async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             let made = client
                 .mknod(
-                    caller,
+                    origin,
                     mknod.parent,
                     &name,
                     mknod.mode,
@@ -369,9 +384,13 @@ impl VoidportFs {
     fn mkdir(&self, request: Request, mkdir: Mkdir<'_>, reply: ReplyEntry) {
         let (client, caller, entry) = (self.client(), caller_of(request), self.entry());
         let name = mkdir.name.as_bytes().to_vec();
-        self.spawn(request, async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             let made = client
-                .mkdir(caller, mkdir.parent, &name, mkdir.mode, mkdir.umask)
+                .mkdir(origin, mkdir.parent, &name, mkdir.mode, mkdir.umask)
                 .await;
             entry.reply(reply, made);
         });
@@ -380,16 +399,24 @@ impl VoidportFs {
     fn unlink(&self, request: Request, child: Child<'_>, reply: ReplyEmpty) {
         let (client, caller) = (self.client(), caller_of(request));
         let name = child.name.as_bytes().to_vec();
-        self.spawn(request, async move {
-            answer(reply, client.unlink(caller, child.parent, &name).await);
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            answer(reply, client.unlink(origin, child.parent, &name).await);
         });
     }
 
     fn rmdir(&self, request: Request, child: Child<'_>, reply: ReplyEmpty) {
         let (client, caller) = (self.client(), caller_of(request));
         let name = child.name.as_bytes().to_vec();
-        self.spawn(request, async move {
-            answer(reply, client.rmdir(caller, child.parent, &name).await);
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            answer(reply, client.rmdir(origin, child.parent, &name).await);
         });
     }
 
@@ -397,8 +424,12 @@ impl VoidportFs {
         let (client, caller, entry) = (self.client(), caller_of(request), self.entry());
         let name = symlink.name.as_bytes().to_vec();
         let target = symlink.target.as_bytes().to_vec();
-        self.spawn(request, async move {
-            let made = client.symlink(caller, symlink.parent, &name, &target).await;
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            let made = client.symlink(origin, symlink.parent, &name, &target).await;
             entry.reply(reply, made);
         });
     }
@@ -409,11 +440,15 @@ impl VoidportFs {
         let new_name = rename.new_name.as_bytes().to_vec();
         let (parent, new_parent) = (rename.parent, rename.new_parent);
         let flags = wire_rename_flags(rename.flags);
-        self.spawn(request, async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             answer(
                 reply,
                 client
-                    .rename(caller, parent, &name, new_parent, &new_name, flags)
+                    .rename(origin, parent, &name, new_parent, &new_name, flags)
                     .await,
             );
         });
@@ -423,8 +458,12 @@ impl VoidportFs {
         let (client, caller, entry) = (self.client(), caller_of(request), self.entry());
         let name = link.new_name.as_bytes().to_vec();
         let (node, new_parent) = (link.node, link.new_parent);
-        self.spawn(request, async move {
-            entry.reply(reply, client.link(caller, node, new_parent, &name).await);
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            entry.reply(reply, client.link(origin, node, new_parent, &name).await);
         });
     }
 
@@ -434,11 +473,12 @@ impl VoidportFs {
     /// the decision in two places.
     fn open(&self, request: Request, open: Open, reply: ReplyOpen) {
         let (client, caller, file_io) = (self.client(), caller_of(request), self.file_io);
-        self.spawn_interruptible(request, |interrupt| async move {
-            match client
-                .open_file(caller, &interrupt, open.node, open.flags.bits())
-                .await
-            {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            match client.open_file(origin, open.node, open.flags.bits()).await {
                 Ok((handle, pages)) => reply.opened(handle, file_io.open_flags(pages)),
                 Err(error) => reply.error(error),
             }
@@ -450,7 +490,11 @@ impl VoidportFs {
     /// here from where it stopped, into the same buffer.
     fn read(&self, request: Request, read: Read, reply: ReplyData) {
         let (client, caller, pages) = (self.client(), caller_of(request), self.pages());
-        self.spawn_interruptible(request, |interrupt| async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             let Read {
                 node,
                 handle,
@@ -460,8 +504,8 @@ impl VoidportFs {
             // Before the request goes out, so that a recall of the node can
             // hold it back.
             pages.fill(node, offset, u64::from(size)).await;
-            match serial_read(&client, caller, &interrupt, node, handle, offset, size).await {
-                Ok(data) => reply.data(data.filled()),
+            match serial_read(&client, origin, node, handle, offset, size).await {
+                Ok(received) => reply.data(received.bytes()),
                 Err(error) => reply.error(error),
             }
         });
@@ -488,12 +532,16 @@ impl VoidportFs {
             handle: write.handle,
             offset: write.offset,
         };
-        self.spawn_interruptible(request, |interrupt| async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             // Held back like a read: the kernel stores the bytes of a write
             // in its page cache, and the writeback of a dirty page, which a
             // drop of the pages starts, arrives here.
             pages.fill(at.node_id, at.offset, data.len() as u64).await;
-            let placed = serial_write(&client, caller, &interrupt, at, &data, strip).await;
+            let placed = serial_write(&client, origin, at, &data, strip).await;
             match placed {
                 Ok(written) => reply.written(written),
                 Err(error) => reply.error(error),
@@ -505,7 +553,7 @@ impl VoidportFs {
     /// the locks of a program that released them must not remain in the server.
     fn flush(&self, request: Request, flush: Flush, reply: ReplyEmpty) {
         let (client, caller) = (self.client(), caller_of(request));
-        self.spawn(request, async move {
+        self.spawn(request, |_| async move {
             let flushed = client
                 .flush(caller, flush.node, flush.handle, flush.lock_owner)
                 .await;
@@ -516,7 +564,7 @@ impl VoidportFs {
     /// Releases a handle. No interrupt ends it, as no interrupt ends a flush.
     fn release(&self, request: Request, release: Release, reply: ReplyEmpty) {
         let (client, caller) = (self.client(), caller_of(request));
-        self.spawn(request, async move {
+        self.spawn(request, |_| async move {
             answer(
                 reply,
                 client
@@ -535,9 +583,13 @@ impl VoidportFs {
 
     fn fsync(&self, request: Request, fsync: Fsync, reply: ReplyEmpty) {
         let (client, caller) = (self.client(), caller_of(request));
-        self.spawn_interruptible(request, |interrupt| async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             let synced = client
-                .fsync(caller, &interrupt, fsync.node, fsync.handle, fsync.datasync)
+                .fsync(origin, fsync.node, fsync.handle, fsync.datasync)
                 .await;
             answer(reply, synced);
         });
@@ -545,15 +597,13 @@ impl VoidportFs {
 
     fn fsyncdir(&self, request: Request, fsync: Fsync, reply: ReplyEmpty) {
         let (client, caller) = (self.client(), caller_of(request));
-        self.spawn(request, async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             let synced = client
-                .fsync(
-                    caller,
-                    &Interrupt::none(),
-                    fsync.node,
-                    fsync.handle,
-                    fsync.datasync,
-                )
+                .fsync(origin, fsync.node, fsync.handle, fsync.datasync)
                 .await;
             answer(reply, synced);
         });
@@ -564,8 +614,12 @@ impl VoidportFs {
     /// either.
     fn opendir(&self, request: Request, open: Open, reply: ReplyOpen) {
         let (client, caller) = (self.client(), caller_of(request));
-        self.spawn(request, async move {
-            match client.open(caller, open.node, open.flags.bits()).await {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            match client.open(origin, open.node, open.flags.bits()).await {
                 Ok(handle) => reply.opened(handle, FopenFlags::empty()),
                 Err(error) => reply.error(error),
             }
@@ -579,14 +633,18 @@ impl VoidportFs {
     fn readdir(&self, request: Request, read: Read, reply: ReplyDirectory) {
         let (client, caller) = (self.client(), caller_of(request));
         let privileged = self.present.privileged;
-        self.spawn(request, async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             let read = DirectoryRead {
                 node_id: read.node,
                 handle: read.handle,
                 cookie: read.offset,
             };
             let (sink, outcome) =
-                read_directory(&client, caller, read, privileged, PlainSink { reply }).await;
+                read_directory(&client, origin, read, privileged, PlainSink { reply }).await;
             if let Some(sink) = sink {
                 match outcome {
                     Ok(()) => sink.reply.ok(),
@@ -599,7 +657,11 @@ impl VoidportFs {
     fn readdirplus(&self, request: Request, read: Read, reply: ReplyDirectoryPlus) {
         let (client, caller, present) = (self.client(), caller_of(request), self.present);
         let pages = self.pages();
-        self.spawn(request, async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             let read = DirectoryRead {
                 node_id: read.node,
                 handle: read.handle,
@@ -611,7 +673,7 @@ impl VoidportFs {
                 taken: Vec::new(),
             };
             let (sink, outcome) =
-                read_directory(&client, caller, read, present.privileged, sink).await;
+                read_directory(&client, origin, read, present.privileged, sink).await;
             if let Some(sink) = sink {
                 match outcome {
                     Ok(()) => {
@@ -626,9 +688,10 @@ impl VoidportFs {
         });
     }
 
+    /// No interrupt ends it, as no interrupt ends a release.
     fn releasedir(&self, request: Request, release: Release, reply: ReplyEmpty) {
         let (client, caller) = (self.client(), caller_of(request));
-        self.spawn(request, async move {
+        self.spawn(request, |_| async move {
             answer(
                 reply,
                 client
@@ -647,8 +710,12 @@ impl VoidportFs {
 
     fn statfs(&self, request: Request, statfs: Statfs, reply: ReplyStatfs) {
         let (client, caller) = (self.client(), caller_of(request));
-        self.spawn(request, async move {
-            match client.statfs(caller, statfs.node).await {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            match client.statfs(origin, statfs.node).await {
                 Ok(stat) => reply.statfs(&FilesystemStats {
                     blocks: stat.blocks.get(),
                     free_blocks: stat.bfree.get(),
@@ -669,10 +736,14 @@ impl VoidportFs {
         let name = setxattr.name.as_bytes().to_vec();
         let value = setxattr.value.to_vec();
         let (node, flags) = (setxattr.node, wire_xattr_flags(setxattr.flags));
-        self.spawn(request, async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             answer(
                 reply,
-                client.setxattr(caller, node, &name, &value, flags).await,
+                client.setxattr(origin, node, &name, &value, flags).await,
             );
         });
     }
@@ -681,8 +752,12 @@ impl VoidportFs {
         let (client, caller) = (self.client(), caller_of(request));
         let name = getxattr.name.as_bytes().to_vec();
         let (node, size) = (getxattr.node, getxattr.size);
-        self.spawn(request, async move {
-            match client.getxattr(caller, node, &name, size).await {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            match client.getxattr(origin, node, &name, size).await {
                 Ok(value) if size == 0 => reply.size(value.size),
                 Ok(value) => reply.data(&value.value),
                 Err(error) => reply.error(error),
@@ -696,8 +771,12 @@ impl VoidportFs {
     fn listxattr(&self, request: Request, listxattr: Listxattr, reply: ReplyXattr) {
         let (client, caller) = (self.client(), caller_of(request));
         let Listxattr { node, size } = listxattr;
-        self.spawn(request, async move {
-            match client.listxattr(caller, node, size).await {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            match client.listxattr(origin, node, size).await {
                 Ok(names) if size == 0 => reply.size(names.size),
                 Ok(names) => reply.data(&names.to_kernel_list()),
                 Err(error) => reply.error(error),
@@ -709,15 +788,23 @@ impl VoidportFs {
         let (client, caller) = (self.client(), caller_of(request));
         let name = removexattr.name.as_bytes().to_vec();
         let node = removexattr.node;
-        self.spawn(request, async move {
-            answer(reply, client.removexattr(caller, node, &name).await);
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            answer(reply, client.removexattr(origin, node, &name).await);
         });
     }
 
     fn create(&self, request: Request, create: Create<'_>, reply: ReplyCreate) {
         let (client, caller, entry) = (self.client(), caller_of(request), self.entry());
         let name = create.name.as_bytes().to_vec();
-        self.spawn_interruptible(request, |interrupt| async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             let file = NewFile {
                 parent: create.parent,
                 name: &name,
@@ -725,7 +812,7 @@ impl VoidportFs {
                 mode: create.mode,
                 umask: create.umask,
             };
-            entry.created(reply, client.create(caller, &interrupt, file).await);
+            entry.created(reply, client.create(origin, file).await);
         });
     }
 
@@ -735,11 +822,12 @@ impl VoidportFs {
     fn getlk(&self, request: Request, getlk: Getlk, reply: ReplyLock) {
         let (client, caller) = (self.client(), caller_of(request));
         let lock = wire_lock(getlk.owner, &getlk.lock);
-        self.spawn_interruptible(request, |interrupt| async move {
-            match client
-                .getlk(caller, &interrupt, getlk.node, getlk.handle, lock)
-                .await
-            {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
+            match client.getlk(origin, getlk.node, getlk.handle, lock).await {
                 Ok(conflict) => reply.lock(&FileLock {
                     start: conflict.start,
                     end: conflict.end,
@@ -757,16 +845,13 @@ impl VoidportFs {
     fn setlk(&self, request: Request, setlk: Setlk, reply: ReplyEmpty) {
         let (client, caller) = (self.client(), caller_of(request));
         let lock = wire_lock(setlk.owner, &setlk.lock);
-        self.spawn_interruptible(request, |interrupt| async move {
+        self.spawn(request, |interrupt| async move {
+            let origin = Origin {
+                caller,
+                interrupt: &interrupt,
+            };
             let placed = client
-                .setlk(
-                    caller,
-                    &interrupt,
-                    setlk.node,
-                    setlk.handle,
-                    lock,
-                    setlk.wait,
-                )
+                .setlk(origin, setlk.node, setlk.handle, lock, setlk.wait)
                 .await;
             answer(reply, placed);
         });
@@ -854,31 +939,29 @@ const fn ioctl_type(cmd: u32) -> u32 {
     (cmd >> 8) & 0xff
 }
 
-/// A read that received bytes before an errno answers with those bytes, as a
-/// local read that fails partway returns what it read. One that received none
-/// answers the errno.
+/// A read that received bytes before an errno or an interrupt answers with
+/// those bytes, as a local read that fails partway returns what it read. One
+/// that received none answers the errno.
 async fn serial_read(
     client: &Client,
-    caller: Caller,
-    interrupt: &Interrupt,
+    origin: Origin<'_>,
     node_id: u64,
     handle: u64,
     offset: u64,
     size: u32,
-) -> Result<Data, rustix::io::Errno> {
+) -> Result<Received, rustix::io::Errno> {
     let mut data = Data::new(client.buffer(size as usize).await);
     while data.remaining() > 0 {
         let before = data.filled().len();
-        let (returned, outcome) = client
-            .read(
-                caller,
-                interrupt,
-                node_id,
-                handle,
-                offset + before as u64,
-                data,
-            )
-            .await;
+        // The buffer goes with a request that an interrupt ends, so the bytes
+        // of the requests before are copied out first.
+        let copied = (before > 0).then(|| data.filled().to_vec());
+        let Ok((returned, outcome)) = client
+            .read(origin, node_id, handle, offset + before as u64, data)
+            .await
+        else {
+            return copied.map(Received::Copied).ok_or(Errno::INTR);
+        };
         data = returned;
         let received = data.filled().len();
         match outcome {
@@ -898,13 +981,28 @@ async fn serial_read(
             Ok(_) | Err(_) => break,
         }
     }
-    Ok(data)
+    Ok(Received::Buffer(data))
+}
+
+/// The bytes of a read: in the buffer the read received them in, or copied
+/// out of a buffer that went with an interrupted request.
+enum Received {
+    Buffer(Data),
+    Copied(Vec<u8>),
+}
+
+impl Received {
+    fn bytes(&self) -> &[u8] {
+        match self {
+            Self::Buffer(data) => data.filled(),
+            Self::Copied(bytes) => bytes,
+        }
+    }
 }
 
 async fn serial_write(
     client: &Client,
-    caller: Caller,
-    interrupt: &Interrupt,
+    origin: Origin<'_>,
     at: Placement,
     data: &[u8],
     strip: bool,
@@ -919,7 +1017,7 @@ async fn serial_write(
                     ..at
                 };
                 let reply = client
-                    .write(caller, interrupt, from_here, &data[from as usize..], strip)
+                    .write(origin, from_here, &data[from as usize..], strip)
                     .await;
                 next = write::next(length, from, reply);
             }
@@ -986,7 +1084,7 @@ fn caller_of(request: Request) -> Caller {
 /// and operation.
 async fn preserve_privileged(
     client: &Client,
-    caller: Caller,
+    origin: Origin<'_>,
     node_id: u64,
     change: AttrChange,
     chmod: Option<MaskedChmod>,
@@ -994,7 +1092,7 @@ async fn preserve_privileged(
     let Some(chmod) = chmod else {
         return Ok(change);
     };
-    let held = client.getattr(caller, node_id, None).await?;
+    let held = client.getattr(origin, node_id, None).await?;
     Ok(AttrChange {
         mode: Some(chmod.mode(held.mode.get())),
         ..change
@@ -1073,6 +1171,88 @@ impl DirectorySink for PlainSink {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+    use voidport_proto::frame::{FRAME_HEADER_LEN, Frame, FrameWriter, Parsed};
+    use voidport_proto::limits::LIMITS;
+    use voidport_proto::ops::file::ReadResponse;
+    use voidport_proto::piece::{self, Closing};
+
+    use crate::client::{endpoint_path, join_reply};
+    use crate::url::Endpoint;
+
+    async fn next_request(server: &mut tokio::net::UnixStream) -> u64 {
+        let mut bytes = vec![0u8; FRAME_HEADER_LEN];
+        server.read_exact(&mut bytes).await.expect("a request");
+        loop {
+            let needed = match Frame::parse_prefix(&bytes, &LIMITS).expect("a frame") {
+                Parsed::Frame(frame) => return frame.request_id(),
+                Parsed::Need(needed) => needed,
+            };
+            let have = bytes.len();
+            bytes.resize(needed, 0);
+            server
+                .read_exact(&mut bytes[have..])
+                .await
+                .expect("the rest of the request");
+        }
+    }
+
+    /// The answer of a short read: `bytes`, and a closing piece that does not
+    /// mark the end of the file.
+    fn short_answer(request_id: u64, bytes: &[u8]) -> Vec<u8> {
+        let mut buffer = [0u8; 64];
+        let mut answer = FrameWriter::response(&mut buffer, &LIMITS, request_id, &ReadResponse)
+            .and_then(FrameWriter::finish)
+            .expect("encodable")
+            .to_vec();
+        answer.extend(piece::length(bytes.len()).expect("a length"));
+        answer.extend(bytes);
+        answer.extend(Closing::done(false).encode());
+        answer
+    }
+
+    async fn mounted(name: &str) -> (Arc<Client>, tokio::net::UnixStream) {
+        let path = endpoint_path(name);
+        let listener = tokio::net::UnixListener::bind(&path).expect("a listener");
+        let serving = async {
+            let (mut accepted, _) = listener.accept().await.expect("the mount dials");
+            let hello = next_request(&mut accepted).await;
+            let reply = join_reply(hello, 1, b"t");
+            accepted.write_all(&reply).await.expect("the reply");
+            accepted
+        };
+        let endpoint = Endpoint::Unix { path: path.clone() };
+        let (client, server) = tokio::join!(Client::mount(&endpoint, "", b""), serving);
+        std::fs::remove_file(&path).expect("the socket file is removed");
+        (client.expect("the mount"), server)
+    }
+
+    #[tokio::test]
+    async fn a_read_interrupted_while_it_continues_returns_the_bytes_received_before() {
+        let (client, mut server) = mounted("serial-read").await;
+        let (raise, interrupt) = Interrupt::new();
+        let reading = tokio::spawn({
+            let client = Arc::clone(&client);
+            async move {
+                let origin = Origin {
+                    caller: Caller::default(),
+                    interrupt: &interrupt,
+                };
+                serial_read(&client, origin, 2, 3, 0, 8)
+                    .await
+                    .map(|received| received.bytes().to_vec())
+            }
+        });
+        let first = next_request(&mut server).await;
+        server
+            .write_all(&short_answer(first, b"abc"))
+            .await
+            .expect("the short answer");
+        let _continuation = next_request(&mut server).await;
+        raise.raise();
+        assert_eq!(reading.await.expect("joined"), Ok(b"abc".to_vec()));
+    }
 
     #[test]
     fn a_direct_io_mount_opens_every_file_past_the_page_cache() {

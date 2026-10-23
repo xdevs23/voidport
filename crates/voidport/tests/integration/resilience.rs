@@ -20,7 +20,7 @@ use support::daemon::{
 };
 use support::relay::{Cut, Latch, Relay};
 use support::{errno, preflight};
-use voidport::client::{Caller, MountState};
+use voidport::client::{Caller, MountState, Origin};
 use voidport::mount::{MountOptions, TeardownError};
 use voidport_proto::opcode::Opcode;
 use voidport_spawn::{Program, Stream};
@@ -207,16 +207,16 @@ fn a_server_absent_past_the_window_fails_at_its_edge_and_then_immediately() {
     let mut ground = Ground::start("window");
     let runtime = runtime();
     let client = ground.connect(&runtime, STALL);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the mount serves");
 
     let killed = Instant::now();
     ground.server.kill();
     let stalled = runtime
-        .block_on(client.getattr(caller, root, None))
+        .block_on(client.getattr(origin, root, None))
         .expect_err("the server is gone");
     let waited = killed.elapsed();
     assert_eq!(stalled, Errno::IO);
@@ -234,7 +234,7 @@ fn a_server_absent_past_the_window_fails_at_its_edge_and_then_immediately() {
         let started = Instant::now();
         assert_eq!(
             runtime
-                .block_on(client.getattr(caller, root, None))
+                .block_on(client.getattr(origin, root, None))
                 .expect_err("still gone"),
             Errno::IO
         );
@@ -263,10 +263,10 @@ fn a_handshake_completing_past_the_deadline_does_not_serve_the_window_it_missed(
     let runtime = runtime();
     let relay = Relay::start(&ground.socket());
     let client = ground.connect_to(&runtime, &relay.endpoint(), STALL);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the mount serves");
     assert_eq!(
         client.connections().expect("a session").pooled,
@@ -281,7 +281,7 @@ fn a_handshake_completing_past_the_deadline_does_not_serve_the_window_it_missed(
         relay.end_carriers(Opcode::Hello);
         held.recv().expect("the reconnect sends a hello");
         let stalled = runtime
-            .block_on(client.getattr(caller, root, None))
+            .block_on(client.getattr(origin, root, None))
             .expect_err("the window closed before the held hello went through");
         let waited = lost.elapsed();
         assert_eq!(stalled, Errno::IO);
@@ -292,7 +292,7 @@ fn a_handshake_completing_past_the_deadline_does_not_serve_the_window_it_missed(
         latch.release();
     });
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the mount serves again");
 }
 
@@ -303,10 +303,10 @@ fn a_wedged_peer_does_not_hold_the_mount_past_the_deadline() {
     let mut ground = Ground::start("wedged");
     let runtime = runtime();
     let client = ground.connect(&runtime, STALL);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the mount serves");
 
     let killed = Instant::now();
@@ -329,7 +329,7 @@ fn a_wedged_peer_does_not_hold_the_mount_past_the_deadline() {
     );
 
     let stalled = runtime
-        .block_on(client.getattr(caller, root, None))
+        .block_on(client.getattr(origin, root, None))
         .expect_err("nothing is being served");
     let waited = killed.elapsed();
     assert_eq!(stalled, Errno::IO);
@@ -394,9 +394,10 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
     let runtime = runtime();
     let client = ground.connect(&runtime, STALL);
     let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the mount serves");
 
     reconnected_after(&client, || {
@@ -408,7 +409,7 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
     });
     assert_eq!(
         runtime
-            .block_on(client.lookup(caller, root, b"tree"))
+            .block_on(client.lookup(origin, root, b"tree"))
             .expect_err("the rule is gone"),
         Errno::NOENT
     );
@@ -421,14 +422,14 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
         ground.server.start_again();
     });
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft is back");
     let file = runtime
-        .block_on(client.lookup(caller, tree.node_id, b"data.bin"))
+        .block_on(client.lookup(origin, tree.node_id, b"data.bin"))
         .expect("resolves");
     assert_eq!(
         runtime
-            .block_on(client.open(caller, file.node_id, rustix::fs::OFlags::WRONLY.bits()))
+            .block_on(client.open(origin, file.node_id, rustix::fs::OFlags::WRONLY.bits()))
             .expect_err("the graft is read-only now"),
         Errno::ROFS
     );
@@ -445,13 +446,13 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
         ground.server.start_again();
     });
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft still resolves");
     let moved = runtime
-        .block_on(client.lookup(caller, tree.node_id, b"moved"))
+        .block_on(client.lookup(origin, tree.node_id, b"moved"))
         .expect("the new target's contents are what the graft shows now");
     let handle = runtime
-        .block_on(client.open(caller, moved.node_id, 0))
+        .block_on(client.open(origin, moved.node_id, 0))
         .expect("opens through the re-targeted graft");
     assert_eq!(
         runtime
@@ -461,7 +462,7 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
     );
     assert_eq!(
         runtime
-            .block_on(client.lookup(caller, tree.node_id, b"data.bin"))
+            .block_on(client.lookup(origin, tree.node_id, b"data.bin"))
             .expect_err("the old target is not behind this graft any more"),
         Errno::NOENT
     );
@@ -476,11 +477,11 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
         ground.server.start_again();
     });
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft is still there");
     assert_eq!(
         runtime
-            .block_on(client.mkdir(caller, tree.node_id, b"made", 0o755, 0))
+            .block_on(client.mkdir(origin, tree.node_id, b"made", 0o755, 0))
             .expect_err("the name is hidden now"),
         Errno::ACCESS
     );
@@ -499,7 +500,7 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
     );
     assert_eq!(
         runtime
-            .block_on(client.getattr(caller, root, None))
+            .block_on(client.getattr(origin, root, None))
             .expect_err("nothing serves this mount"),
         Errno::IO
     );
@@ -511,7 +512,7 @@ fn configuration_changed_across_the_gap_surfaces_per_request() {
     ground.server.start_again();
     state_is(&client, |state| state == MountState::Connected);
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the namespace is served again");
 }
 
@@ -520,17 +521,17 @@ fn a_zero_window_fails_outstanding_and_subsequent_operations_immediately() {
     let mut ground = Ground::start("failfast");
     let runtime = runtime();
     let client = ground.connect(&runtime, Duration::ZERO);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the mount serves");
 
     ground.server.kill();
     let started = Instant::now();
     assert_eq!(
         runtime
-            .block_on(client.getattr(caller, root, None))
+            .block_on(client.getattr(origin, root, None))
             .expect_err("the server is gone"),
         Errno::IO
     );
@@ -545,7 +546,7 @@ fn a_zero_window_fails_outstanding_and_subsequent_operations_immediately() {
         let started = Instant::now();
         assert_eq!(
             runtime
-                .block_on(client.getattr(caller, root, None))
+                .block_on(client.getattr(origin, root, None))
                 .expect_err("still gone"),
             Errno::IO
         );

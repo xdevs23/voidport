@@ -11,7 +11,7 @@ use std::time::Duration;
 use rustix::fs::OFlags;
 use rustix::io::Errno;
 use support::daemon::{Ground, reconnected_after, runtime};
-use voidport::client::{Caller, Interrupt, Lock, LockKind, MountState};
+use voidport::client::{Caller, Lock, LockKind, MountState, Origin};
 
 const STALL: Duration = Duration::from_secs(30);
 
@@ -24,23 +24,23 @@ fn a_stale_node_id_never_aliases_another_file() {
     let mut ground = Ground::start("aliasing");
     let runtime = runtime();
     let client = ground.connect(&runtime, STALL);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
 
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves");
     let alpha = runtime
-        .block_on(client.lookup(caller, tree.node_id, b"alpha"))
+        .block_on(client.lookup(origin, tree.node_id, b"alpha"))
         .expect("alpha resolves");
 
     reconnected_after(&client, || ground.server.restart());
 
     let fresh_tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves again");
     let beta = runtime
-        .block_on(client.lookup(caller, fresh_tree.node_id, b"beta"))
+        .block_on(client.lookup(origin, fresh_tree.node_id, b"beta"))
         .expect("beta resolves");
     // Distinguished by contents, not by inos: inos are not stable across server
     // restarts, so the first file each lifetime resolves gets the same number.
@@ -57,14 +57,14 @@ fn a_stale_node_id_never_aliases_another_file() {
     assert_ne!(tree.node_id, fresh_tree.node_id, "and so did the directory");
     assert_eq!(
         runtime
-            .block_on(client.getattr(caller, alpha.node_id, None))
+            .block_on(client.getattr(origin, alpha.node_id, None))
             .expect_err("the old node id belongs to a dead session"),
         Errno::STALE
     );
 
     assert_eq!(client.state(), MountState::Connected);
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the session survives an answer about a stale id");
 }
 
@@ -74,21 +74,22 @@ fn no_id_from_the_old_session_is_accepted_by_the_new_one() {
     let runtime = runtime();
     let client = ground.connect(&runtime, STALL);
     let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
 
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves");
     let mut old_nodes = HashSet::new();
     let mut old_handles = HashSet::new();
     for name in [&b"alpha"[..], b"beta"] {
         let entry = runtime
-            .block_on(client.lookup(caller, tree.node_id, name))
+            .block_on(client.lookup(origin, tree.node_id, name))
             .expect("resolves");
         old_nodes.insert(entry.node_id);
         old_handles.insert(
             runtime
-                .block_on(client.open(caller, entry.node_id, OFlags::RDONLY.bits()))
+                .block_on(client.open(origin, entry.node_id, OFlags::RDONLY.bits()))
                 .expect("opens"),
         );
     }
@@ -97,12 +98,12 @@ fn no_id_from_the_old_session_is_accepted_by_the_new_one() {
     reconnected_after(&client, || ground.server.restart());
 
     let fresh_tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves again");
     let mut fresh_handles = Vec::new();
     for name in [&b"alpha"[..], b"beta"] {
         let entry = runtime
-            .block_on(client.lookup(caller, fresh_tree.node_id, name))
+            .block_on(client.lookup(origin, fresh_tree.node_id, name))
             .expect("resolves");
         assert!(
             !old_nodes.contains(&entry.node_id),
@@ -110,7 +111,7 @@ fn no_id_from_the_old_session_is_accepted_by_the_new_one() {
             entry.node_id
         );
         let handle = runtime
-            .block_on(client.open(caller, entry.node_id, OFlags::RDONLY.bits()))
+            .block_on(client.open(origin, entry.node_id, OFlags::RDONLY.bits()))
             .expect("opens");
         assert!(
             !old_handles.contains(&handle),
@@ -126,7 +127,7 @@ fn no_id_from_the_old_session_is_accepted_by_the_new_one() {
     for node_id in &old_nodes {
         assert_eq!(
             runtime
-                .block_on(client.getattr(caller, *node_id, None))
+                .block_on(client.getattr(origin, *node_id, None))
                 .expect_err("a dead session's node"),
             Errno::STALE
         );
@@ -143,7 +144,7 @@ fn no_id_from_the_old_session_is_accepted_by_the_new_one() {
     assert_eq!(client.state(), MountState::Connected);
 
     runtime
-        .block_on(client.getattr(caller, root, None))
+        .block_on(client.getattr(origin, root, None))
         .expect("the mount root is the one id every session shares");
 }
 
@@ -154,17 +155,18 @@ fn a_lock_lost_with_its_server_surfaces_as_ebadf_and_is_reacquirable() {
     let runtime = runtime();
     let client = ground.connect(&runtime, STALL);
     let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
     let owner = 0x5ba7_efc0;
 
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves");
     let alpha = runtime
-        .block_on(client.lookup(caller, tree.node_id, b"alpha"))
+        .block_on(client.lookup(origin, tree.node_id, b"alpha"))
         .expect("alpha resolves");
     let handle = runtime
-        .block_on(client.open(caller, alpha.node_id, OFlags::RDWR.bits()))
+        .block_on(client.open(origin, alpha.node_id, OFlags::RDWR.bits()))
         .expect("opens");
     let exclusive = Lock {
         start: 0,
@@ -175,8 +177,7 @@ fn a_lock_lost_with_its_server_surfaces_as_ebadf_and_is_reacquirable() {
     };
     runtime
         .block_on(client.setlk(
-            caller,
-            &Interrupt::none(),
+            Origin::detached(caller),
             alpha.node_id,
             handle,
             exclusive,
@@ -188,15 +189,14 @@ fn a_lock_lost_with_its_server_surfaces_as_ebadf_and_is_reacquirable() {
 
     assert_eq!(
         runtime
-            .block_on(client.getlk(caller, &Interrupt::none(), alpha.node_id, handle, exclusive))
+            .block_on(client.getlk(Origin::detached(caller), alpha.node_id, handle, exclusive))
             .expect_err("the handle died with the session"),
         Errno::BADF
     );
     assert_eq!(
         runtime
             .block_on(client.setlk(
-                caller,
-                &Interrupt::none(),
+                Origin::detached(caller),
                 alpha.node_id,
                 handle,
                 exclusive,
@@ -207,18 +207,17 @@ fn a_lock_lost_with_its_server_surfaces_as_ebadf_and_is_reacquirable() {
     );
 
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves again");
     let alpha = runtime
-        .block_on(client.lookup(caller, tree.node_id, b"alpha"))
+        .block_on(client.lookup(origin, tree.node_id, b"alpha"))
         .expect("alpha resolves again");
     let reopened = runtime
-        .block_on(client.open(caller, alpha.node_id, OFlags::RDWR.bits()))
+        .block_on(client.open(origin, alpha.node_id, OFlags::RDWR.bits()))
         .expect("reopens");
     runtime
         .block_on(client.setlk(
-            caller,
-            &Interrupt::none(),
+            Origin::detached(caller),
             alpha.node_id,
             reopened,
             exclusive,

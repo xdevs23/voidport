@@ -10,7 +10,7 @@ use support::daemon::{Ground, reconnected_after, runtime};
 use support::relay::{Cut, Latch, Relay};
 use voidport::client::{
     Caller, Client, Connections, Data, DirEntry, EntrySink, Interrupt, Lock, LockKind, MountState,
-    Placement,
+    Origin, Placement,
 };
 use voidport::subscribe::{ShareEvent, Subscription};
 use voidport_control::{
@@ -42,7 +42,7 @@ fn rig_with(label: &str, prepare: impl FnOnce(&std::path::Path)) -> Rig {
     let runtime = runtime();
     let client = ground.connect_to(&runtime, &relay.endpoint(), STALL);
     let tree = runtime
-        .block_on(client.lookup(Caller::default(), client.root_node_id(), b"tree"))
+        .block_on(client.lookup(Origin::default(), client.root_node_id(), b"tree"))
         .expect("the graft resolves")
         .node_id;
     Rig {
@@ -70,10 +70,10 @@ impl Rig {
         let root = client.root_node_id();
         let first = self
             .runtime
-            .spawn(async move { client.getattr(Caller::default(), root, None).await });
+            .spawn(async move { client.getattr(Origin::default(), root, None).await });
         held.recv().expect("the first reply is held");
         self.runtime
-            .block_on(self.client.getattr(Caller::default(), root, None))
+            .block_on(self.client.getattr(Origin::default(), root, None))
             .expect("the second request takes a connection of its own");
         latch.release();
         self.runtime
@@ -86,7 +86,7 @@ impl Rig {
 
     fn lookup(&self, name: &[u8]) -> u64 {
         self.runtime
-            .block_on(self.client.lookup(Caller::default(), self.tree, name))
+            .block_on(self.client.lookup(Origin::default(), self.tree, name))
             .expect("the name resolves")
             .node_id
     }
@@ -95,15 +95,14 @@ impl Rig {
         let node = self.lookup(name);
         let handle = self
             .runtime
-            .block_on(self.client.open(Caller::default(), node, flags))
+            .block_on(self.client.open(Origin::default(), node, flags))
             .expect("the file opens");
         (node, handle)
     }
 
     fn write(&self, (node, handle): (u64, u64), offset: u64, data: &[u8]) -> Result<u32, Errno> {
         self.runtime.block_on(self.client.write(
-            Caller::default(),
-            &Interrupt::none(),
+            Origin::default(),
             Placement {
                 node_id: node,
                 handle,
@@ -166,15 +165,9 @@ fn a_long_read_does_not_delay_a_lookup_a_small_read_or_a_write_in_parallel() {
     let buffer = rig.runtime.block_on(rig.client.buffer(64));
     let reading = rig.runtime.spawn(async move {
         let (data, outcome) = client
-            .read(
-                Caller::default(),
-                &Interrupt::none(),
-                long.0,
-                long.1,
-                0,
-                Data::new(buffer),
-            )
-            .await;
+            .read(Origin::default(), long.0, long.1, 0, Data::new(buffer))
+            .await
+            .expect("no interrupt is raised");
         outcome.map(|_| data.filled().to_vec())
     });
     let mut carriers = vec![long_held.recv().expect("the long read's reply is held")];
@@ -188,7 +181,7 @@ fn a_long_read_does_not_delay_a_lookup_a_small_read_or_a_write_in_parallel() {
     let tree = rig.tree;
     let looking = rig.runtime.spawn(async move {
         client
-            .lookup(Caller::default(), tree, b"alpha")
+            .lookup(Origin::default(), tree, b"alpha")
             .await
             .map(|entry| entry.node_id)
     });
@@ -196,23 +189,16 @@ fn a_long_read_does_not_delay_a_lookup_a_small_read_or_a_write_in_parallel() {
     let buffer = rig.runtime.block_on(rig.client.buffer(64));
     let small_reading = rig.runtime.spawn(async move {
         let (data, outcome) = client
-            .read(
-                Caller::default(),
-                &Interrupt::none(),
-                small.0,
-                small.1,
-                0,
-                Data::new(buffer),
-            )
-            .await;
+            .read(Origin::default(), small.0, small.1, 0, Data::new(buffer))
+            .await
+            .expect("no interrupt is raised");
         outcome.map(|_| data.filled().to_vec())
     });
     let client = Arc::clone(&rig.client);
     let writing = rig.runtime.spawn(async move {
         client
             .write(
-                Caller::default(),
-                &Interrupt::none(),
+                Origin::default(),
                 Placement {
                     node_id: target.0,
                     handle: target.1,
@@ -307,8 +293,7 @@ fn a_write_cut_off_mid_data_is_a_short_write_and_the_rest_is_sent_again() {
     let writing = rig.runtime.spawn(async move {
         client
             .write(
-                Caller::default(),
-                &Interrupt::none(),
+                Origin::default(),
                 Placement {
                     node_id: file.0,
                     handle: file.1,
@@ -375,7 +360,7 @@ fn a_write_lost_where_the_server_read_nothing_is_sent_again_once() {
     let root = rig.client.root_node_id();
     let first = rig
         .runtime
-        .spawn(async move { client.getattr(Caller::default(), root, None).await });
+        .spawn(async move { client.getattr(Origin::default(), root, None).await });
     held.recv().expect("the first reply is held");
     rig.relay.arm(Opcode::Write, Cut::DropRequest);
     assert_eq!(rig.write(file, 0, b"ONCE"), Ok(4));
@@ -407,8 +392,7 @@ fn interleaved_writes_of_different_bytes_each_land_once() {
     let first = rig.runtime.spawn(async move {
         client
             .write(
-                Caller::default(),
-                &Interrupt::none(),
+                Origin::default(),
                 Placement {
                     node_id: file.0,
                     handle: file.1,
@@ -500,7 +484,7 @@ fn a_lost_lookup_and_open_leave_the_counts_as_the_client_knows_them() {
     rig.relay.arm(Opcode::Open, Cut::DiscardReply);
     let handle = rig
         .runtime
-        .block_on(rig.client.open(Caller::default(), node, O_RDWR))
+        .block_on(rig.client.open(Origin::default(), node, O_RDWR))
         .expect("settled from the kept reply");
     assert_eq!(rig.session().handles, before.handles + 1);
 
@@ -594,7 +578,7 @@ fn a_forget_lost_with_its_connection_is_applied_once() {
         .relay
         .arm(Opcode::Getattr, Cut::HoldReply(Latch::released()));
     rig.runtime
-        .block_on(rig.client.getattr(Caller::default(), rig.tree, None))
+        .block_on(rig.client.getattr(Origin::default(), rig.tree, None))
         .expect("answered");
     assert_eq!(
         answered.recv().expect("the reply went through"),
@@ -606,7 +590,7 @@ fn a_forget_lost_with_its_connection_is_applied_once() {
         .arm(Opcode::Retire, Cut::HoldReply(Latch::released()));
     let cut = rig.relay.arm(Opcode::Getattr, Cut::AfterRequest);
     rig.runtime
-        .block_on(rig.client.getattr(Caller::default(), rig.tree, None))
+        .block_on(rig.client.getattr(Origin::default(), rig.tree, None))
         .expect("sent again on another connection");
     assert_eq!(
         cut.recv().expect("the connection was lost"),
@@ -647,7 +631,7 @@ fn a_queued_forget_of_an_ended_session_never_reaches_the_newer_one() {
     let client = Arc::clone(&rig.client);
     let first = rig
         .runtime
-        .spawn(async move { client.getattr(caller, root, None).await });
+        .spawn(async move { client.getattr(Origin::default(), root, None).await });
     held.recv().expect("the reply is withheld");
 
     rig.relay.refuse_new(true);
@@ -668,7 +652,7 @@ fn a_queued_forget_of_an_ended_session_never_reaches_the_newer_one() {
 
     let tree = rig
         .runtime
-        .block_on(rig.client.lookup(caller, root, b"tree"))
+        .block_on(rig.client.lookup(Origin::default(), root, b"tree"))
         .expect("the graft resolves in the new session")
         .node_id;
     let looked_up = sessions_of(&other)[0].nodes;
@@ -713,7 +697,7 @@ fn a_listing_cut_off_part_way_is_answered_whole_from_the_kept_reply() {
     rig.relay.arm(Opcode::Readdirplus, Cut::Reply { pieces: 5 });
     let names = Arc::new(Mutex::new(Vec::new()));
     let listing = rig.runtime.block_on(rig.client.readdirplus(
-        Caller::default(),
+        Origin::default(),
         node,
         handle,
         0,
@@ -764,7 +748,7 @@ fn a_listing_cut_off_with_its_session_is_answered_by_the_next_session() {
     rig.relay.arm(Opcode::Readdirplus, Cut::Reply { pieces: 5 });
     let names = Arc::new(Mutex::new(Vec::new()));
     let listing = rig.runtime.block_on(rig.client.readdirplus(
-        Caller::default(),
+        Origin::default(),
         node,
         handle,
         0,
@@ -798,8 +782,7 @@ fn a_waiting_lock_whose_connection_closes_is_sent_again() {
     };
     rig.runtime
         .block_on(rig.client.setlk(
-            Caller::default(),
-            &Interrupt::none(),
+            Origin::default(),
             node,
             handle,
             lock(1, LockKind::Write),
@@ -811,8 +794,7 @@ fn a_waiting_lock_whose_connection_closes_is_sent_again() {
     let waiting = rig.runtime.spawn(async move {
         client
             .setlk(
-                Caller::default(),
-                &Interrupt::none(),
+                Origin::default(),
                 node,
                 handle,
                 lock(2, LockKind::Write),
@@ -830,8 +812,7 @@ fn a_waiting_lock_whose_connection_closes_is_sent_again() {
     assert!(!waiting.is_finished(), "it waits again");
     rig.runtime
         .block_on(rig.client.setlk(
-            Caller::default(),
-            &Interrupt::none(),
+            Origin::default(),
             node,
             handle,
             lock(1, LockKind::Unlock),
@@ -857,8 +838,7 @@ fn an_interrupted_lock_wait_ends_with_eintr_and_takes_nothing() {
     let (node, handle) = rig.open(b"alpha", O_RDWR);
     let setlk = |owner, kind| {
         rig.runtime.block_on(rig.client.setlk(
-            Caller::default(),
-            &Interrupt::none(),
+            Origin::default(),
             node,
             handle,
             whole_file(owner, kind),
@@ -874,9 +854,11 @@ fn an_interrupted_lock_wait_ends_with_eintr_and_takes_nothing() {
     let client = Arc::clone(&rig.client);
     let waiting = rig.runtime.spawn(async move {
         let lock = whole_file(2, LockKind::Write);
-        client
-            .setlk(Caller::default(), &interrupt, node, handle, lock, true)
-            .await
+        let origin = Origin {
+            caller: Caller::default(),
+            interrupt: &interrupt,
+        };
+        client.setlk(origin, node, handle, lock, true).await
     });
     reaching
         .recv()
@@ -902,19 +884,20 @@ fn a_raised_interrupt_ends_a_lock_request_and_never_an_unlock() {
     let (raise, raised) = Interrupt::new();
     raise.raise();
     let setlk = |interrupt: &Interrupt, owner, kind| {
-        rig.runtime.block_on(rig.client.setlk(
-            Caller::default(),
+        let origin = Origin {
+            caller: Caller::default(),
             interrupt,
-            node,
-            handle,
-            whole_file(owner, kind),
-            false,
-        ))
+        };
+        rig.runtime.block_on(
+            rig.client
+                .setlk(origin, node, handle, whole_file(owner, kind), false),
+        )
     };
-    setlk(&Interrupt::none(), 1, LockKind::Write).expect("the first lock holder acquires it");
+    let never = Interrupt::new().1;
+    setlk(&never, 1, LockKind::Write).expect("the first lock holder acquires it");
     assert_eq!(setlk(&raised, 2, LockKind::Write), Err(Errno::INTR));
     setlk(&raised, 1, LockKind::Unlock).expect("the unlock is applied");
-    setlk(&Interrupt::none(), 2, LockKind::Write).expect("the lock is free");
+    setlk(&never, 2, LockKind::Write).expect("the lock is free");
 }
 
 #[test]
@@ -928,7 +911,7 @@ fn a_request_cancelled_before_its_connection_is_lost_is_retired_once() {
     let client = Arc::clone(&rig.client);
     let cancelled = rig
         .runtime
-        .spawn(async move { client.statfs(Caller::default(), root).await });
+        .spawn(async move { client.statfs(Origin::default(), root).await });
     let carrier = held.recv().expect("the reply is held");
     cancelled.abort();
     assert!(
@@ -942,7 +925,7 @@ fn a_request_cancelled_before_its_connection_is_lost_is_retired_once() {
         .relay
         .arm(Opcode::Getattr, Cut::HoldReply(Latch::released()));
     rig.runtime
-        .block_on(rig.client.getattr(Caller::default(), root, None))
+        .block_on(rig.client.getattr(Origin::default(), root, None))
         .expect("answered");
     assert_ne!(
         other.recv().expect("the reply went through"),
@@ -991,8 +974,7 @@ fn a_request_cancelled_while_its_outcome_answer_is_held_is_retired_once() {
     let writing = rig.runtime.spawn(async move {
         client
             .write(
-                Caller::default(),
-                &Interrupt::none(),
+                Origin::default(),
                 Placement {
                     node_id: file.0,
                     handle: file.1,
@@ -1074,7 +1056,7 @@ fn a_subscription_owns_its_connection() {
     // on without a break.
     rig.relay.arm(Opcode::Getattr, Cut::DiscardReply);
     rig.runtime
-        .block_on(rig.client.getattr(Caller::default(), rig.tree, None))
+        .block_on(rig.client.getattr(Origin::default(), rig.tree, None))
         .expect("sent again");
     add_rule(&rig, "/tree/docs");
     assert!(
@@ -1131,7 +1113,7 @@ fn losing_the_last_pool_connection_while_dials_fail_keeps_the_session() {
     let tree = rig.tree;
     let pending = rig
         .runtime
-        .spawn(async move { client.getattr(Caller::default(), tree, None).await });
+        .spawn(async move { client.getattr(Origin::default(), tree, None).await });
     rig.ground
         .server
         .until(|| rig.relay.refused() >= refused + 3);
@@ -1185,10 +1167,10 @@ fn a_refused_join_ends_the_session_and_the_mount_reconnects() {
         let client = Arc::clone(&rig.client);
         let first = rig
             .runtime
-            .spawn(async move { client.getattr(Caller::default(), root, None).await });
+            .spawn(async move { client.getattr(Origin::default(), root, None).await });
         held.recv().expect("the first reply is held");
         rig.runtime
-            .block_on(rig.client.getattr(Caller::default(), root, None))
+            .block_on(rig.client.getattr(Origin::default(), root, None))
             .expect("served in the new session");
         latch.release();
         rig.runtime
@@ -1204,6 +1186,6 @@ fn a_refused_join_ends_the_session_and_the_mount_reconnects() {
         .server
         .until(|| sessions_of(&rig.ground).is_empty());
     rig.runtime
-        .block_on(rig.client.lookup(Caller::default(), root, b"tree"))
+        .block_on(rig.client.lookup(Origin::default(), root, b"tree"))
         .expect("the new session serves");
 }

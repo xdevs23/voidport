@@ -17,7 +17,7 @@ use std::time::Duration;
 
 use rustix::io::Errno;
 use support::daemon::{Ground, reconnected_after, runtime, state_is};
-use voidport::client::{Caller, MountState};
+use voidport::client::{Caller, MountState, Origin};
 use voidport::fuse::attr::Privileged;
 use voidport::fuse::dir::{DirectoryEntry, DirectoryRead, DirectorySink, read_directory};
 use voidport::url::Endpoint;
@@ -204,17 +204,17 @@ fn a_written_mutation_that_lost_its_answer_fails_and_is_not_applied_twice() {
     let relay = Relay::start(ground.server.data_socket());
     let runtime = runtime();
     let client = ground.connect_to(&runtime, &relay.endpoint(), STALL);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
 
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves");
 
     reconnected_after(&client, || {
         let sprung = relay.discard_next_reply(Opcode::Mkdir);
         let refused = runtime
-            .block_on(client.mkdir(caller, tree.node_id, b"made", 0o755, 0))
+            .block_on(client.mkdir(origin, tree.node_id, b"made", 0o755, 0))
             .expect_err("a mutation that may already have been applied must not be re-sent");
         assert_eq!(refused, Errno::IO);
         sprung
@@ -236,7 +236,7 @@ fn a_written_mutation_that_lost_its_answer_fails_and_is_not_applied_twice() {
         "the mount re-sent a mutation whose answer it never saw"
     );
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the mount serves after the refusal");
 }
 
@@ -246,17 +246,17 @@ fn a_written_idempotent_request_that_lost_its_answer_is_resent_and_completes() {
     let relay = Relay::start(ground.server.data_socket());
     let runtime = runtime();
     let client = ground.connect_to(&runtime, &relay.endpoint(), STALL);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
     runtime
-        .block_on(client.getattr(caller, root, None))
+        .block_on(client.getattr(origin, root, None))
         .expect("the mount serves");
     let before = relay.forwarded(Opcode::Getattr);
 
     let sprung = relay.discard_next_reply(Opcode::Getattr);
     let asking = {
         let client = Arc::clone(&client);
-        runtime.spawn(async move { client.getattr(caller, root, None).await })
+        runtime.spawn(async move { client.getattr(origin, root, None).await })
     };
     sprung
         .recv()
@@ -293,16 +293,17 @@ fn a_written_flush_that_lost_its_answer_fails_and_is_not_resent() {
     let runtime = runtime();
     let client = ground.connect_to(&runtime, &relay.endpoint(), STALL);
     let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
 
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves");
     let alpha = runtime
-        .block_on(client.lookup(caller, tree.node_id, b"alpha"))
+        .block_on(client.lookup(origin, tree.node_id, b"alpha"))
         .expect("the file resolves");
     let handle = runtime
-        .block_on(client.open(caller, alpha.node_id, 0))
+        .block_on(client.open(origin, alpha.node_id, 0))
         .expect("the file opens");
 
     reconnected_after(&client, || {
@@ -337,16 +338,17 @@ fn a_release_with_no_connection_is_moot_at_once() {
     let endpoint = ground.server.endpoint();
     let client = ground.connect_to(&runtime, &endpoint, STALL);
     let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
 
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves");
     let alpha = runtime
-        .block_on(client.lookup(caller, tree.node_id, b"alpha"))
+        .block_on(client.lookup(origin, tree.node_id, b"alpha"))
         .expect("the file resolves");
     let handle = runtime
-        .block_on(client.open(caller, alpha.node_id, 0))
+        .block_on(client.open(origin, alpha.node_id, 0))
         .expect("the file opens");
 
     ground.server.kill();
@@ -372,18 +374,18 @@ fn a_queued_request_is_sent_after_the_re_handshake() {
     let runtime = runtime();
     let endpoint = ground.server.endpoint();
     let client = ground.connect_to(&runtime, &endpoint, STALL);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
     runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the mount serves");
 
     ground.server.kill();
     state_is(&client, |state| state != MountState::Connected);
 
     let (lookup, mutation) = runtime.block_on(async {
-        let mut lookup = std::pin::pin!(client.lookup(caller, root, b"tree"));
-        let mut mutation = std::pin::pin!(client.mkdir(caller, root, b"unreachable", 0o755, 0));
+        let mut lookup = std::pin::pin!(client.lookup(origin, root, b"tree"));
+        let mut mutation = std::pin::pin!(client.mkdir(origin, root, b"unreachable", 0o755, 0));
         std::future::poll_fn(|cx| {
             assert!(
                 lookup.as_mut().poll(cx).is_pending(),
@@ -450,17 +452,17 @@ fn a_listing_that_fails_after_a_reconnect_forgets_nothing_of_the_ended_connectio
     let relay = Relay::start(ground.server.data_socket());
     let runtime = runtime();
     let client = ground.connect_to(&runtime, &relay.endpoint(), STALL);
-    let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
 
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves");
     let directory = runtime
-        .block_on(client.lookup(caller, tree.node_id, b"wide"))
+        .block_on(client.lookup(origin, tree.node_id, b"wide"))
         .expect("the directory resolves");
     let handle = runtime
-        .block_on(client.open(caller, directory.node_id, 0))
+        .block_on(client.open(origin, directory.node_id, 0))
         .expect("the directory opens");
 
     let (sprung_tx, sprung) = mpsc::channel();
@@ -475,7 +477,7 @@ fn a_listing_that_fails_after_a_reconnect_forgets_nothing_of_the_ended_connectio
     };
     let (sink, outcome) = runtime.block_on(read_directory(
         &client,
-        caller,
+        origin,
         read,
         Privileged::Present,
         sink,
@@ -494,7 +496,7 @@ fn a_listing_that_fails_after_a_reconnect_forgets_nothing_of_the_ended_connectio
     // A reply on the replacement connection comes after every frame sent on
     // it before its request, a `forget` included.
     runtime
-        .block_on(client.getattr(caller, root, None))
+        .block_on(client.getattr(origin, root, None))
         .expect("the mount serves");
     assert_eq!(
         relay.forwarded(Opcode::Forget),
@@ -510,16 +512,17 @@ fn a_forget_of_an_ended_generation_never_reaches_the_newer_connection() {
     let runtime = runtime();
     let client = ground.connect_to(&runtime, &relay.endpoint(), STALL);
     let caller = Caller::default();
+    let origin = Origin::default();
     let root = client.root_node_id();
 
     let tree = runtime
-        .block_on(client.lookup(caller, root, b"tree"))
+        .block_on(client.lookup(origin, root, b"tree"))
         .expect("the graft resolves");
     runtime.block_on(client.forget_on(caller, FIRST_GENERATION, tree.node_id, 1));
     // A reply comes after every frame sent before its request, a `forget`
     // included.
     runtime
-        .block_on(client.getattr(caller, root, None))
+        .block_on(client.getattr(origin, root, None))
         .expect("the mount serves");
     assert_eq!(
         relay.forwarded(Opcode::Forget),
@@ -535,7 +538,7 @@ fn a_forget_of_an_ended_generation_never_reaches_the_newer_connection() {
 
     runtime.block_on(client.forget_on(caller, FIRST_GENERATION, tree.node_id, 1));
     runtime
-        .block_on(client.getattr(caller, root, None))
+        .block_on(client.getattr(origin, root, None))
         .expect("the mount serves on the newer connection");
     assert_eq!(
         relay.forwarded(Opcode::Forget),

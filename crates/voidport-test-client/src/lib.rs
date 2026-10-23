@@ -606,16 +606,11 @@ pub async fn read(
     size: u32,
 ) -> Result<Vec<u8>, rustix::io::Errno> {
     let data = voidport::client::Data::new(client.buffer(size as usize).await);
+    let origin = voidport::client::Origin::detached(caller);
     let (data, outcome) = client
-        .read(
-            caller,
-            &voidport::client::Interrupt::none(),
-            node_id,
-            handle,
-            offset,
-            data,
-        )
-        .await;
+        .read(origin, node_id, handle, offset, data)
+        .await
+        .map_err(|voidport::client::Interrupted| rustix::io::Errno::INTR)?;
     match outcome {
         Ok(voidport::client::Streamed {
             failed: Some(errno),

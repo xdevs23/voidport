@@ -6,7 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex, mpsc};
 use std::thread;
 
-use voidport::client::{Caller, Client};
+use voidport::client::{Client, Origin};
 use voidport::url::Endpoint;
 use voidport_proto::frame::{FLAG_RESPONSE, FRAME_HEADER_LEN, Frame, FrameHeader, Parsed};
 use voidport_proto::limits::LIMITS;
@@ -187,7 +187,7 @@ impl Relay {
             let mut asking = tokio::task::JoinSet::new();
             for _ in 0..pool {
                 let client = Arc::clone(client);
-                asking.spawn(async move { client.getattr(Caller::default(), root, None).await });
+                asking.spawn(async move { client.getattr(Origin::default(), root, None).await });
             }
             while let Some(asked) = asking.join_next().await {
                 asked.expect("joined").expect("the getattr is answered");

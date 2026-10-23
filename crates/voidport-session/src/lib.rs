@@ -37,6 +37,7 @@ pub mod backoff;
 pub mod cache;
 pub mod cleanup;
 pub mod handshake;
+pub mod interrupt;
 pub mod metadata;
 pub mod options;
 pub mod owed;

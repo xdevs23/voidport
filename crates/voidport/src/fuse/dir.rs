@@ -15,7 +15,7 @@ use std::any::Any;
 use rustix::io::Errno;
 use voidport_fuse::{Attributes, FileType};
 
-use crate::client::{Caller, Client, DirEntry, EntrySink};
+use crate::client::{Caller, Client, DirEntry, EntrySink, Origin};
 use crate::fuse::attr::{Privileged, dirent_kind, entry_attr};
 
 #[derive(Clone, Copy, Debug)]
@@ -75,7 +75,7 @@ impl<S: DirectorySink> EntrySink for Offer<S> {
 /// answered that errno, and the entries the sink took were given back.
 pub async fn read_directory<S: DirectorySink>(
     client: &Client,
-    caller: Caller,
+    origin: Origin<'_>,
     read: DirectoryRead,
     privileged: Privileged,
     sink: S,
@@ -94,7 +94,7 @@ pub async fn read_directory<S: DirectorySink>(
     let page = u32::try_from(rustix::param::page_size()).unwrap_or(u32::MAX);
     let outcome = loop {
         let listing = client
-            .readdirplus(caller, read.node_id, read.handle, offer.cookie, page, offer)
+            .readdirplus(origin, read.node_id, read.handle, offer.cookie, page, offer)
             .await;
         let any: Box<dyn Any> = listing.sink;
         offer = match any.downcast::<Offer<S>>() {
@@ -118,7 +118,7 @@ pub async fn read_directory<S: DirectorySink>(
                 }
             }
             Err(error) => {
-                forget_all(client, caller, std::mem::take(&mut taken)).await;
+                forget_all(client, origin.caller, std::mem::take(&mut taken)).await;
                 break Err(error);
             }
         }
@@ -126,7 +126,7 @@ pub async fn read_directory<S: DirectorySink>(
     // One lookup was counted per entry reply, including when two entries name
     // the same node, as hardlinks in one directory do.
     if outcome.is_ok() && !counts_lookups {
-        forget_all(client, caller, taken).await;
+        forget_all(client, origin.caller, taken).await;
     }
     (Some(offer.sink), outcome)
 }
@@ -140,8 +140,8 @@ struct Taken {
 /// went with it.
 async fn forget_all(client: &Client, caller: Caller, taken: Vec<Taken>) {
     for batch in taken {
-        for node_id in batch.node_ids {
-            client.forget_on(caller, batch.generation, node_id, 1).await;
-        }
+        client
+            .forget_each_on(caller, batch.generation, &batch.node_ids)
+            .await;
     }
 }

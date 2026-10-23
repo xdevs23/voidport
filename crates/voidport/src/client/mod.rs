@@ -11,6 +11,7 @@ mod connection;
 mod forgets;
 
 pub use caching::Pages;
+mod exchange;
 mod interrupt;
 mod ops;
 mod pool;
@@ -18,7 +19,8 @@ mod storage;
 mod transport;
 
 pub use connection::{Data, EntrySink, Notice};
-pub use interrupt::{Interrupt, Raise};
+pub use exchange::Interrupted;
+pub use interrupt::{Interrupt, Origin, Raise};
 pub use ops::{
     AttrChange, Granted, Listing, Lock, LockKind, NewFile, Placement, Streamed, TimeChange,
     XattrNames, XattrValue,
@@ -37,24 +39,22 @@ use voidport_proto::error::FramingError;
 use voidport_proto::frame::Frame;
 use voidport_proto::limits::{LIMITS, Part};
 use voidport_proto::message::{RequestBody, ResponseBody, ResponseOutcome};
-use voidport_proto::opcode::Opcode;
-use voidport_proto::ops::connection::OutcomeRequest;
 use voidport_session::handshake::{HandshakeError, TooLong};
+use voidport_session::owed;
 use voidport_session::probe::{Action as ProbeAction, Degraded, Driver, Event};
 use voidport_session::reconnect::{FIRST_GENERATION, Lost, Machine, Phase, Serve, Woke};
 use voidport_session::replay::OpenFlags;
-use voidport_session::settling::{
-    AfterLoss, Concluded, Fate, Settled, Unsettled, conclude, settled,
-};
 use voidport_session::{Backoff, Instant};
-use zerocopy::byteorder::little_endian::U64;
 
 mod clock;
 
 use crate::url::Endpoint;
-use connection::{Answer, Connection, Destination, Forget, Nothing, Unsent, kept_answer};
+use connection::{Connection, Forget, Nothing};
+use exchange::Reply;
 pub use pool::Connections;
-use pool::Pool;
+#[cfg(test)]
+pub(crate) use pool::tests::{endpoint_path, join_reply};
+use pool::{Counted, Pool};
 pub use voidport_session::handshake::ROOT_NODE_ID;
 
 pub const DEFAULT_RECONNECT_STALL: Duration = voidport_session::options::DEFAULT_RECONNECT_STALL;
@@ -453,167 +453,25 @@ impl Client {
         }
     }
 
-    /// `Ok(None)` is the moot answer, which only an operation the core classifies
-    /// as moot can produce.
-    ///
-    /// When the connection is lost while the session lives, the request is
-    /// settled on another connection of the same session as the session core
-    /// decides ([`voidport_session::pool`]). When the session ends first, the
-    /// replay decision of the session core for the attempt stands.
-    ///
-    /// `destination` comes back with every outcome, an error before any attempt
-    /// included. A destination that cannot be restarted while its session lives,
-    /// one that already received entries, fails the request instead of being
-    /// sent again in that session.
-    ///
-    /// `kept` is the most bytes the kept reply of the server to this request can
-    /// take.
-    ///
-    /// `interrupt` ends the request with `EINTR` wherever it would otherwise be
-    /// sent, or sent again. While the request is in flight, a cancel of it
-    /// follows it on the connection it uses.
-    async fn exchange<Q: RequestBody, D: Destination>(
-        &self,
-        caller: Caller,
-        interrupt: &Interrupt,
-        opcode: Opcode,
-        request: &Outgoing<'_, Q>,
-        mut destination: D,
-        kept: usize,
-    ) -> (D, Result<Option<(Arc<Connection>, Answer)>, Errno>) {
-        let Outgoing {
-            node_id,
-            open,
-            body,
-            payload,
-            data,
-        } = *request;
-        let mut interrupt = interrupt.clone();
-        loop {
-            if interrupt.raised() {
-                return (destination, Err(Errno::INTR));
-            }
-            let pool = tokio::select! {
-                biased;
-                () = interrupt.wait() => continue,
-                connected = self.connected() => match connected {
-                    Ok(pool) => pool,
-                    Err(errno) => return (destination, Err(errno)),
-                },
-            };
-            let taken = tokio::select! {
-                biased;
-                () = interrupt.wait() => continue,
-                taken = pool.take() => taken,
-            };
-            let Ok(connection) = taken else {
-                // The session ended while this request waited for a connection, so
-                // the request takes the reconnect path once the mount has moved on
-                // from the session, unless it is interrupted first.
-                tokio::select! {
-                    biased;
-                    () = interrupt.wait() => {}
-                    () = self.moved_on_from(&pool) => {}
-                }
-                continue;
-            };
-            let (ticket, frame) =
-                match connection.compose(opcode, open, caller, node_id, body, payload) {
-                    Ok(composed) => composed,
-                    Err(unsent) => {
-                        connection.give_back();
-                        return (destination, Err(unsent_errno(unsent)));
-                    }
-                };
-            let request_id = ticket.request_id();
-            let (returned, outcome) = {
-                let call = connection.call(ticket, &frame, data, destination);
-                tokio::pin!(call);
-                tokio::select! {
-                    biased;
-                    called = &mut call => called,
-                    () = interrupt.wait() => {
-                        // Joined, so that the request continues to be written while
-                        // the cancel waits to follow it.
-                        let ((), called) = tokio::join!(connection.cancel(request_id), call);
-                        called
-                    }
-                }
-            };
-            destination = returned;
-            let decision = match outcome {
-                Ok(answer) => return (destination, Ok(Some((connection.give_back(), answer)))),
-                Err(decision) => decision,
-            };
-            connection.lost();
-            let settled = match pool.after_loss(opcode) {
-                AfterLoss::Settled(unasked) => unasked.into(),
-                AfterLoss::Ask => {
-                    let question = OutcomeRequest {
-                        connection_id: U64::new(connection.id()),
-                        request_id: U64::new(request_id),
-                    };
-                    settle(&pool, question, opcode, kept).await
-                }
-            };
-            // Given back after it is settled, because the lost connection is
-            // retired only once its request is.
-            let connection = connection.give_back();
-            match conclude(settled, decision, destination.restartable()) {
-                Concluded::Answer(reply) => {
-                    let answer = read_kept(&reply, request_id, opcode, &mut destination).await;
-                    return (destination, answer.map(|answer| Some((connection, answer))));
-                }
-                Concluded::SendAgain => destination.restart(),
-                Concluded::Fail => return (destination, Err(Errno::IO)),
-                Concluded::Moot => return (destination, Ok(None)),
-            }
-        }
-    }
-
     /// # Errors
     ///
     /// The errno the server answered with, `EIO` for a mount that is degraded or
-    /// whose non-idempotent request was lost in flight, and the errno the kernel
-    /// gives a part longer than its interface takes.
+    /// whose non-idempotent request was lost in flight, the errno the kernel
+    /// returns for a name or a value longer than the kernel interface accepts,
+    /// and `EINTR` for a request ended by the interrupt.
     async fn call<Q, R, T>(
         &self,
-        caller: Caller,
+        origin: Origin<'_>,
         node_id: u64,
         body: &Q,
         payload: &[u8],
-        extract: impl FnOnce(&R, &[u8]) -> Result<T, FramingError>,
+        extract: fn(&R, &[u8]) -> Result<T, FramingError>,
+        counted: fn(&T) -> Counted,
     ) -> Result<T, Errno>
     where
         Q: RequestBody,
-        R: ResponseBody,
-    {
-        self.call_interruptible::<Q, R, T>(
-            caller,
-            &Interrupt::none(),
-            node_id,
-            body,
-            payload,
-            extract,
-        )
-        .await
-    }
-
-    /// # Errors
-    ///
-    /// As [`Self::call`], and `EINTR` for a request ended by the interrupt.
-    async fn call_interruptible<Q, R, T>(
-        &self,
-        caller: Caller,
-        interrupt: &Interrupt,
-        node_id: u64,
-        body: &Q,
-        payload: &[u8],
-        extract: impl FnOnce(&R, &[u8]) -> Result<T, FramingError>,
-    ) -> Result<T, Errno>
-    where
-        Q: RequestBody,
-        R: ResponseBody,
+        R: ResponseBody + 'static,
+        T: 'static,
     {
         let request = Outgoing {
             node_id,
@@ -622,7 +480,7 @@ impl Client {
             payload,
             data: &[],
         };
-        self.call_on::<Q, R, T>(caller, interrupt, &request, extract)
+        self.call_on::<Q, R, T>(origin, &request, extract, counted)
             .await
             .map(|(value, _)| value)
     }
@@ -631,33 +489,41 @@ impl Client {
     /// last attempt, not necessarily the one it was first written to. The
     /// generation of the mount read around the call cannot say which, so the
     /// answering connection is the source.
+    ///
+    /// `counted` names what a value counts on the server, which is given back
+    /// for a reply that comes after its caller left.
     async fn call_on<Q, R, T>(
         &self,
-        caller: Caller,
-        interrupt: &Interrupt,
+        origin: Origin<'_>,
         request: &Outgoing<'_, Q>,
-        extract: impl FnOnce(&R, &[u8]) -> Result<T, FramingError>,
+        extract: fn(&R, &[u8]) -> Result<T, FramingError>,
+        counted: fn(&T) -> Counted,
     ) -> Result<(T, u64), Errno>
     where
         Q: RequestBody,
-        R: ResponseBody,
+        R: ResponseBody + 'static,
+        T: 'static,
     {
         let (Nothing, answered) = self
-            .exchange(
-                caller,
-                interrupt,
-                R::OPCODE,
-                request,
-                Nothing,
-                kept_bound::<R>(),
-            )
-            .await;
-        let answered = answered?;
+            .exchange(origin, R::OPCODE, request, Nothing, kept_bound::<R>())
+            .await
+            .or_hand_over(move |Nothing, answer| {
+                let value = reply_value::<R, T>(&answer.frame, extract)?;
+                Ok(value.map(|value| counted(&value)).unwrap_or_default())
+            })
+            .map_err(|Interrupted| Errno::INTR)?;
         // Only a moot operation answers without a reply, and those take
         // `call_moot`. A caller here that reaches this arm has lost its
         // connection and gets what every lost request gets.
-        let (connection, answer) = answered.ok_or(Errno::IO)?;
+        let Reply::Answered(connection, answer) = answered? else {
+            return Err(Errno::IO);
+        };
         let value = interpret::<R, T>(&connection, &answer.frame, extract)?;
+        debug_assert!(
+            counted(&value).fits(owed::of(R::OPCODE)),
+            "{} counts what the session core does not owe for it",
+            R::OPCODE
+        );
         Ok((value, connection.generation()))
     }
 
@@ -688,19 +554,20 @@ impl Client {
         };
         let (Nothing, answered) = self
             .exchange(
-                caller,
-                &Interrupt::none(),
+                Origin::detached(caller),
                 R::OPCODE,
                 &request,
                 Nothing,
                 kept_bound::<R>(),
             )
-            .await;
+            .await
+            .or_hand_over(|Nothing, _| Ok(Counted::default()))
+            .map_err(|Interrupted| Errno::INTR)?;
         match answered? {
-            Some((connection, answer)) => {
+            Reply::Answered(connection, answer) => {
                 interpret::<R, ()>(&connection, &answer.frame, |_, _| Ok(()))
             }
-            None => Ok(()),
+            Reply::Moot => Ok(()),
         }
     }
 
@@ -715,10 +582,15 @@ impl Client {
     /// A mount with another session installed, or none, drops them: the
     /// lookups they give back were counted by a session that is gone.
     async fn forget_within(&self, generation: u64, forgets: &[Forget]) {
-        let serving = self.lock().machine.serving(generation).map(Arc::clone);
-        if let Some(pool) = serving {
+        if let Some(pool) = self.serving(generation) {
             pool.forget(forgets).await;
         }
+    }
+
+    /// `None` for a mount with another session installed, or none: a lookup
+    /// that session counted went with it.
+    fn serving(&self, generation: u64) -> Option<Arc<Pool>> {
+        self.lock().machine.serving(generation).map(Arc::clone)
     }
 
     /// This is where session losses coalesce: the pool reports one when a join
@@ -990,45 +862,6 @@ struct Opened {
     generation: u64,
 }
 
-async fn settle(
-    pool: &Arc<Pool>,
-    question: OutcomeRequest,
-    opcode: Opcode,
-    bound: usize,
-) -> Settled<Data> {
-    let fate = pool.ask(question, bound).await;
-    if let Fate::Unsettled(unsettled) = &fate {
-        let errno = match unsettled {
-            Unsettled::Refused(errno) => Errno::from_raw_os_error(errno.get()),
-            Unsettled::Unanswerable => Errno::IO,
-        };
-        tracing::warn!(%errno, %opcode, "the server refused to say what became of a request");
-    }
-    settled(fate)
-}
-
-async fn read_kept<D: Destination>(
-    reply: &Data,
-    request_id: u64,
-    opcode: Opcode,
-    destination: &mut D,
-) -> Result<Answer, Errno> {
-    kept_answer(reply.filled(), request_id, opcode, destination)
-        .await
-        .map_err(|reason| {
-            tracing::warn!(%reason, %opcode, "a kept reply could not be read");
-            Errno::IO
-        })
-}
-
-fn unsent_errno(unsent: Unsent) -> Errno {
-    match unsent {
-        Unsent::Claim(voidport_session::table::ClaimError::Allocation) => Errno::NOMEM,
-        Unsent::Claim(voidport_session::table::ClaimError::Invariant(_)) => Errno::IO,
-        Unsent::Encode(error) => unencodable(error),
-    }
-}
-
 #[derive(Clone, Copy)]
 struct Outgoing<'a, Q> {
     node_id: u64,
@@ -1100,19 +933,17 @@ fn interpret<R: ResponseBody, T>(
     bytes: &[u8],
     extract: impl FnOnce(&R, &[u8]) -> Result<T, FramingError>,
 ) -> Result<T, Errno> {
-    let frame = match Frame::parse(bytes, &LIMITS) {
-        Ok(frame) => frame,
-        Err(fault) => return Err(poison(connection, fault)),
-    };
-    match frame.response::<R>() {
-        Ok(ResponseOutcome::Success(response)) => {
-            match extract(response.body(), response.payload()) {
-                Ok(value) => Ok(value),
-                Err(fault) => Err(poison(connection, fault)),
-            }
-        }
-        Ok(ResponseOutcome::Error(status)) => Err(errno_of(status)),
-        Err(fault) => Err(poison(connection, fault)),
+    reply_value::<R, T>(bytes, extract).unwrap_or_else(|fault| Err(poison(connection, fault)))
+}
+
+/// The inner `Err` is the errno a well-formed reply reports.
+fn reply_value<R: ResponseBody, T>(
+    bytes: &[u8],
+    extract: impl FnOnce(&R, &[u8]) -> Result<T, FramingError>,
+) -> Result<Result<T, Errno>, FramingError> {
+    match Frame::parse(bytes, &LIMITS)?.response::<R>()? {
+        ResponseOutcome::Success(response) => extract(response.body(), response.payload()).map(Ok),
+        ResponseOutcome::Error(status) => Ok(Err(errno_of(status))),
     }
 }
 
