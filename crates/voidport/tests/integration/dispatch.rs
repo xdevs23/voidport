@@ -5,6 +5,7 @@ use std::io::{IsTerminal as _, Read as _};
 use std::num::NonZeroUsize;
 use std::thread;
 
+use rustix::fs::{Mode, OFlags};
 use rustix::io::Errno;
 use support::daemon::Ground;
 use support::preflight;
@@ -17,7 +18,9 @@ use voidport_proto::opcode::Opcode;
 /// pruned node waits for a connection until the reads are answered. The pool
 /// tries to open a connection for the forget only once the forget has left the
 /// kernel, and the mount returns the result of a terminal query on an open file
-/// after that, which needs no connection.
+/// after that, which needs no connection. The pruned node stays in the kernel
+/// through a path descriptor until then, since a dentry cache drop by any other
+/// process would otherwise send its forget while a connection is still free.
 #[test]
 fn a_forget_that_waits_for_a_connection_leaves_the_mount_reading_requests() {
     preflight();
@@ -33,7 +36,12 @@ fn a_forget_that_waits_for_a_connection_leaves_the_mount_reading_requests() {
         },
     );
     let asked = fs::File::open(guest.path("tree/beta")).expect("the file opens");
-    fs::metadata(guest.path("tree/alpha")).expect("the kernel looks the file up");
+    let pruned = rustix::fs::open(
+        guest.path("tree/alpha"),
+        OFlags::PATH | OFlags::CLOEXEC,
+        Mode::empty(),
+    )
+    .expect("the kernel looks the file up");
 
     relay.refuse_new(true);
     let busy = guest.client().connections().expect("a session").pooled;
@@ -52,6 +60,7 @@ fn a_forget_that_waits_for_a_connection_leaves_the_mount_reading_requests() {
         .collect();
 
     let (forgets, refused) = (relay.carried(Opcode::Forget), relay.refused());
+    drop(pruned);
     support::drop_dentry_cache();
     ground.server.until(|| relay.refused() > refused);
     assert!(!asked.is_terminal(), "a shared file is not a terminal");
