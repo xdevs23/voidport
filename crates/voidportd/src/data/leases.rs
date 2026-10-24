@@ -7,9 +7,11 @@
 use std::collections::HashMap;
 use std::io;
 use std::os::fd::{AsRawFd, BorrowedFd, RawFd};
-use std::sync::{Arc, Mutex, MutexGuard, Weak};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, Weak};
 use std::thread::JoinHandle;
 
+use rustix::io::Errno;
+use rustix::process::Pid;
 use tokio::io::unix::AsyncFd;
 use tokio::sync::oneshot;
 use tokio::task::AbortHandle;
@@ -19,7 +21,7 @@ use crate::data::descriptor_budget::{DescriptorBudget, LeaseHolder, LeaseSlot};
 use crate::host::Description;
 use crate::host::attr::NodeIdentity;
 use crate::host::closes::{Closed, Closes, WatchId};
-use crate::host::lease::{Breaks, Kind};
+use crate::host::lease::{self as host_lease, Breaks, Kind};
 
 #[derive(Debug)]
 pub struct Leases {
@@ -29,6 +31,9 @@ pub struct Leases {
     closes: Closes,
     watches: Mutex<Watches>,
     caches: Mutex<HashMap<NodeIdentity, Vec<Weak<FileCache>>>>,
+    /// The lease thread while it runs. Every break signal goes to it, since it
+    /// sleeps only interruptibly.
+    thread: RwLock<Option<Pid>>,
 }
 
 #[derive(Debug)]
@@ -81,31 +86,41 @@ impl LeaseThread {
         let runtime = tokio::runtime::Builder::new_current_thread()
             .enable_all()
             .build()?;
-        let leases = Arc::new(Leases {
-            files: Mutex::default(),
-            budget,
-            runtime: runtime.handle().clone(),
-            closes,
-            watches: Mutex::new(Watches {
-                caches: HashMap::new(),
-                reading: true,
-            }),
-            caches: Mutex::default(),
-        });
         let (stop, stopped) = oneshot::channel();
-        let dispatching = Arc::clone(&leases);
+        let (started, running) = std::sync::mpsc::sync_channel(1);
         let thread = std::thread::Builder::new()
             .name("voidportd-leases".into())
             .spawn(move || {
-                runtime.block_on(async {
-                    tokio::select! {
-                        _ = stopped => {}
-                        _ = async {
-                            tokio::join!(dispatching.dispatch(&breaks), dispatching.changes())
-                        } => {}
-                    }
+                let leases = Arc::new(Leases {
+                    files: Mutex::default(),
+                    budget,
+                    runtime: runtime.handle().clone(),
+                    closes,
+                    watches: Mutex::new(Watches {
+                        caches: HashMap::new(),
+                        reading: true,
+                    }),
+                    caches: Mutex::default(),
+                    thread: RwLock::new(Some(rustix::thread::gettid())),
                 });
+                if started.send(Arc::clone(&leases)).is_ok() {
+                    runtime.block_on(async {
+                        tokio::select! {
+                            _ = stopped => {}
+                            _ = async {
+                                tokio::join!(leases.dispatch(&breaks), leases.changes())
+                            } => {}
+                        }
+                    });
+                }
+                // The kernel can give the number of an ended thread to another
+                // thread, which would then get the break signals.
+                *leases
+                    .thread
+                    .write()
+                    .unwrap_or_else(|poison| poison.into_inner()) = None;
             })?;
+        let leases = running.recv().map_err(io::Error::other)?;
         Ok(Self {
             leases,
             stop: Some(stop),
@@ -196,6 +211,16 @@ impl Leases {
             tokio::time::sleep_until(tokio::time::Instant::from_std(passed)).await;
             drop(caches);
         }));
+    }
+
+    /// After the lease thread ended, no lease is taken, since none of its
+    /// breaks would arrive.
+    pub fn take(&self, file: BorrowedFd<'_>, kind: Kind) -> Result<(), Errno> {
+        let thread = self
+            .thread
+            .read()
+            .unwrap_or_else(|poison| poison.into_inner());
+        host_lease::take(file, kind, thread.ok_or(Errno::SRCH)?)
     }
 
     pub fn spawn(&self, task: impl Future<Output = ()> + Send + 'static) -> LeaseTask {

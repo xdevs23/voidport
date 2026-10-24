@@ -5,9 +5,9 @@
 //! description of the file. A break makes the opener wait until the holder gives
 //! the lease up or the lease break time has passed, and signals the holder.
 //! [`take`] sets that signal with `F_SETSIG`, so it reports the descriptor the
-//! lease was placed on. A signal the kernel cannot queue arrives as a plain
-//! `SIGIO` that reports no descriptor, so every lease then has to be asked
-//! whether it is breaking.
+//! lease was placed on, and sends it to the thread named by the caller. A
+//! signal the kernel cannot queue arrives as a plain `SIGIO` that reports no
+//! descriptor, so every lease then has to be asked whether it is breaking.
 //!
 //! Only the account that owns a file, or a holder of `CAP_LEASE`, may lease it.
 
@@ -21,6 +21,7 @@ use rustix::event::EventfdFlags;
 use rustix::fs::OFlags;
 use rustix::io::Errno;
 use rustix::net::SendFlags;
+use rustix::process::Pid;
 use signal_hook_registry::SigId;
 
 /// A real-time signal, because those queue, one per break, with the descriptor
@@ -60,18 +61,38 @@ impl Kind {
     }
 }
 
-/// A read lease needs a descriptor open for reading.
+/// A read lease needs a descriptor open for reading. The break signal goes to
+/// the thread `signalled`.
 ///
 /// # Errors
 ///
 /// The host errno: `EAGAIN` while the file is open for writing, or for a
 /// write lease while it is open anywhere else, `EACCES` for a file of
-/// another account without `CAP_LEASE`, and whatever a filesystem that has
-/// no leases returns.
-pub fn take(file: BorrowedFd<'_>, kind: Kind) -> Result<(), Errno> {
+/// another account without `CAP_LEASE`, `ESRCH` when `signalled` is no
+/// thread, and whatever a filesystem that has no leases returns.
+pub fn take(file: BorrowedFd<'_>, kind: Kind, signalled: Pid) -> Result<(), Errno> {
     let signal = linux_raw_sys::general::F_SETSIG as libc::c_int;
     fcntl(file, signal, break_signal())?;
-    fcntl(file, libc::F_SETLEASE, kind.lock_type())
+    fcntl(file, libc::F_SETLEASE, kind.lock_type())?;
+    // Each lease added by `F_SETLEASE` sends its break signal to the calling
+    // thread (`lease_setup`, `fs/locks.c`). The kernel drops that signal once
+    // the thread has ended, and delays it while the thread sleeps
+    // uninterruptibly, so the opener would wait out the lease break time. A
+    // break before the next call goes to the calling thread, which is running.
+    signal_thread(file, signalled).inspect_err(|_| give_up(file))
+}
+
+fn signal_thread(file: BorrowedFd<'_>, thread: Pid) -> Result<(), Errno> {
+    let signalled = linux_raw_sys::general::f_owner_ex {
+        type_: linux_raw_sys::general::F_OWNER_TID as libc::c_int,
+        pid: thread.as_raw_nonzero().get(),
+    };
+    let command = linux_raw_sys::general::F_SETOWN_EX as libc::c_int;
+    // SAFETY: Unavoidable: rustix and libc have no `F_SETOWN_EX`. The kernel
+    // copies the `f_owner_ex` behind the pointer during the call and keeps no
+    // pointer. `signalled` lives until the call returns, and `file` is a valid
+    // descriptor for the duration of the borrow.
+    checked(unsafe { libc::fcntl(file.as_raw_fd(), command, &raw const signalled) })
 }
 
 /// While a break runs, the kernel returns the type the lease is being broken
@@ -218,8 +239,11 @@ fn fcntl(file: BorrowedFd<'_>, command: libc::c_int, argument: libc::c_int) -> R
     // have neither `F_SETSIG` nor a lease command. `F_SETSIG` and `F_SETLEASE`
     // take an `int` as their variadic argument, and `file` is a valid
     // descriptor for the duration of the borrow. The kernel stores no pointer.
-    let result = unsafe { libc::fcntl(file.as_fd().as_raw_fd(), command, argument) };
-    if result < 0 {
+    checked(unsafe { libc::fcntl(file.as_fd().as_raw_fd(), command, argument) })
+}
+
+fn checked(returned: libc::c_int) -> Result<(), Errno> {
+    if returned < 0 {
         return Err(Errno::from_raw_os_error(
             io::Error::last_os_error()
                 .raw_os_error()
@@ -231,10 +255,57 @@ fn fcntl(file: BorrowedFd<'_>, command: libc::c_int, argument: libc::c_int) -> R
 
 #[cfg(test)]
 mod tests {
-    use rustix::event::{PollFd, PollFlags};
-    use rustix::process::{Signal, getpid, kill_process};
+    use std::fs::{File, OpenOptions};
+    use std::os::fd::{AsFd, AsRawFd, RawFd};
+    use std::os::unix::fs::OpenOptionsExt;
 
-    use super::Breaks;
+    use rustix::event::{PollFd, PollFlags};
+    use rustix::net::RecvFlags;
+    use rustix::process::{Signal, getpid, kill_process};
+    use voidport_test_host::Scratch;
+
+    use super::{Breaks, Kind, give_up, take};
+
+    #[test]
+    fn a_break_signals_the_thread_named_at_take_after_the_taking_thread_ended() {
+        let breaks = Breaks::install().expect("the actions install");
+        let scratch = Scratch::new("lease-signalled-thread");
+        let path = scratch.file("leased", b"data");
+        let leased = File::open(&path).expect("readable");
+        let signalled = rustix::thread::gettid();
+        std::thread::scope(|scope| {
+            scope
+                .spawn(|| take(leased.as_fd(), Kind::Read, signalled))
+                .join()
+        })
+        .expect("the thread that takes the lease ends")
+        .expect("the scratch filesystem grants a lease");
+
+        // The open starts the break and fails at once. The kernel sends the
+        // break signal inside the open, and this thread runs its action on the
+        // way back.
+        let opened = OpenOptions::new()
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path);
+        assert_eq!(
+            opened.err().and_then(|error| error.raw_os_error()),
+            Some(libc::EWOULDBLOCK),
+            "the open breaks the lease"
+        );
+        let reported: Vec<RawFd> = std::iter::from_fn(|| {
+            let mut datagram = [0u8; size_of::<RawFd>()];
+            rustix::net::recv(breaks.descriptors(), &mut datagram, RecvFlags::DONTWAIT)
+                .ok()
+                .map(|_| RawFd::from_ne_bytes(datagram))
+        })
+        .collect();
+        give_up(leased.as_fd());
+        assert!(
+            reported.contains(&leased.as_raw_fd()),
+            "the break reports the leased descriptor"
+        );
+    }
 
     #[test]
     fn a_plain_sigio_counts_as_a_break_whose_descriptor_did_not_arrive() {

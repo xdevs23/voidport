@@ -34,7 +34,7 @@ fn leased_reply(directory: &Path) -> u32 {
     let probe = directory.join("lease-probe");
     fs::write(&probe, b"probe").expect("writable");
     let file = File::open(&probe).expect("readable");
-    let granted = lease::take(file.as_fd(), lease::Kind::Read).is_ok();
+    let granted = lease::take(file.as_fd(), lease::Kind::Read, rustix::thread::gettid()).is_ok();
     if granted {
         lease::give_up(file.as_fd());
     }

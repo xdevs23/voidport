@@ -25,7 +25,7 @@ pub(crate) fn require_leases(fixture: &Fixture) {
     let probe = fixture.host("tree").join("lease-probe");
     fs::write(&probe, b"probe").expect("writable");
     let file = File::open(&probe).expect("readable");
-    let granted = lease::take(file.as_fd(), lease::Kind::Read).is_ok();
+    let granted = lease::take(file.as_fd(), lease::Kind::Read, rustix::thread::gettid()).is_ok();
     if granted {
         lease::give_up(file.as_fd());
     }

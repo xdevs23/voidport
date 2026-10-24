@@ -49,7 +49,7 @@ use crate::data::leases::{LeaseFile, Leases};
 use crate::data::locks::FileLocks;
 use crate::data::recall::Recalls;
 use crate::host::attr::NodeIdentity;
-use crate::host::lease::{self as host_lease, Kind};
+use crate::host::lease::Kind;
 use crate::host::{Description, Transfer};
 
 #[derive(Debug)]
@@ -334,7 +334,7 @@ impl FileCache {
         match self.leases.slot(self) {
             Ok(slot) => {
                 let file = LeaseFile::new(&self.leases, description, slot, self);
-                state.lease = if host_lease::take(file.fd(), file.kind()).is_ok() {
+                state.lease = if self.leases.take(file.fd(), file.kind()).is_ok() {
                     state.epoch += 1;
                     Lease::Held {
                         file,

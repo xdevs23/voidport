@@ -224,7 +224,7 @@ impl FileCache {
             return;
         };
         let file = LeaseFile::new(&self.leases, description, slot, self);
-        if host_lease::take(file.fd(), kind).is_err() {
+        if self.leases.take(file.fd(), kind).is_err() {
             let (description, slot) = file.into_parts();
             state.lease = Lease::Waiting {
                 access,
