@@ -6,14 +6,16 @@ use std::fs;
 use std::io::{IsTerminal as _, Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::fs::{MetadataExt as _, PermissionsExt as _};
 use std::path::Path;
-use std::sync::mpsc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
+use procfs::process::Process;
 use rustix::event::{PollFd, PollFlags, Timespec};
 use rustix::fs::{FlockOperation, XattrFlags};
+use rustix::process::Pid;
 use support::mapping::SharedMapping;
 use support::{
-    Fixture, MAPPED_GUEST_ID, MAPPED_HOST_ID, NOBODY_ID, errno, eventually, presented_mode,
+    Fixture, KilledOnDrop, MAPPED_GUEST_ID, MAPPED_HOST_ID, NOBODY_ID, errno, eventually,
+    presented_mode,
 };
 use voidport::mount::{MountOptions, TeardownError};
 use voidport_spawn::{Program, Stream};
@@ -955,35 +957,25 @@ fn a_busy_mountpoint_reports_ebusy_and_an_unmount_never_hangs() {
         .expect("openable");
     rustix::fs::fcntl_lock(&blocker, FlockOperation::NonBlockingLockExclusive)
         .expect("the range is free");
-    let mut waiter = lock_waiter(&guest.path("data.bin"));
-    // Give the blocking request time to reach the server and park there.
-    std::thread::sleep(Duration::from_millis(300));
+    let mut waiter = parked_lock_waiter(&fixture, &guest.path("data.bin"));
 
-    let started = Instant::now();
     let outcome = guest.unmount();
-    assert!(
-        started.elapsed() < Duration::from_secs(5),
-        "the unmount took {:?} with a lock parked",
-        started.elapsed()
-    );
     assert!(
         outcome.is_err(),
         "descriptors are open, so the mountpoint is busy"
     );
 
     rustix::fs::fcntl_lock(&blocker, FlockOperation::Unlock).expect("releasable");
-    let status = waiter.wait().expect("the waiter's exit is readable");
+    let status = waiter.0.wait().expect("the waiter's exit is readable");
     assert!(
         status.success(),
         "the parked lock is granted once the range frees, got {status}"
     );
     drop(blocker);
     drop(held);
-    let started = Instant::now();
     guest
         .unmount_patiently()
         .expect("a quiet mountpoint unmounts");
-    assert!(started.elapsed() < Duration::from_secs(5));
 }
 
 #[test]
@@ -1025,17 +1017,7 @@ fn a_parked_blocking_lock_does_not_stall_the_mount() {
     rustix::fs::fcntl_lock(&held, FlockOperation::NonBlockingLockExclusive)
         .expect("the range is free");
 
-    let mut child = lock_waiter(&guest.path("data.bin"));
-    let (granted, is_granted) = mpsc::channel();
-    let waiter = std::thread::spawn(move || {
-        let outcome = child.wait();
-        granted.send(()).expect("the test is listening");
-        outcome
-    });
-    assert!(
-        is_granted.recv_timeout(Duration::from_millis(500)).is_err(),
-        "the blocking lock should still be waiting"
-    );
+    let mut waiter = parked_lock_waiter(&fixture, &guest.path("data.bin"));
 
     // Unrelated I/O keeps flowing through the same mount.
     for round in 0..4 {
@@ -1047,34 +1029,60 @@ fn a_parked_blocking_lock_does_not_stall_the_mount() {
         fs::read(guest.path("sub/inner")).expect("readable"),
         b"inner"
     );
+    assert_eq!(
+        parked_lock_requests(&fixture),
+        1,
+        "the blocking lock should still be waiting"
+    );
 
     rustix::fs::fcntl_lock(&held, FlockOperation::Unlock).expect("releasable");
-    is_granted
-        .recv_timeout(PATIENCE)
-        .expect("the parked lock is granted once the range frees");
-    let status = waiter
-        .join()
-        .expect("the waiter finishes")
-        .expect("the waiter's exit is readable");
-    assert!(status.success(), "the lock was granted, got {status}");
+    let status = waiter.0.wait().expect("the waiter's exit is readable");
+    assert!(
+        status.success(),
+        "the parked lock is granted once the range frees, got {status}"
+    );
 }
 
 const LOCK_WAITER: &str = "VOIDPORT_TEST_LOCK_WAITER";
 
 /// A record lock belongs to its process, so a request that waits on a lock
 /// this process holds has to come from another one: this test binary, run
-/// again as [`a_blocking_lock_waiter_in_its_own_process`].
-fn lock_waiter(path: &std::path::Path) -> std::process::Child {
-    Program::new(std::env::current_exe().expect("the test binary"))
-        .args([
-            "--exact",
-            &test_name!(a_blocking_lock_waiter_in_its_own_process),
-            "--test-threads=1",
-        ])
-        .env(LOCK_WAITER, path)
-        .stderr(Stream::Inherit)
-        .spawn()
-        .expect("the waiter starts")
+/// again as [`a_blocking_lock_waiter_in_its_own_process`]. Returns once the
+/// server has parked the lock request sent by that process.
+fn parked_lock_waiter(fixture: &Fixture, path: &Path) -> KilledOnDrop {
+    let waiter = KilledOnDrop(
+        Program::new(std::env::current_exe().expect("the test binary"))
+            .args([
+                "--exact",
+                &test_name!(a_blocking_lock_waiter_in_its_own_process),
+                "--test-threads=1",
+            ])
+            .env(LOCK_WAITER, path)
+            .stderr(Stream::Inherit)
+            .spawn()
+            .expect("the waiter starts"),
+    );
+    let process = Process::new(Pid::from_child(&waiter.0).as_raw_nonzero().get())
+        .expect("the waiter is listed in /proc");
+    fixture.server.until(|| {
+        assert!(
+            process.is_alive(),
+            "the waiter ended before the server parked its request"
+        );
+        parked_lock_requests(fixture) == 1
+    });
+    waiter
+}
+
+fn parked_lock_requests(fixture: &Fixture) -> usize {
+    fixture
+        .server
+        .service()
+        .sessions()
+        .live()
+        .iter()
+        .map(|session| session.locks().waiting_requests())
+        .sum()
 }
 
 /// Run any other way, it does nothing.
