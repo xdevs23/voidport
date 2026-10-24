@@ -34,6 +34,8 @@ pub const NOBODY_ID: u32 = 65534;
 
 static SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+const TEMP_DIR_PREFIX: &str = "voidport-e2e-";
+
 pub fn preflight() {
     if let Err(error) = fs::OpenOptions::new()
         .read(true)
@@ -107,18 +109,22 @@ impl TempDir {
     /// inherited umask.
     #[must_use]
     pub fn new(label: &str) -> Self {
-        let nanos = SystemTime::UNIX_EPOCH
-            .elapsed()
-            .map_or(0, |elapsed| elapsed.as_nanos());
-        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
-        let path = scratch_root().join(format!(
-            "voidport-e2e-{label}-{}-{sequence}-{nanos}",
-            std::process::id()
-        ));
+        let path = Self::unique_path(label);
         create_directory(&path);
         fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("a settable mode");
         detach_mounts_below(&path);
         Self { path }
+    }
+
+    fn unique_path(label: &str) -> PathBuf {
+        let nanos = SystemTime::UNIX_EPOCH
+            .elapsed()
+            .map_or(0, |elapsed| elapsed.as_nanos());
+        let sequence = SEQUENCE.fetch_add(1, Ordering::Relaxed);
+        scratch_root().join(format!(
+            "{TEMP_DIR_PREFIX}{label}-{}-{sequence}-{nanos}",
+            std::process::id()
+        ))
     }
 
     #[must_use]
@@ -148,6 +154,19 @@ impl TempDir {
     }
 }
 
+/// Whether `path` is a directory made by [`TempDir::new`] or lies below one.
+fn is_in_temp_dir(path: &Path) -> bool {
+    path.strip_prefix(scratch_root())
+        .ok()
+        .and_then(|inside| inside.components().next())
+        .is_some_and(|directory| {
+            directory
+                .as_os_str()
+                .as_bytes()
+                .starts_with(TEMP_DIR_PREFIX.as_bytes())
+        })
+}
+
 impl Drop for TempDir {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.path) {
@@ -156,6 +175,18 @@ impl Drop for TempDir {
                 self.path.display()
             );
         }
+    }
+}
+
+/// A program the test started, killed if the test ends before it exits, so
+/// that no mount a test leaves behind remains busy.
+#[derive(Debug)]
+pub struct KilledOnDrop(pub Child);
+
+impl Drop for KilledOnDrop {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
     }
 }
 

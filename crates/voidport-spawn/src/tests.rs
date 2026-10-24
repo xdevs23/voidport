@@ -82,6 +82,16 @@ fn the_output_and_the_status_of_a_child_are_returned() {
     assert_eq!(status.code(), Some(4));
 }
 
+#[test]
+fn a_program_run_through_a_wrapper_follows_the_arguments_of_the_wrapper() {
+    let output = Program::new("echo")
+        .arg("program")
+        .run_through("echo", ["wrapper"])
+        .output()
+        .expect("echo starts");
+    assert_eq!(output.stdout, b"wrapper echo program\n");
+}
+
 fn waiting(program: &mut Program<'_>) -> Child {
     program
         .args(["-c", "read -r line || true"])
