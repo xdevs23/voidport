@@ -118,8 +118,10 @@ impl Shared {
 
 impl Drop for Shared {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let ended = self.child.kill().and_then(|()| self.child.wait());
+        if let Err(error) = ended {
+            eprintln!("the shared server is not ended: {error}");
+        }
     }
 }
 
@@ -195,9 +197,16 @@ impl Drop for Guest {
         let Some(child) = self.child.as_mut() else {
             return;
         };
-        let _ = fuse_client().arg("umount").arg(&self.mountpoint).status();
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Err(error) = fuse_client().arg("umount").arg(&self.mountpoint).status() {
+            eprintln!(
+                "the mount at {} is not taken down: {error}",
+                self.mountpoint.display()
+            );
+        }
+        let ended = child.kill().and_then(|()| child.wait());
+        if let Err(error) = ended {
+            eprintln!("the mount process is not ended: {error}");
+        }
     }
 }
 

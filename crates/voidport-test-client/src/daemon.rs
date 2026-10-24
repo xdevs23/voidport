@@ -78,7 +78,7 @@ impl DataAddress {
             Self::Vsock { port } => {
                 match vsock::VsockStream::connect_with_cid_port(LOOPBACK_CID, *port) {
                     Ok(stream) => {
-                        let _ = stream.shutdown(Shutdown::Both);
+                        let _probe_needs_no_clean_close = stream.shutdown(Shutdown::Both);
                         true
                     }
                     Err(_) => false,
@@ -241,7 +241,7 @@ impl Restartable {
         let Some(pid) = self.running.take() else {
             return;
         };
-        let _ = rustix::process::kill_process(pid, signal);
+        let _server_may_have_exited = rustix::process::kill_process(pid, signal);
         self.launcher.exited();
     }
 
@@ -369,8 +369,10 @@ impl Launcher {
 impl Drop for Launcher {
     /// [`Restartable`] has already killed the server, so nothing is orphaned here.
     fn drop(&mut self) {
-        let _ = self.shell.kill();
-        let _ = self.shell.wait();
+        let ended = self.shell.kill().and_then(|()| self.shell.wait());
+        if let Err(error) = ended {
+            eprintln!("the launcher shell is not ended: {error}");
+        }
     }
 }
 
@@ -379,7 +381,7 @@ impl Drop for Launcher {
 pub fn accepts(path: &Path) -> bool {
     match UnixStream::connect(path) {
         Ok(stream) => {
-            let _ = stream.shutdown(Shutdown::Both);
+            let _probe_needs_no_clean_close = stream.shutdown(Shutdown::Both);
             true
         }
         Err(_) => false,

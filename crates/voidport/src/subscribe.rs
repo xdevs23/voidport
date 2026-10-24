@@ -403,7 +403,7 @@ impl Subscription {
             NotificationOpcode::Recall => {
                 let recall = frame.notification::<RecallBody>().ok()?;
                 if let Some(recalls) = &self.recalls {
-                    let _ = recalls.send(Recall {
+                    let _receiver_ends_with_the_mount = recalls.send(Recall {
                         node_id: recall.body().node_id.get(),
                         recall: recall.body().recall.get(),
                     });

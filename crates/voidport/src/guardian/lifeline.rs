@@ -315,7 +315,7 @@ mod tests {
         let (end, ending) = mpsc::channel();
         let thread = std::thread::spawn(move || {
             held.send(lifeline.hold(index)).expect("the test waits");
-            let _ = ending.recv();
+            let _sent_or_dropped_either_ends_the_hold = ending.recv();
         });
         let pidfd = holding
             .recv()

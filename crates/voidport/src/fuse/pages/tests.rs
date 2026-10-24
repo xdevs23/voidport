@@ -31,8 +31,8 @@ struct Pauses {
 impl Invalidate for Dropper {
     fn invalidate(&self, node_id: u64, offset: u64, len: Option<u64>) -> Result<(), Errno> {
         if let Some(pausing) = self.pausing.as_ref().filter(|p| p.node_id == node_id) {
-            let _ = pausing.started.send(());
-            let _ = pausing.go.lock().unwrap().recv();
+            let _test_may_have_stopped_watching = pausing.started.send(());
+            let _released_or_the_test_ended = pausing.go.lock().unwrap().recv();
         }
         self.drops.lock().unwrap().push((node_id, offset, len));
         let mut failing = self.failing.lock().unwrap();
@@ -40,7 +40,7 @@ impl Invalidate for Dropper {
             *failing -= 1;
             return Err(Errno::BUSY);
         }
-        let _ = self.ended.send(node_id);
+        let _test_may_have_stopped_watching = self.ended.send(node_id);
         Ok(())
     }
 }

@@ -342,7 +342,9 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let ended = self.child.kill().and_then(|()| self.child.wait());
+        if let Err(error) = ended {
+            eprintln!("the subscription is not ended: {error}");
+        }
     }
 }

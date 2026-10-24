@@ -4,7 +4,7 @@
 
 use voidport_test_client as support;
 
-use std::io::{self, Read, Write};
+use std::io::{Read, Write};
 use std::net::{Shutdown, SocketAddr, TcpListener, TcpStream};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
@@ -341,7 +341,7 @@ impl WireCensus {
 /// parked on a peer that has gone away.
 fn serve(client: TcpStream, server: &Path, sent: &Arc<Mutex<Vec<Sent>>>) {
     let Ok(upstream) = UnixStream::connect(server) else {
-        let _ = client.shutdown(Shutdown::Both);
+        let _peer_may_be_gone = client.shutdown(Shutdown::Both);
         return;
     };
     let (Ok(from_client), Ok(to_client)) = (client.try_clone(), client.try_clone()) else {
@@ -354,17 +354,17 @@ fn serve(client: TcpStream, server: &Path, sent: &Arc<Mutex<Vec<Sent>>>) {
         let sent = Arc::clone(sent);
         let ends = (client.try_clone(), upstream.try_clone());
         thread::spawn(move || {
-            let _ = pump(from_client, to_server, |frame| record(frame, &sent));
+            pump(from_client, to_server, |frame| record(frame, &sent));
             if let (Ok(client), Ok(server)) = ends {
-                let _ = client.shutdown(Shutdown::Both);
-                let _ = server.shutdown(Shutdown::Both);
+                let _client_side_may_be_shut_already = client.shutdown(Shutdown::Both);
+                let _server_side_may_be_shut_already = server.shutdown(Shutdown::Both);
             }
         })
     };
-    let _ = pump(from_server, to_client, |_| {});
-    let _ = client.shutdown(Shutdown::Both);
-    let _ = upstream.shutdown(Shutdown::Both);
-    let _ = requests.join();
+    pump(from_server, to_client, |_| {});
+    let _client_side_may_be_shut_already = client.shutdown(Shutdown::Both);
+    let _server_side_may_be_shut_already = upstream.shutdown(Shutdown::Both);
+    let _panic_was_printed = requests.join();
 }
 
 fn record(frame: &[u8], sent: &Arc<Mutex<Vec<Sent>>>) {
@@ -392,13 +392,13 @@ fn record(frame: &[u8], sent: &Arc<Mutex<Vec<Sent>>>) {
     sent.lock().expect("unpoisoned").push(record);
 }
 
-fn pump(mut from: impl Read, mut to: impl Write, seen: impl Fn(&[u8])) -> io::Result<()> {
-    loop {
-        let Ok(frame) = support::read_message(&mut from) else {
-            return Ok(());
-        };
+/// Returns once either side ends.
+fn pump(mut from: impl Read, mut to: impl Write, seen: impl Fn(&[u8])) {
+    while let Ok(frame) = support::read_message(&mut from) {
         seen(&frame);
-        to.write_all(&frame)?;
+        if to.write_all(&frame).is_err() {
+            return;
+        }
     }
 }
 

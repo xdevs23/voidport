@@ -489,7 +489,9 @@ fn listed(path: &Path) -> Vec<String> {
 /// Whether the host filesystem stores `user.*` attributes at all. tmpfs does so only from Linux 6.6.
 fn host_stores_user_xattrs(host: &Path) -> bool {
     let supported = rustix::fs::setxattr(host, "user.probe", b"1", XattrFlags::empty()).is_ok();
-    let _ = rustix::fs::removexattr(host, "user.probe");
+    if supported {
+        rustix::fs::removexattr(host, "user.probe").expect("the probe attribute is removed");
+    }
     supported
 }
 

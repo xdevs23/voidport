@@ -153,8 +153,10 @@ impl Drop for Filler {
     /// A test that fails before [`Self::unmount`] ends the filler, and with
     /// it the only mount of the filesystem in the image.
     fn drop(&mut self) {
-        let _ = self.process.kill();
-        let _ = self.process.wait();
+        let ended = self.process.kill().and_then(|()| self.process.wait());
+        if let Err(error) = ended {
+            eprintln!("the filler is not ended: {error}");
+        }
     }
 }
 

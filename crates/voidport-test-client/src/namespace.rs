@@ -63,13 +63,15 @@ impl NamespaceCopy {
 
     pub fn release(mut self) {
         drop(self.child.stdin.take());
-        let _ = self.child.wait();
+        self.child.wait().expect("the copy exits");
     }
 }
 
 impl Drop for NamespaceCopy {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let ended = self.child.kill().and_then(|()| self.child.wait());
+        if let Err(error) = ended {
+            eprintln!("the namespace copy is not ended: {error}");
+        }
     }
 }
