@@ -170,11 +170,30 @@ fn is_in_temp_dir(path: &Path) -> bool {
 impl Drop for TempDir {
     fn drop(&mut self) {
         if let Err(error) = fs::remove_dir_all(&self.path) {
-            eprintln!(
+            cleanup_failed(format_args!(
                 "the temporary directory {} is not removed: {error}",
                 self.path.display()
-            );
+            ));
         }
+    }
+}
+
+/// A panic in a drop that runs while the thread unwinds aborts the process,
+/// so the failure is printed then and fails the test otherwise.
+pub fn cleanup_failed(failure: impl std::fmt::Display) {
+    if std::thread::panicking() {
+        eprintln!("{failure}");
+    } else {
+        panic!("{failure}");
+    }
+}
+
+pub fn kill_and_reap(child: &mut Child) {
+    if let Err(error) = child.kill().and_then(|()| child.wait()) {
+        cleanup_failed(format_args!(
+            "the process {} is not ended: {error}",
+            child.id()
+        ));
     }
 }
 
@@ -185,8 +204,7 @@ pub struct KilledOnDrop(pub Child);
 
 impl Drop for KilledOnDrop {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        kill_and_reap(&mut self.0);
     }
 }
 
@@ -195,10 +213,11 @@ pub fn tcp_url(address: impl std::fmt::Display, namespace: &str, subpath: &str) 
     format!("voidport://{address}/@{namespace}{subpath}")
 }
 
+/// The server is dropped before the directory it writes into.
 #[derive(Debug)]
 pub struct Fixture {
-    pub directory: TempDir,
     pub server: RunningServer,
+    pub directory: TempDir,
 }
 
 impl Fixture {

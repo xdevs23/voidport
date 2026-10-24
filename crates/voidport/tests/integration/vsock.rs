@@ -30,10 +30,11 @@ const STALL: Duration = Duration::from_secs(5);
 
 const CONTENTS: &[u8] = b"0123456789";
 
+/// The server is dropped before the directory it writes into.
 struct Ground {
+    server: Restartable,
     directory: TempDir,
     tree: PathBuf,
-    server: Restartable,
 }
 
 impl Ground {
@@ -342,9 +343,6 @@ impl Subscription {
 
 impl Drop for Subscription {
     fn drop(&mut self) {
-        let ended = self.child.kill().and_then(|()| self.child.wait());
-        if let Err(error) = ended {
-            eprintln!("the subscription is not ended: {error}");
-        }
+        support::kill_and_reap(&mut self.child);
     }
 }

@@ -181,7 +181,8 @@ impl NamespaceCopy {
 
     pub fn release(mut self) {
         drop(self.child.0.stdin.take());
-        let _ = self.child.0.wait();
+        let status = self.child.0.wait().expect("the copy exits");
+        assert!(status.success(), "the copy ended with {status}");
     }
 }
 
