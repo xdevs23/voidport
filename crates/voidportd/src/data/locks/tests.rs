@@ -518,6 +518,37 @@ fn the_last_handle_to_leave_releases_the_set_before_another_starts() {
 }
 
 #[test]
+fn a_waiting_request_is_counted_until_it_ends() {
+    let scratch = Scratch::new("locks");
+    let sets = Arc::new(LockSets::default());
+    let locked = |name| {
+        let pinned = pin(&scratch.file(name, &[0u8; 64]));
+        let joined = sets.join(identity(&pinned));
+        let description = described(&pinned, OFlags::RDWR);
+        joined
+            .locks()
+            .place(1, LockKind::Write, range(0, 9), false, &description)
+            .expect("free");
+        (joined, description)
+    };
+    let (one, one_description) = locked("one");
+    let (two, two_description) = locked("two");
+    waiting(one.locks(), &one_description, 2, range(0, 9));
+    waiting(one.locks(), &one_description, 3, range(0, 9));
+    waiting(two.locks(), &two_description, 2, range(0, 9));
+    assert_eq!(sets.waiting_requests(), 3);
+
+    one.locks().release_holder(1);
+    assert!(
+        one.locks()
+            .retry(2, LockKind::Write, range(0, 9))
+            .expect("placed")
+    );
+    two.locks().abandon(2);
+    assert_eq!(sets.waiting_requests(), 1, "only lock holder 3 still waits");
+}
+
+#[test]
 fn two_names_of_one_file_share_its_lock_set() {
     let scratch = Scratch::new("locks");
     let path = scratch.file("file", &[0u8; 64]);

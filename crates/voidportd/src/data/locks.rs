@@ -245,6 +245,15 @@ impl FileLocks {
         state.forget_if_idle(holder);
     }
 
+    #[must_use]
+    pub fn waiting_requests(&self) -> usize {
+        self.state()
+            .holders
+            .values()
+            .map(|holder| holder.waiters)
+            .sum()
+    }
+
     pub fn release_holder(&self, holder: u64) {
         let mut state = self.state();
         state.unlock(holder, LockRange::whole_file());
@@ -448,6 +457,14 @@ impl LockSets {
             identity,
             locks: Arc::clone(&joined.locks),
         }
+    }
+
+    #[must_use]
+    pub fn waiting_requests(&self) -> usize {
+        self.files()
+            .values()
+            .map(|joined| joined.locks.waiting_requests())
+            .sum()
     }
 
     fn leave(&self, identity: NodeIdentity) {
