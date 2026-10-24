@@ -109,6 +109,18 @@ impl<'fd> Program<'fd> {
         self
     }
 
+    /// Starts `wrapper` with `arguments`, followed by the program and the
+    /// arguments given so far.
+    pub fn run_through<A: AsRef<OsStr>>(
+        &mut self,
+        wrapper: impl AsRef<OsStr>,
+        arguments: impl IntoIterator<Item = A>,
+    ) -> &mut Self {
+        let program = std::mem::replace(&mut self.executable, wrapper.as_ref().to_owned());
+        let program_arguments = std::mem::take(&mut self.arguments);
+        self.args(arguments).arg(program).args(program_arguments)
+    }
+
     pub fn env(&mut self, name: impl AsRef<OsStr>, value: impl AsRef<OsStr>) -> &mut Self {
         self.environment
             .push((name.as_ref().to_owned(), Some(value.as_ref().to_owned())));

@@ -2994,6 +2994,7 @@ version = "2.0.0"
 dependencies = [
  "libc",
  "percent-encoding",
+ "procfs",
  "rustix",
  "serde_json",
  "signal-hook",

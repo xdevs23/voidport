@@ -7,7 +7,7 @@ use std::os::fd::{AsFd as _, OwnedFd};
 use std::os::unix::fs::{FileExt as _, MetadataExt as _};
 use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
-use std::process::Child;
+use std::process::{Child, ExitStatus};
 use std::time::{Duration, Instant};
 
 use procfs::ProcError;
@@ -17,15 +17,15 @@ use rustix::io::{Errno, retry_on_intr};
 use rustix::process::{Pid, PidfdFlags, Resource, Rlimit, Signal, getrlimit, pidfd_open, prlimit};
 use support::daemon::{Ground, PATIENCE, eventually, runtime};
 use support::mapping::SharedMapping;
-use support::namespace::{NamespaceCopy, in_copy};
+use support::namespace::{NamespaceCopy, spawn_in_copy};
 use support::relay::{Cut, Latch, Relay};
-use support::{fuse_client, preflight};
+use support::{KilledOnDrop, fuse_client, preflight};
 use voidport::client::{MountState, Origin};
 use voidport::guardian::Launch;
 use voidport::mount::{Mount, MountError, MountOptions};
 use voidport::url::MountUrl;
 use voidport_proto::opcode::Opcode;
-use voidport_spawn::{Program, Stream};
+use voidport_spawn::{Program, SpawnError, Stream};
 use voidport_test_support::{ReadinessSocket, Startup, test_name, until};
 
 const STALL: Duration = Duration::from_secs(5);
@@ -133,6 +133,16 @@ impl Foreground {
         children_of(self.child.as_ref().expect("the mount is still running"))
     }
 
+    /// The process exits once the kernel has ended the connection of the
+    /// mount.
+    fn wait(&mut self) -> ExitStatus {
+        self.child
+            .take()
+            .expect("the mount is still running")
+            .wait()
+            .expect("the mount process exits")
+    }
+
     fn kill(&mut self) {
         let mut child = self.child.take().expect("the mount is still running");
         child.kill().expect("the mount is killed");
@@ -150,13 +160,8 @@ impl Drop for Foreground {
                 eprintln!("the mount process is not ended: {error}");
             }
         }
-        if probe(&self.mountpoint) != Mountpoint::Unmounted
-            && let Err(error) = fuse_client().arg("umount").arg(&self.mountpoint).status()
-        {
-            eprintln!(
-                "the mount at {} is not taken down: {error}",
-                self.mountpoint.display()
-            );
+        if probe(&self.mountpoint) != Mountpoint::Unmounted {
+            let _ = umount_with_client(&self.mountpoint);
         }
     }
 }
@@ -214,17 +219,8 @@ fn program(name: &str) -> PathBuf {
         .unwrap_or_else(|| panic!("{name} is on PATH"))
 }
 
-/// A program the test started, killed if the test ends before it exits, so
-/// that no mount a test leaves behind remains busy.
-struct KilledOnDrop(Child);
-
-impl Drop for KilledOnDrop {
-    fn drop(&mut self) {
-        let ended = self.0.kill().and_then(|()| self.0.wait());
-        if let Err(error) = ended {
-            eprintln!("the child process is not ended: {error}");
-        }
-    }
+fn umount_with_client(mountpoint: &Path) -> Result<ExitStatus, SpawnError> {
+    fuse_client().arg("umount").arg(mountpoint).status()
 }
 
 #[test]
@@ -363,10 +359,7 @@ fn a_signalled_mount_with_a_busy_mountpoint_still_exits() {
 
     drop(held);
     assert!(
-        eventually(PATIENCE, || fuse_client()
-            .arg("umount")
-            .arg(guest.mountpoint())
-            .status()
+        eventually(PATIENCE, || umount_with_client(guest.mountpoint())
             .is_ok_and(|status| status.success())),
         "`voidport umount` should recover the mountpoint once it is idle"
     );
@@ -443,10 +436,7 @@ fn a_killed_client_leaves_no_mountpoint_or_a_recoverable_one() {
         probe(guest.mountpoint())
     );
     assert!(
-        fuse_client()
-            .arg("umount")
-            .arg(guest.mountpoint())
-            .status()
+        umount_with_client(guest.mountpoint())
             .expect("the client binary runs")
             .success(),
         "`voidport umount` recovers the mountpoint"
@@ -500,10 +490,7 @@ fn a_killed_client_leaves_no_mountpoint_or_a_recoverable_one() {
         probe(&mountpoint)
     );
     assert!(
-        fuse_client()
-            .arg("umount")
-            .arg(&mountpoint)
-            .status()
+        umount_with_client(&mountpoint)
             .expect("the client binary runs")
             .success(),
         "`voidport umount` recovers the mountpoint"
@@ -753,33 +740,29 @@ fn client_of_its_own_mount() -> Option<(String, PathBuf)> {
 }
 
 #[derive(Clone, Copy, Debug)]
-enum ClientNamespace {
+enum ClientNamespace<'a> {
     OfTheTest,
-    Copy,
+    Copy(&'a Path),
 }
 
 fn run_client_of_its_own_mount(
     test: &str,
     url: &str,
     mountpoint: &Path,
-    namespace: ClientNamespace,
+    namespace: ClientNamespace<'_>,
 ) -> KilledOnDrop {
-    let binary = std::env::current_exe().expect("the test binary");
-    let mut program = match namespace {
-        ClientNamespace::OfTheTest => Program::new(binary),
-        ClientNamespace::Copy => in_copy(binary),
-    };
-    KilledOnDrop(
-        program
-            .args(["--exact", test, "--nocapture"])
-            .env(CLIENT_URL, url)
-            .env(CLIENT_MOUNTPOINT, mountpoint)
-            .stdin(Stream::Piped)
-            .stdout(Stream::Piped)
-            .stderr(Stream::Inherit)
-            .spawn()
-            .expect("the client runs"),
-    )
+    let mut client = Program::new(std::env::current_exe().expect("the test binary"));
+    client
+        .args(["--exact", test, "--nocapture"])
+        .env(CLIENT_URL, url)
+        .env(CLIENT_MOUNTPOINT, mountpoint)
+        .stdin(Stream::Piped)
+        .stdout(Stream::Piped)
+        .stderr(Stream::Inherit);
+    match namespace {
+        ClientNamespace::OfTheTest => KilledOnDrop(client.spawn().expect("the client runs")),
+        ClientNamespace::Copy(kept) => spawn_in_copy(client, &[kept]),
+    }
 }
 
 fn mount_in_this_process(url: &str, mountpoint: &Path, dispatch_threads: usize) -> Mount {
@@ -809,10 +792,7 @@ fn kill_and_see_no_page_behind(mut client: KilledOnDrop, mountpoint: &Path) {
     );
     drop(held);
     assert!(
-        fuse_client()
-            .arg("umount")
-            .arg(mountpoint)
-            .status()
+        umount_with_client(mountpoint)
             .expect("the client binary runs")
             .success(),
         "`voidport umount` recovers the mountpoint the client left"
@@ -923,7 +903,7 @@ fn a_mount_dropped_without_fusectl_while_a_thread_waits_on_it_ends_and_its_proce
         ),
         &relay.url("work", ""),
         &mountpoint,
-        ClientNamespace::Copy,
+        ClientNamespace::Copy(ground.directory.path()),
     );
     truncating
         .recv()
@@ -1053,7 +1033,7 @@ fn an_unmount_returns_while_another_namespace_has_a_copy_of_the_mount() {
         b"alpha"
     );
 
-    let mut copy = NamespaceCopy::start();
+    let mut copy = NamespaceCopy::start(&[ground.directory.path()]);
     let unmounted = guest.unmount_patiently();
     let copy_exists = copy.exists();
     copy.release();
@@ -1072,7 +1052,7 @@ fn a_signalled_mount_exits_while_another_namespace_has_a_copy_of_the_mount() {
         panic!("the mount never came up");
     };
 
-    let mut copy = NamespaceCopy::start();
+    let mut copy = NamespaceCopy::start(&[ground.directory.path()]);
     let (clean, _) = guest.signal(Signal::TERM);
     let copy_exists = copy.exists();
     copy.release();
@@ -1084,5 +1064,43 @@ fn a_signalled_mount_exits_while_another_namespace_has_a_copy_of_the_mount() {
     assert!(
         copy_exists,
         "the process exited only after the copy of the mount was gone"
+    );
+}
+
+#[test]
+fn a_mount_of_another_test_ends_with_its_unmount_while_a_copy_of_the_namespace_exists() {
+    preflight();
+    let (_other, mut guest) = std::thread::spawn(|| {
+        let other = Ground::start("mounted-elsewhere");
+        let Some(guest) = Foreground::start(&other, "elsewhere", &[]) else {
+            panic!("the mount of the other test never came up");
+        };
+        (other, guest)
+    })
+    .join()
+    .expect("the other test mounts");
+
+    let mut copy = NamespaceCopy::start(&[]);
+    assert!(
+        !copy.has_mount_of(guest.mountpoint()),
+        "the copy has a mount of the other test"
+    );
+    assert!(
+        umount_with_client(guest.mountpoint())
+            .expect("the client binary runs")
+            .success(),
+        "the other test unmounts its mount"
+    );
+    let exited = guest.wait();
+    let copy_exists = copy.exists();
+    copy.release();
+    assert!(
+        exited.success(),
+        "the mount process exits cleanly, and it exited with {exited}:\n{}",
+        guest.said()
+    );
+    assert!(
+        copy_exists,
+        "the copy ended before the connection of the other mount did"
     );
 }

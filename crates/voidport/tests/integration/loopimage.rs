@@ -13,11 +13,11 @@ use voidport_test_client as support;
 use std::fs;
 use std::io::{BufRead as _, BufReader, Lines, Read as _};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdout};
+use std::process::ChildStdout;
 
 use sha2::{Digest as _, Sha256};
-use support::Fixture;
-use support::namespace::{NamespaceCopy, in_copy};
+use support::namespace::{NamespaceCopy, spawn_in_copy};
+use support::{Fixture, KilledOnDrop};
 use voidport_spawn::{Program, Stream};
 use voidport_test_support::test_name;
 
@@ -102,13 +102,14 @@ impl Drop for Loopback {
 /// with the process, so a filler that fails or is killed leaves no mount of it
 /// behind.
 struct Filler {
-    process: Child,
+    process: KilledOnDrop,
     output: Lines<BufReader<ChildStdout>>,
 }
 
 impl Filler {
-    fn start(device: &str, mountpoint: &Path) -> Self {
-        let mut process = in_copy(std::env::current_exe().expect("the test binary"))
+    fn start(kept: &Path, device: &str, mountpoint: &Path) -> Self {
+        let mut filler = Program::new(std::env::current_exe().expect("the test binary"));
+        filler
             .args([
                 "--exact",
                 &test_name!(a_btrfs_image_on_the_mount_formats_mounts_and_checks_clean),
@@ -118,10 +119,9 @@ impl Filler {
             .env(IMAGE_MOUNTPOINT, mountpoint)
             .stdin(Stream::Piped)
             .stdout(Stream::Piped)
-            .stderr(Stream::Inherit)
-            .spawn()
-            .expect("unshare runs");
-        let output = BufReader::new(process.stdout.take().expect("a piped stdout")).lines();
+            .stderr(Stream::Inherit);
+        let mut process = spawn_in_copy(filler, &[kept]);
+        let output = BufReader::new(process.0.stdout.take().expect("a piped stdout")).lines();
         let mut filler = Self { process, output };
         assert!(
             filler
@@ -135,28 +135,17 @@ impl Filler {
     }
 
     fn unmount(mut self) {
-        drop(self.process.stdin.take());
+        drop(self.process.0.stdin.take());
         // The rest of the output of the filler, read to its end so that the
         // filler never writes into a closed pipe.
         for line in self.output.by_ref().map_while(Result::ok) {
             println!("{line}");
         }
-        let status = self.process.wait().expect("the filler is waited for");
+        let status = self.process.0.wait().expect("the filler is waited for");
         assert!(
             status.success(),
             "the filler of the image failed ({status})"
         );
-    }
-}
-
-impl Drop for Filler {
-    /// A test that fails before [`Self::unmount`] ends the filler, and with
-    /// it the only mount of the filesystem in the image.
-    fn drop(&mut self) {
-        let ended = self.process.kill().and_then(|()| self.process.wait());
-        if let Err(error) = ended {
-            eprintln!("the filler is not ended: {error}");
-        }
     }
 }
 
@@ -235,10 +224,10 @@ fn a_btrfs_image_on_the_mount_formats_mounts_and_checks_clean() {
     );
 
     let inside = support::TempDir::new("image-mnt");
-    let filler = Filler::start(loopback.device(), inside.path());
+    let filler = Filler::start(fixture.directory.path(), loopback.device(), inside.path());
     // A copy of the mount namespace of this test, as a sandboxed build makes
     // one, made while the image is mounted in the namespace of the filler.
-    let copy = NamespaceCopy::start();
+    let copy = NamespaceCopy::start(&[fixture.directory.path()]);
     filler.unmount();
     drop(loopback);
 
