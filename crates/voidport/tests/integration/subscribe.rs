@@ -97,8 +97,10 @@ impl Stream {
 
 impl Drop for Stream {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        let ended = self.child.kill().and_then(|()| self.child.wait());
+        if let Err(error) = ended {
+            eprintln!("the subscription is not ended: {error}");
+        }
     }
 }
 
@@ -594,7 +596,9 @@ fn replaying_server() -> (std::net::SocketAddr, mpsc::Receiver<usize>) {
                 .set_read_timeout(Some(QUIET))
                 .expect("a settable timeout");
         }
-        let _ = report.send(subscribes);
+        report
+            .send(subscribes)
+            .expect("the test waits for the report");
     });
 
     (address, observed)
@@ -645,14 +649,18 @@ fn the_example_mount_manager_drives_real_mounts() {
         .expect("the example script runs");
     let cleanup = |root: &Path| {
         for point in std::fs::read_dir(root).into_iter().flatten().flatten() {
-            let _ = voidport::mount::unmount(&point.path());
+            if let Err(error) = voidport::mount::unmount(&point.path()) {
+                eprintln!("{} is not unmounted: {error}", point.path().display());
+            }
         }
     };
 
     let mounted = |name: &str| root.join(name).join("data.bin").exists();
     let assertion = support::eventually(PATIENCE, || mounted("tree"));
     if !assertion {
-        let _ = manager.kill();
+        if let Err(error) = manager.kill() {
+            eprintln!("the mount manager is not killed: {error}");
+        }
         cleanup(&root);
         panic!("the snapshot's share was never mounted");
     }
@@ -698,8 +706,8 @@ fn the_example_mount_manager_drives_real_mounts() {
     let ended = support::eventually(PATIENCE, || manager.try_wait().ok().flatten().is_some());
     let torn_down = support::eventually(PATIENCE, || !mounted("tree"));
 
-    let _ = manager.kill();
-    let _ = manager.wait();
+    manager.kill().expect("the mount manager is killed");
+    manager.wait().expect("the killed mount manager exits");
     cleanup(&root);
 
     assert!(appeared, "a share that appeared was never mounted");

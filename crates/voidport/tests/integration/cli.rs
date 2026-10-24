@@ -70,9 +70,16 @@ impl Drop for Mounted {
         let Some(child) = self.child.as_mut() else {
             return;
         };
-        let _ = fuse_client().arg("umount").arg(&self.mountpoint).status();
-        let _ = child.kill();
-        let _ = child.wait();
+        if let Err(error) = fuse_client().arg("umount").arg(&self.mountpoint).status() {
+            eprintln!(
+                "the mount at {} is not taken down: {error}",
+                self.mountpoint.display()
+            );
+        }
+        let ended = child.kill().and_then(|()| child.wait());
+        if let Err(error) = ended {
+            eprintln!("the mount process is not ended: {error}");
+        }
     }
 }
 

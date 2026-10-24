@@ -96,6 +96,8 @@ impl Drop for SharedMapping {
         // `munmap`, and dropping the file it maps leaves it in place. The
         // address and length are the ones `mmap` returned, the mapping has not
         // been released before now, and nothing can access it afterwards.
-        let _ = unsafe { munmap(self.address, self.length) };
+        if let Err(error) = unsafe { munmap(self.address, self.length) } {
+            eprintln!("the shared mapping is not released: {error}");
+        }
     }
 }

@@ -94,7 +94,7 @@ fn a_fifo_carries_data_between_two_processes_of_one_guest() {
             let mut text = String::new();
             file.read_to_string(&mut text).map(|_| text)
         });
-        let _ = sender.send(outcome);
+        sender.send(outcome).expect("the test waits for the reader");
     });
 
     let mut writer = Program::new("sh")

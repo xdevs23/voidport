@@ -149,7 +149,7 @@ fn probe_one_pwrite(root: &Path, len: usize) -> usize {
     let file = fs::File::create(&path).expect("the probe file is creatable");
     let written = rustix::io::pwrite(&file, &payload(len), 0).expect("the probe write succeeds");
     drop(file);
-    let _ = fs::remove_file(&path);
+    fs::remove_file(&path).expect("the probe file is removed");
     written
 }
 
