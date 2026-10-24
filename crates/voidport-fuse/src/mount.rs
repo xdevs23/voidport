@@ -75,13 +75,35 @@ pub enum MountError {
     Start(#[source] SpawnError),
     #[error("the fusermount3 helper could not be talked to")]
     Helper(#[source] io::Error),
-    #[error("the fusermount3 helper did not mount ({status}): {message}")]
+    #[error("the fusermount3 helper did not mount ({status}, {reason}): {message}")]
     Refused {
         status: ExitStatus,
         /// What the helper wrote to its standard error. The helper of an
         /// auto-unmount writes to the standard error of this process instead.
         message: String,
+        reason: NotReceived,
     },
+}
+
+/// What the socket of the helper showed in place of the descriptor of the
+/// connection.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum NotReceived {
+    /// Every copy of the end given to the helper was closed, or that end was
+    /// shut down for writing.
+    EndOfStream,
+    HelperEnded,
+    NoDescriptor,
+}
+
+impl std::fmt::Display for NotReceived {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(match self {
+            Self::EndOfStream => "the socket reached its end",
+            Self::HelperEnded => "the helper ended with nothing left to read on the socket",
+            Self::NoDescriptor => "a message arrived without a descriptor",
+        })
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

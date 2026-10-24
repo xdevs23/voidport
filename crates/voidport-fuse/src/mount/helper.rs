@@ -15,7 +15,7 @@ use rustix::net::{
 use rustix::process::{Pid, PidfdFlags, pidfd_open};
 use voidport_spawn::{Program, Stream};
 
-use super::{MountError, MountOptions, Mounted, Unmount, UnmountError};
+use super::{MountError, MountOptions, Mounted, NotReceived, Unmount, UnmountError};
 use crate::device::Device;
 
 const COMMAND_SOCKET: &str = "_FUSE_COMMFD";
@@ -137,8 +137,8 @@ impl Fusermount {
         let helper = spawned.map_err(MountError::Start)?;
 
         let descriptor = match receive_descriptor(&ours, &helper) {
-            Ok(Some(descriptor)) => descriptor,
-            Ok(None) => return Err(refused(ours, helper)),
+            Ok(Received::Descriptor(descriptor)) => descriptor,
+            Ok(Received::Missing(reason)) => return Err(refused(ours, helper, reason)),
             Err(error) => {
                 end(ours, helper);
                 return Err(MountError::Helper(error));
@@ -322,9 +322,9 @@ fn end(socket: OwnedFd, helper: Child) {
 /// one started by the helper, so the socket alone does not show that the
 /// helper ended: its process is watched as well, where the kernel gives out a
 /// descriptor for it.
-fn receive_descriptor(socket: &OwnedFd, helper: &Child) -> io::Result<Option<OwnedFd>> {
+fn receive_descriptor(socket: &OwnedFd, helper: &Child) -> io::Result<Received> {
     let Ok(ended) = pidfd_open(Pid::from_child(helper), PidfdFlags::empty()) else {
-        return receive(socket, RecvFlags::empty());
+        return Ok(receive(socket, RecvFlags::empty())?);
     };
     loop {
         let mut events = [
@@ -337,15 +337,24 @@ fn receive_descriptor(socket: &OwnedFd, helper: &Child) -> io::Result<Option<Own
             Err(error) => return Err(error.into()),
         }
         if !events[0].revents().is_empty() {
-            return receive(socket, RecvFlags::empty());
+            return Ok(receive(socket, RecvFlags::empty())?);
         }
         if !events[1].revents().is_empty() {
-            return receive(socket, RecvFlags::DONTWAIT);
+            return match receive(socket, RecvFlags::DONTWAIT) {
+                Err(Errno::AGAIN) => Ok(Received::Missing(NotReceived::HelperEnded)),
+                received => Ok(received?),
+            };
         }
     }
 }
 
-fn receive(socket: &OwnedFd, flags: RecvFlags) -> io::Result<Option<OwnedFd>> {
+#[derive(Debug)]
+enum Received {
+    Descriptor(OwnedFd),
+    Missing(NotReceived),
+}
+
+fn receive(socket: &OwnedFd, flags: RecvFlags) -> Result<Received, Errno> {
     let mut byte = [0];
     let mut space = [MaybeUninit::uninit(); rustix::cmsg_space!(ScmRights(1))];
     let mut control = RecvAncillaryBuffer::new(&mut space);
@@ -357,26 +366,32 @@ fn receive(socket: &OwnedFd, flags: RecvFlags) -> io::Result<Option<OwnedFd>> {
             flags | RecvFlags::CMSG_CLOEXEC,
         ) {
             Err(Errno::INTR) => {}
-            Err(Errno::AGAIN) => return Ok(None),
             received => break received?,
         }
     };
     if received.bytes == 0 {
-        return Ok(None);
+        return Ok(Received::Missing(NotReceived::EndOfStream));
     }
-    Ok(control.drain().find_map(|message| match message {
-        RecvAncillaryMessage::ScmRights(mut descriptors) => descriptors.next(),
-        _ => None,
-    }))
+    Ok(control
+        .drain()
+        .find_map(|message| match message {
+            RecvAncillaryMessage::ScmRights(mut descriptors) => descriptors.next(),
+            _ => None,
+        })
+        .map_or(
+            Received::Missing(NotReceived::NoDescriptor),
+            Received::Descriptor,
+        ))
 }
 
-fn refused(socket: OwnedFd, helper: Child) -> MountError {
+fn refused(socket: OwnedFd, helper: Child, reason: NotReceived) -> MountError {
     // A helper that waits for this end to close never ends otherwise.
     drop(socket);
     match helper.wait_with_output() {
         Ok(output) => MountError::Refused {
             status: output.status,
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            reason,
         },
         Err(error) => MountError::Helper(error),
     }
@@ -438,17 +453,43 @@ mod tests {
             .stderr(Stream::Piped)
             .spawn()
             .expect("sh starts");
-        assert!(
-            receive_descriptor(&ours, &helper)
-                .expect("received")
-                .is_none()
-        );
+        let Received::Missing(reason) = receive_descriptor(&ours, &helper).expect("received")
+        else {
+            panic!("a descriptor arrived");
+        };
+        assert_eq!(reason, NotReceived::HelperEnded);
         drop(theirs);
-        let MountError::Refused { status, message } = refused(ours, helper) else {
+        let MountError::Refused {
+            status, message, ..
+        } = refused(ours, helper, reason)
+        else {
             panic!("a refusal");
         };
         assert_eq!(status.code(), Some(1));
         assert_eq!(message, "user_allow_other is not set");
+    }
+
+    #[test]
+    fn an_answer_without_a_descriptor_names_what_the_socket_showed() {
+        use rustix::net::{SendFlags, send};
+
+        let (ours, theirs) = socketpair(
+            AddressFamily::UNIX,
+            SocketType::STREAM,
+            SocketFlags::CLOEXEC,
+            None,
+        )
+        .expect("a socket pair");
+        let missing = |flags| match receive(&ours, flags) {
+            Ok(Received::Missing(reason)) => Ok(reason),
+            Ok(Received::Descriptor(_)) => panic!("a descriptor arrived"),
+            Err(error) => Err(error),
+        };
+        assert_eq!(send(&theirs, b"\0", SendFlags::empty()), Ok(1));
+        assert_eq!(missing(RecvFlags::empty()), Ok(NotReceived::NoDescriptor));
+        assert_eq!(missing(RecvFlags::DONTWAIT), Err(Errno::AGAIN));
+        drop(theirs);
+        assert_eq!(missing(RecvFlags::empty()), Ok(NotReceived::EndOfStream));
     }
 
     #[test]
@@ -529,9 +570,10 @@ mod tests {
         .expect("sent");
         drop(writer);
 
-        let received = receive(&ours, RecvFlags::empty())
-            .expect("received")
-            .expect("a descriptor");
+        let Received::Descriptor(received) = receive(&ours, RecvFlags::empty()).expect("received")
+        else {
+            panic!("no descriptor arrived");
+        };
         rustix::io::write(&received, b"x").expect("the descriptor received is the pipe");
         drop(received);
         let mut read = Vec::new();

@@ -24,7 +24,7 @@ pub use flags::{FopenFlags, InitFlags, PollEvents};
 pub use init::{Init, InitError, LimitError, MissingCapabilities};
 pub use lock::{FileLock, LockType};
 pub use mount::{
-    AutoUnmountCopy, Fusermount, InvalidSource, MountError, MountOptions, MountSource,
+    AutoUnmountCopy, Fusermount, InvalidSource, MountError, MountOptions, MountSource, NotReceived,
     UnmountError, connection_ended, fusermount,
 };
 pub use reply::{
