@@ -92,12 +92,26 @@ fn a_program_run_through_a_wrapper_follows_the_arguments_of_the_wrapper() {
     assert_eq!(output.stdout, b"wrapper echo program\n");
 }
 
+/// Returns once the shell has started, so `/proc` shows the program that the
+/// child runs and no longer the process before its exec.
 fn waiting(program: &mut Program<'_>) -> Child {
-    program
-        .args(["-c", "read -r line || true"])
+    let mut child = program
+        .args(["-c", "echo started; read -r line || true"])
         .stdin(Stream::Piped)
+        .stdout(Stream::Piped)
         .spawn()
-        .expect("sh starts")
+        .expect("sh starts");
+    let started = BufReader::new(child.stdout.as_mut().expect("a piped output"))
+        .lines()
+        .next()
+        .transpose()
+        .expect("the output is readable");
+    assert_eq!(
+        started.as_deref(),
+        Some("started"),
+        "the shell reports that it started"
+    );
+    child
 }
 
 fn environment_of(child: &Child) -> Vec<String> {
