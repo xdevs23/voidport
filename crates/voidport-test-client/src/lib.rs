@@ -155,6 +155,12 @@ impl TempDir {
         fs::write(&path, contents).expect("a writable temporary file");
         path
     }
+
+    pub fn executable(&self, name: &str, contents: &str) -> PathBuf {
+        let path = self.write(name, contents);
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).expect("a settable mode");
+        path
+    }
 }
 
 /// Whether `path` is a directory made by [`TempDir::new`] or lies below one.

@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::Child;
 
 use rustix::event::{PollFd, PollFlags, poll};
+use rustix::fs::{AtFlags, CWD, StatxFlags, statx};
 use rustix::io::Errno;
 use rustix::net::{
     AddressFamily, RecvAncillaryBuffer, RecvAncillaryMessage, RecvFlags, SocketFlags, SocketType,
@@ -87,14 +88,20 @@ impl Fusermount {
         &self.0
     }
 
-    /// The helper of an auto-unmount writes to the standard error of this
-    /// process, because it lives as long as the mount and nothing would read
-    /// a pipe of it.
     pub(crate) fn mount(
         &self,
         mountpoint: &Path,
         options: &MountOptions,
     ) -> Result<Mounted, MountError> {
+        let before = MountId::of(mountpoint);
+        self.start(mountpoint, options)
+            .inspect_err(|_| self.unmount_left_behind(mountpoint, before))
+    }
+
+    /// The helper of an auto-unmount writes to the standard error of this
+    /// process, because it lives as long as the mount and nothing would read
+    /// a pipe of it.
+    fn start(&self, mountpoint: &Path, options: &MountOptions) -> Result<Mounted, MountError> {
         let (ours, theirs) = socketpair(
             AddressFamily::UNIX,
             SocketType::STREAM,
@@ -183,6 +190,62 @@ impl Fusermount {
             status: output.status,
             message: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
         })
+    }
+
+    /// A helper that fails or is killed after it mounted leaves the mount it
+    /// made on `mountpoint`, with a connection that has ended. A mount whose
+    /// connection is served, such as one made by another process meanwhile,
+    /// is not unmounted.
+    fn unmount_left_behind(&self, mountpoint: &Path, before: Result<MountId, Errno>) {
+        match (before, MountId::of(mountpoint)) {
+            (Ok(before), Ok(after)) if before == after => {}
+            (Ok(_), Ok(_)) => {
+                if connection_ended(mountpoint)
+                    && let Err(error) = self.unmount(mountpoint)
+                {
+                    tracing::warn!(%error, "the mount left by the failed fusermount3 helper could not be unmounted");
+                }
+            }
+            (Err(error), _) | (_, Err(error)) => {
+                tracing::warn!(%error, "whether the failed fusermount3 helper left a mount could not be read");
+            }
+        }
+    }
+}
+
+/// The kernel gives the id of a mount to another mount only once the first is
+/// gone, so the id read on a path changes only when another mount covers it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct MountId(u64);
+
+impl MountId {
+    /// `AT_STATX_DONT_SYNC` lets the kernel answer without a request to a FUSE
+    /// mount that no process may read. A kernel that does not report the id
+    /// gives `NOSYS`.
+    fn of(path: &Path) -> Result<Self, Errno> {
+        let flags = AtFlags::STATX_DONT_SYNC | AtFlags::NO_AUTOMOUNT;
+        let status = statx(CWD, path, flags, StatxFlags::MNT_ID)?;
+        if StatxFlags::from_bits_retain(status.stx_mask).contains(StatxFlags::MNT_ID) {
+            Ok(Self(status.stx_mnt_id))
+        } else {
+            Err(Errno::NOSYS)
+        }
+    }
+}
+
+/// A `statfs` on the mount fails with `ENOTCONN` once its connection has ended
+/// (`fuse_statfs` in `fs/fuse/inode.c`). A process that served the connection
+/// and is exiting can close its descriptor of the connection after the request
+/// went out, and that request fails with `ECONNABORTED` once the connection
+/// ends, so it is sent again.
+#[must_use]
+pub fn connection_ended(mountpoint: &Path) -> bool {
+    loop {
+        match rustix::fs::statfs(mountpoint) {
+            Err(Errno::NOTCONN) => return true,
+            Err(Errno::CONNABORTED | Errno::INTR) => {}
+            Ok(_) | Err(_) => return false,
+        }
     }
 }
 

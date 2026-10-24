@@ -1,7 +1,4 @@
-use std::path::Path;
-
-use rustix::io::Errno;
-use voidport_fuse::AutoUnmountCopy;
+use voidport_fuse::{AutoUnmountCopy, connection_ended};
 
 use super::GuardianError;
 
@@ -11,27 +8,12 @@ use super::GuardianError;
 /// another process unmounted it.
 pub(super) fn release(auto_unmount: &AutoUnmountCopy) -> Result<(), GuardianError> {
     let mountpoint = &auto_unmount.mountpoint;
-    if !disconnected(mountpoint) {
+    if !connection_ended(mountpoint) {
         return Ok(());
     }
     match auto_unmount.helper.unmount(mountpoint) {
-        Err(error) if disconnected(mountpoint) => Err(GuardianError::Release(error)),
+        Err(error) if connection_ended(mountpoint) => Err(GuardianError::Release(error)),
         Ok(()) | Err(_) => Ok(()),
-    }
-}
-
-/// A `statfs` on the mount fails with `ENOTCONN` once its connection has ended
-/// (`fuse_statfs` in `fs/fuse/inode.c`). The exit of a client that died can close
-/// its descriptor of the connection after the guardian closed its own, and a
-/// request sent before that fails with `ECONNABORTED` once the connection ends,
-/// so it is sent again.
-fn disconnected(mountpoint: &Path) -> bool {
-    loop {
-        match rustix::fs::statfs(mountpoint) {
-            Err(Errno::NOTCONN) => return true,
-            Err(Errno::CONNABORTED | Errno::INTR) => {}
-            Ok(_) | Err(_) => return false,
-        }
     }
 }
 

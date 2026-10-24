@@ -7,19 +7,21 @@ use voidport_test_client as support;
 use std::fs;
 use std::io::{Read as _, Seek as _, SeekFrom, Write as _};
 use std::os::unix::net::UnixListener;
+use std::os::unix::process::ExitStatusExt as _;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use rustix::io::Errno;
+use rustix::process::Signal;
 use support::daemon::{
     CONTENTS, Ground, PATIENCE, accepts, eventually, reconnected_after, runtime, state_file,
     state_file_hiding_children, state_file_read_only, state_file_retargeted,
     state_file_without_the_namespace, state_file_without_the_tree, state_is,
 };
 use support::relay::{Cut, Latch, Relay};
-use support::{errno, preflight};
+use support::{TempDir, errno, preflight};
 use voidport::client::{Caller, MountState, Origin};
 use voidport::mount::{MountOptions, TeardownError};
 use voidport_proto::opcode::Opcode;
@@ -689,13 +691,7 @@ fn a_child_started_while_the_fusermount_helper_starts_gets_no_copy_of_its_socket
     );
 
     let mountpoint = stalled.directory.directory("mnt-helper");
-    let options = voidport_fuse::MountOptions {
-        source: voidport_fuse::MountSource::new("voidport-helper").expect("a plain source"),
-        default_permissions: false,
-        allow_other: true,
-        read_only: false,
-        auto_unmount: Some(helper),
-    };
+    let options = helper_mount_options(helper);
     let mounting = std::thread::spawn(move || {
         voidport_fuse::Session::mount(&mountpoint, &options, |_| Ok(()))
     });
@@ -735,6 +731,45 @@ fn sockets_of(pid: u32) -> Vec<PathBuf> {
         .map(|entry| fs::read_link(entry.expect("an entry").path()).expect("a descriptor"))
         .filter(|target| target.to_string_lossy().starts_with("socket:"))
         .collect()
+}
+
+fn helper_mount_options(helper: voidport_fuse::Fusermount) -> voidport_fuse::MountOptions {
+    voidport_fuse::MountOptions {
+        source: voidport_fuse::MountSource::new("voidport-helper").expect("a plain source"),
+        default_permissions: false,
+        allow_other: true,
+        read_only: false,
+        auto_unmount: Some(helper),
+    }
+}
+
+/// It stands in for a helper that mounts and then kills itself with SIGPIPE,
+/// so the connection ends with the descriptor of `/dev/fuse` held by it.
+const HELPER_KILLED_AFTER_IT_MOUNTED: &str = r#"#!/bin/sh
+if [ "$1" = -u ]; then exec umount --lazy --no-canonicalize -- "$5"; fi
+exec 5<>/dev/fuse
+mount -i --no-canonicalize -t fuse \
+    -o "fd=5,rootmode=40000,user_id=$(id -u),group_id=$(id -g)" voidport-helper "$4" || exit
+kill -s PIPE "$$"
+"#;
+
+#[test]
+fn a_mount_left_by_a_helper_that_is_killed_is_unmounted() {
+    preflight();
+    let directory = TempDir::new("killed-helper");
+    let helper = directory.executable("helper", HELPER_KILLED_AFTER_IT_MOUNTED);
+    let mountpoint = directory.directory("mnt");
+    let options = helper_mount_options(voidport_fuse::Fusermount::new(&helper));
+    let refused = voidport_fuse::Session::mount(&mountpoint, &options, |_| Ok(()))
+        .expect_err("the helper is killed");
+    let voidport_fuse::StartError::Mount(voidport_fuse::MountError::Refused { status, .. }) =
+        &refused
+    else {
+        panic!("the helper did not get past its mount: {refused:?}");
+    };
+    assert_eq!(status.signal(), Some(Signal::PIPE.as_raw()), "{refused:?}");
+    fs::remove_dir(&mountpoint)
+        .unwrap_or_else(|error| panic!("the mount is left after {refused:?}: {error}"));
 }
 
 /// `EBUSY` means nothing happened: the mountpoint is still there, the mount is

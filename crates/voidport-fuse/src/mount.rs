@@ -13,7 +13,7 @@ use voidport_spawn::SpawnError;
 
 use crate::device::Device;
 pub(crate) use helper::AutoUnmount;
-pub use helper::{AutoUnmountCopy, Fusermount, fusermount};
+pub use helper::{AutoUnmountCopy, Fusermount, connection_ended, fusermount};
 
 /// The source `/proc/mounts` shows for a mount: text without a comma or a NUL
 /// byte, which the option list of the helper and the kernel cannot take.
