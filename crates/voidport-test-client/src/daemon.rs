@@ -1,5 +1,4 @@
 use std::io::{BufRead as _, BufReader, Write as _};
-use std::net::Shutdown;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -7,6 +6,7 @@ use std::process::{Child, ChildStdin, ChildStdout};
 use std::sync::Arc;
 use std::time::Duration;
 
+use rustix::io::Errno;
 use rustix::process::{Pid, Signal};
 use voidport::client::{Client, MountState, Resilience};
 use voidport::mount::{Mount, MountOptions};
@@ -76,13 +76,7 @@ impl DataAddress {
         match self {
             Self::Unix(path) => accepts(path),
             Self::Vsock { port } => {
-                match vsock::VsockStream::connect_with_cid_port(LOOPBACK_CID, *port) {
-                    Ok(stream) => {
-                        let _probe_needs_no_clean_close = stream.shutdown(Shutdown::Both);
-                        true
-                    }
-                    Err(_) => false,
-                }
+                vsock::VsockStream::connect_with_cid_port(LOOPBACK_CID, *port).is_ok()
             }
         }
     }
@@ -241,7 +235,14 @@ impl Restartable {
         let Some(pid) = self.running.take() else {
             return;
         };
-        let _server_may_have_exited = rustix::process::kill_process(pid, signal);
+        match rustix::process::kill_process(pid, signal) {
+            // The launcher has reaped a server that exited by itself, and
+            // reports that exit.
+            Ok(()) | Err(Errno::SRCH) => {}
+            Err(error) => {
+                crate::cleanup_failed(format_args!("the server {pid} is not signalled: {error}"))
+            }
+        }
         self.launcher.exited();
     }
 
@@ -369,23 +370,14 @@ impl Launcher {
 impl Drop for Launcher {
     /// [`Restartable`] has already killed the server, so nothing is orphaned here.
     fn drop(&mut self) {
-        let ended = self.shell.kill().and_then(|()| self.shell.wait());
-        if let Err(error) = ended {
-            eprintln!("the launcher shell is not ended: {error}");
-        }
+        crate::kill_and_reap(&mut self.shell);
     }
 }
 
 /// A killed server leaves its socket file behind, and connecting to it fails.
 #[must_use]
 pub fn accepts(path: &Path) -> bool {
-    match UnixStream::connect(path) {
-        Ok(stream) => {
-            let _probe_needs_no_clean_close = stream.shutdown(Shutdown::Both);
-            true
-        }
-        Err(_) => false,
-    }
+    UnixStream::connect(path).is_ok()
 }
 
 /// The end-to-end fixture is not reused here, because these suites need a fixed
@@ -505,11 +497,12 @@ target = "{elsewhere}"
 pub const CONTENTS: &[u8] = b"0123456789";
 
 /// `alpha` and `beta` differ in length, so an id that points at the wrong one of
-/// the two shows up in the data read.
+/// the two shows up in the data read. The server is dropped before the
+/// directory it writes into.
 pub struct Ground {
+    pub server: Restartable,
     pub directory: TempDir,
     pub tree: PathBuf,
-    pub server: Restartable,
 }
 
 impl Ground {
