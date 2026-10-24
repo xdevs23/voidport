@@ -2808,7 +2808,7 @@ dependencies = [
 
 [[package]]
 name = "voidport"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2842,7 +2842,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-bench"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2854,7 +2854,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-control"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "rustix",
  "serde",
@@ -2864,7 +2864,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-ctl"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2883,7 +2883,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-fuse"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "bitflags 2.13.1",
  "linux-raw-sys",
@@ -2896,7 +2896,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-keeper"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "anyhow",
  "clap",
@@ -2916,7 +2916,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-lkml"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "clap",
  "clap_mangen",
@@ -2942,21 +2942,21 @@ dependencies = [
 
 [[package]]
 name = "voidport-lkml-cli"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "clap",
 ]
 
 [[package]]
 name = "voidport-memory"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "tokio",
 ]
 
 [[package]]
 name = "voidport-proto"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "linux-raw-sys",
  "zerocopy",
@@ -2964,7 +2964,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-pty"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "rustix",
  "voidport-spawn",
@@ -2973,7 +2973,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-session"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "voidport-proto",
  "zerocopy",
@@ -2981,7 +2981,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-spawn"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "libc",
  "rustix",
@@ -2990,7 +2990,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-test-client"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "libc",
  "percent-encoding",
@@ -3010,7 +3010,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-test-host"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "libc",
  "rustix",
@@ -3019,7 +3019,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-test-server"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "rustix",
  "voidport-control",
@@ -3032,7 +3032,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-test-support"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "rustix",
  "sd-notify",
@@ -3046,7 +3046,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-torture"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "anyhow",
  "clap",
@@ -3065,7 +3065,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-tui"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "crossterm",
  "ratatui",
@@ -3079,7 +3079,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-vhost"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "rustix",
  "thiserror 2.0.20",
@@ -3091,7 +3091,7 @@ dependencies = [
 
 [[package]]
 name = "voidport-wire-census"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "clap",
  "rustix",
@@ -3104,7 +3104,7 @@ dependencies = [
 
 [[package]]
 name = "voidportd"
-version = "2.0.0-beta1"
+version = "2.0.0-beta2"
 dependencies = [
  "anyhow",
  "clap",
