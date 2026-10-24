@@ -4,6 +4,7 @@ use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Output};
 
+use rustix::fs::Access;
 use support::{Fixture, fuse_client};
 use voidport_spawn::{Program, Stream};
 use voidport_test_support::{ReadinessSocket, Startup};
@@ -47,10 +48,8 @@ impl Mounted {
             Startup::Ready,
             "the mount process exited before it reported readiness"
         );
-        assert!(
-            probe.exists(),
-            "the acknowledged mount serves its namespace"
-        );
+        rustix::fs::access(probe, Access::EXISTS)
+            .expect("the acknowledged mount shows its namespace");
         mounted
     }
 
