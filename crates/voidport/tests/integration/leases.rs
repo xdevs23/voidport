@@ -1,7 +1,6 @@
-//! The attributes and the entries are cached for an hour, so nothing but a
-//! recall makes the guest kernel drop the pages of a file it caches. The host
-//! filesystem must grant this process a lease, which is asked first on a file
-//! of its own: a test of the lease fails without one.
+//! The attributes and the entries are cached for an hour, which is longer than
+//! any test runs. The host filesystem must grant this process a lease, which is
+//! asked first on a file of its own: a test of the lease fails without one.
 
 use voidport_test_client as support;
 
@@ -42,6 +41,34 @@ fn rewrite_unnoticed(host: &Path, byte: u8) {
         .expect("the modification time is set back");
 }
 
+/// Reads the file at `path` twice and asserts that the second read is served
+/// from the pages cached by the guest kernel under a lease.
+///
+/// The returned descriptor is opened with `O_PATH` before the first read, so
+/// the inode is in use until the caller closes it, while the server sees no
+/// open handle. An eviction of unused inodes, such as a write of 2 to
+/// `/proc/sys/vm/drop_caches` by a test running in parallel, then cannot drop
+/// the pages between the two reads. Page reclaim and a write of 1 or 3 to
+/// `drop_caches` still can, so a failed assertion here shows a lease defect
+/// only after those two causes are excluded.
+#[must_use]
+fn cached_under_a_lease(relay: &Relay, path: &Path) -> File {
+    let in_use = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH)
+        .open(path)
+        .expect("the name resolves");
+    assert_eq!(fs::read(path).expect("readable"), vec![b'a'; PAGE]);
+    let read = relay.carried(Opcode::Read);
+    assert_eq!(fs::read(path).expect("readable"), vec![b'a'; PAGE]);
+    assert_eq!(
+        relay.carried(Opcode::Read),
+        read,
+        "the guest caches the file under a lease"
+    );
+    in_use
+}
+
 #[test]
 fn a_leased_file_is_read_from_guest_memory_until_a_host_writer_recalls_it() {
     support::preflight();
@@ -54,11 +81,11 @@ fn a_leased_file_is_read_from_guest_memory_until_a_host_writer_recalls_it() {
     let guest = fixture.mount_with("kept", &relay.url("plain", "/tree"), &cached_for_an_hour());
     let path = guest.path("kept.bin");
 
-    assert_eq!(fs::read(&path).expect("readable"), vec![b'a'; PAGE]);
+    let in_use = cached_under_a_lease(&relay, &path);
     let read = relay.carried(Opcode::Read);
     let held = File::open(&path).expect("readable");
+    drop(in_use);
     assert_eq!(page_at_zero(&held), vec![b'a'; PAGE]);
-    assert_eq!(fs::read(&path).expect("readable"), vec![b'a'; PAGE]);
     assert_eq!(
         relay.carried(Opcode::Read),
         read,
@@ -190,15 +217,7 @@ fn an_unmount_gives_the_lease_of_a_cached_file_up_before_it_returns() {
         &relay.url("plain", "/tree"),
         &cached_for_an_hour(),
     );
-    let path = guest.path("unmounted.bin");
-    assert_eq!(fs::read(&path).expect("readable"), vec![b'a'; PAGE]);
-    let read = relay.carried(Opcode::Read);
-    assert_eq!(fs::read(&path).expect("readable"), vec![b'a'; PAGE]);
-    assert_eq!(
-        relay.carried(Opcode::Read),
-        read,
-        "the guest caches the file under a lease"
-    );
+    drop(cached_under_a_lease(&relay, &guest.path("unmounted.bin")));
 
     guest
         .unmount_patiently()
@@ -224,14 +243,8 @@ fn a_mount_whose_guardian_is_killed_gives_its_leases_up() {
         &cached_for_an_hour(),
     );
     let path = guest.path("guarded.bin");
-    assert_eq!(fs::read(&path).expect("readable"), vec![b'a'; PAGE]);
+    let in_use = cached_under_a_lease(&relay, &path);
     let read = relay.carried(Opcode::Read);
-    assert_eq!(fs::read(&path).expect("readable"), vec![b'a'; PAGE]);
-    assert_eq!(
-        relay.carried(Opcode::Read),
-        read,
-        "the guest caches the file under a lease"
-    );
 
     let relinquished = relay.arm(Opcode::Relinquish, Cut::HoldReply(Latch::released()));
     kill_the_guardian_of(&guest);
@@ -250,6 +263,7 @@ fn a_mount_whose_guardian_is_killed_gives_its_leases_up() {
         relay.carried(Opcode::Read) > read,
         "the mount reads the file from the server"
     );
+    drop(in_use);
 }
 
 fn kill_the_guardian_of(guest: &support::Guest) {
